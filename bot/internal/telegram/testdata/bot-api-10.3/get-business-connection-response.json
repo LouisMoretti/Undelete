@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "result": {
+    "id": "bc_fixture_001",
+    "user": {
+      "id": 700001,
+      "is_bot": false,
+      "first_name": "Zoë"
+    },
+    "user_chat_id": 700002,
+    "date": 1788019200,
+    "rights": {
+      "can_reply": true
+    },
+    "is_enabled": true
+  }
+}

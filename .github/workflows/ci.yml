@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bot
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: integration-admin-only
+          POSTGRES_DB: undelete_integration
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d undelete_integration"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      POSTGRES_INTEGRATION_ADMIN_DSN: postgres://postgres:integration-admin-only@127.0.0.1:5432/undelete_integration?sslmode=disable
+      POSTGRES_INTEGRATION_RUNTIME_DSN: postgres://undelete_app:integration-runtime-only@127.0.0.1:5432/undelete_integration?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: bot/go.mod
+          cache-dependency-path: bot/go.sum
+      - name: Create restricted runtime role
+        working-directory: .
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGPASSWORD: integration-admin-only
+          POSTGRES_USER: postgres
+          POSTGRES_DB: undelete_integration
+          APP_DB_USER: undelete_app
+          APP_DB_PASSWORD: integration-runtime-only
+        run: sh db/init/01-app-role.sh
+      - run: test -z "$(gofmt -l .)"
+      - run: go test ./...
+      - run: go test -race ./...
+      - run: go build ./...
+      - run: go vet ./...
+      - name: PostgreSQL 16 integration tests
+        working-directory: .
+        run: make test-integration

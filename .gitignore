@@ -1,0 +1,14 @@
+.env
+
+# Build Go
+bot/undelete-bot
+
+# Données locales (bind mounts docker-compose)
+/media/*
+!/media/.gitkeep
+/backups/*
+!/backups/.gitkeep
+
+# Éditeurs / OS
+.DS_Store
+*.swp

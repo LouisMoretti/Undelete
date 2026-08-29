@@ -1,0 +1,80 @@
+name: undelete
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      APP_DB_USER: undelete_app
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    # Pas de "ports" : Postgres n'est joignable que depuis le réseau Docker
+    # interne (bot, backup). Aucune exposition sur l'hôte, même en local --
+    # réduit la surface d'attaque et évite les fuites de contenu de messages
+    # en cas de mauvaise configuration de pare-feu.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  bot:
+    build:
+      context: ./bot
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      OWNER_TELEGRAM_USER_ID: ${OWNER_TELEGRAM_USER_ID}
+    volumes:
+      - ./media:/app/media
+    # Conteneur durci : utilisateur non-root fixe, système de fichiers en
+    # lecture seule (seuls /tmp en tmpfs et le bind mount ./media sont
+    # inscriptibles), toutes les capabilities Linux retirées, pas
+    # d'escalade de privilèges possible.
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+
+  backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS}
+    volumes:
+      - ./scripts:/scripts:ro
+      - ./backups:/backups
+    working_dir: /backups
+    entrypoint:
+      - sh
+      - -c
+      - |
+        # Backup quotidien : un pg_dump immédiat, puis une boucle qui
+        # attend 24h entre chaque passage. Pas de cron pour rester simple
+        # et éviter une dépendance supplémentaire dans l'image.
+        export BACKUP_DIR=/backups
+        while true; do
+          sh /scripts/backup.sh
+          sleep 86400
+        done
+
+volumes:
+  postgres_data:

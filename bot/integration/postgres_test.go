@@ -4,6 +4,7 @@ package integration_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -19,9 +20,39 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/users"
 )
 
+func TestDestructiveInterlockRefusesUnsafeConfiguration(t *testing.T) {
+	tests := []struct {
+		name         string
+		optIn        string
+		databaseName string
+	}{
+		{name: "missing explicit opt-in", databaseName: "undelete_integration"},
+		{name: "wrong explicit opt-in", optIn: "true", databaseName: "undelete_integration"},
+		{name: "production database name", optIn: "I_UNDERSTAND_THIS_WILL_DELETE_DATA", databaseName: "undelete"},
+		{name: "near-match database name", optIn: "I_UNDERSTAND_THIS_WILL_DELETE_DATA", databaseName: "undelete_integration_copy"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateDestructiveInterlock(tt.optIn, tt.databaseName); err == nil {
+				t.Fatal("unsafe integration configuration unexpectedly accepted")
+			}
+		})
+	}
+}
+
+func TestDestructiveInterlockAcceptsExactConfiguration(t *testing.T) {
+	if err := validateDestructiveInterlock("I_UNDERSTAND_THIS_WILL_DELETE_DATA", "undelete_integration"); err != nil {
+		t.Fatalf("exact integration configuration rejected: %v", err)
+	}
+}
+
 func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 	adminDSN := requireEnv(t, "POSTGRES_INTEGRATION_ADMIN_DSN")
 	runtimeDSN := requireEnv(t, "POSTGRES_INTEGRATION_RUNTIME_DSN")
+	optIn := os.Getenv("POSTGRES_INTEGRATION_ALLOW_DESTRUCTIVE")
+	if err := validateExplicitDestructiveOptIn(optIn); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -30,6 +61,14 @@ func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 		t.Fatalf("connect admin: %v", err)
 	}
 	defer admin.Close(ctx)
+
+	var databaseName string
+	if err := admin.QueryRow(ctx, `SELECT current_database()`).Scan(&databaseName); err != nil {
+		t.Fatalf("read current database for destructive interlock: %v", err)
+	}
+	if err := validateDestructiveInterlock(optIn, databaseName); err != nil {
+		t.Fatal(err)
+	}
 
 	var serverVersionText string
 	if err := admin.QueryRow(ctx, `SHOW server_version_num`).Scan(&serverVersionText); err != nil {
@@ -209,6 +248,25 @@ func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 		}
 		assertTenantCount(t, ctx, db, owner2.ID, 2)
 	})
+}
+
+func validateExplicitDestructiveOptIn(optIn string) error {
+	const required = "I_UNDERSTAND_THIS_WILL_DELETE_DATA"
+	if optIn != required {
+		return fmt.Errorf("refusing destructive integration test: POSTGRES_INTEGRATION_ALLOW_DESTRUCTIVE must equal %q", required)
+	}
+	return nil
+}
+
+func validateDestructiveInterlock(optIn, databaseName string) error {
+	if err := validateExplicitDestructiveOptIn(optIn); err != nil {
+		return err
+	}
+	const requiredDatabase = "undelete_integration"
+	if databaseName != requiredDatabase {
+		return fmt.Errorf("refusing destructive integration test: server reports database %q, require exact dedicated name %q", databaseName, requiredDatabase)
+	}
+	return nil
 }
 
 func requireEnv(t *testing.T, name string) string {

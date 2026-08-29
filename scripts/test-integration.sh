@@ -16,6 +16,15 @@ run_tests() {
 if [ -n "${POSTGRES_INTEGRATION_ADMIN_DSN:-}" ] || [ -n "${POSTGRES_INTEGRATION_RUNTIME_DSN:-}" ]; then
     : "${POSTGRES_INTEGRATION_ADMIN_DSN:?both integration DSNs must be set}"
     : "${POSTGRES_INTEGRATION_RUNTIME_DSN:?both integration DSNs must be set}"
+    if [ "${POSTGRES_INTEGRATION_ALLOW_DESTRUCTIVE:-}" != "I_UNDERSTAND_THIS_WILL_DELETE_DATA" ]; then
+        cat >&2 <<'EOF'
+Refusing caller-provided PostgreSQL DSNs: this suite truncates data.
+Use a dedicated database named exactly "undelete_integration" and explicitly set:
+  POSTGRES_INTEGRATION_ALLOW_DESTRUCTIVE=I_UNDERSTAND_THIS_WILL_DELETE_DATA
+The Go suite also verifies current_database() on the server before migrations or TRUNCATE.
+EOF
+        exit 1
+    fi
     run_tests
     exit 0
 fi
@@ -54,17 +63,20 @@ docker run --detach --rm \
     postgres:16-alpine >/dev/null
 
 attempt=0
-until docker exec "$container" pg_isready -U postgres -d undelete_integration >/dev/null 2>&1; do
+until docker exec "$container" pg_isready -h 127.0.0.1 -U postgres -d undelete_integration >/dev/null 2>&1 &&
+    docker exec "$container" psql -h 127.0.0.1 -U postgres -d undelete_integration -tAc \
+        "SELECT 1 FROM pg_roles WHERE rolname = 'undelete_app'" | grep -qx 1; do
     attempt=$((attempt + 1))
     if [ "$attempt" -ge 60 ]; then
         docker logs "$container" >&2 || true
-        echo "PostgreSQL 16 did not become ready" >&2
+        echo "PostgreSQL 16 or the undelete_app role did not become ready" >&2
         exit 1
     fi
     sleep 1
 done
 
 port=$(docker port "$container" 5432/tcp | awk -F: 'NR == 1 { print $NF }')
-export POSTGRES_INTEGRATION_ADMIN_DSN="postgres://postgres:$admin_password@127.0.0.1:$port/undelete_integration?sslmode=disable"
-export POSTGRES_INTEGRATION_RUNTIME_DSN="postgres://undelete_app:$runtime_password@127.0.0.1:$port/undelete_integration?sslmode=disable"
+export POSTGRES_INTEGRATION_ADMIN_DSN="postgres://postgres:${admin_password}@127.0.0.1:$port/undelete_integration?sslmode=disable"
+export POSTGRES_INTEGRATION_RUNTIME_DSN="postgres://undelete_app:${runtime_password}@127.0.0.1:$port/undelete_integration?sslmode=disable"
+export POSTGRES_INTEGRATION_ALLOW_DESTRUCTIVE=I_UNDERSTAND_THIS_WILL_DELETE_DATA
 run_tests

@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -20,7 +21,10 @@ func fixture(t *testing.T, name string) []byte {
 	if err != nil {
 		t.Fatalf("lecture fixture %s: %v", name, err)
 	}
-	return []byte(strings.TrimSpace(string(data)))
+	if !bytes.HasSuffix(data, []byte("\n")) || bytes.HasSuffix(data, []byte("\n\n")) || bytes.HasSuffix(data, []byte("\r\n")) {
+		t.Fatalf("fixture %s: attendu exactement une newline LF finale", name)
+	}
+	return data[:len(data)-1]
 }
 
 func fixtureClient(t *testing.T, method, requestFixture, responseFixture string) *Client {
@@ -40,7 +44,7 @@ func fixtureClient(t *testing.T, method, requestFixture, responseFixture string)
 			t.Fatalf("lecture requête: %v", err)
 		}
 		want := fixture(t, requestFixture)
-		if string(body) != string(want) {
+		if !bytes.Equal(body, want) {
 			t.Errorf("JSON %s = %s, attendu %s", method, body, want)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -98,31 +102,38 @@ func TestGetBusinessConnectionBotAPIContract(t *testing.T) {
 }
 
 func TestSendMessageAlertContracts(t *testing.T) {
-	if _, exists := reflect.TypeOf(SendMessageRequest{}).FieldByName("BusinessConnectionID"); exists {
-		t.Fatal("SendMessageRequest permet encore business_connection_id pour une alerte")
+	typ := reflect.TypeOf(SendMessageRequest{})
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		if strings.Split(field.Tag.Get("json"), ",")[0] == "business_connection_id" {
+			t.Fatalf("SendMessageRequest.%s expose le tag JSON business_connection_id", field.Name)
+		}
 	}
 
 	tests := []struct {
-		name    string
-		fixture string
-		request SendMessageRequest
+		name     string
+		fixture  string
+		requests []SendMessageRequest
 	}{
 		{
-			name:    "welcome",
-			fixture: "send-message-welcome-request.json",
-			request: SendMessageRequest{ChatID: 700002, Text: "undelete est connecté. Alerte synthétique 🛡️"},
+			name:     "welcome",
+			fixture:  "send-message-welcome-request.json",
+			requests: []SendMessageRequest{BuildWelcomeMessageRequest(700002, 700001)},
 		},
 		{
-			name:    "deletion",
-			fixture: "send-message-deletion-request.json",
-			request: SendMessageRequest{ChatID: 700001, Text: "Message supprimé récupéré (chat 800001) :\n\nBonjour, café ☕ — déjà vu ?"},
+			name:     "deletion",
+			fixture:  "send-message-deletion-request.json",
+			requests: BuildDeletionMessageRequests(700001, 800001, "Bonjour, café ☕ — déjà vu ?"),
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client := fixtureClient(t, "sendMessage", tt.fixture, "send-message-response.json")
-			if err := client.SendMessage(context.Background(), tt.request); err != nil {
+			if len(tt.requests) != 1 {
+				t.Fatalf("nombre de requêtes = %d, attendu 1 pour cette fixture", len(tt.requests))
+			}
+			client := fixtureClient(t, "sendMessage", tt.fixture, "send-message-ok-envelope.json")
+			if err := client.SendMessage(context.Background(), tt.requests[0]); err != nil {
 				t.Fatalf("SendMessage(): %v", err)
 			}
 			if strings.Contains(string(fixture(t, tt.fixture)), "business_connection_id") {

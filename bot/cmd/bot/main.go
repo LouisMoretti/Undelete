@@ -13,6 +13,7 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/business"
 	"github.com/LouisMoretti/Undelete/bot/internal/config"
 	"github.com/LouisMoretti/Undelete/bot/internal/messages"
+	"github.com/LouisMoretti/Undelete/bot/internal/outbox"
 	"github.com/LouisMoretti/Undelete/bot/internal/storage"
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
 	"github.com/LouisMoretti/Undelete/bot/internal/users"
@@ -26,6 +27,7 @@ const httpClientTimeout = 60 * time.Second
 // retentionInterval fixe la fréquence de la purge de rétention. Une purge
 // quotidienne suffit largement (retention_days minimum = 1 jour).
 const retentionInterval = 24 * time.Hour
+const outboxInterval = time.Second
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -61,10 +63,12 @@ func run(logger *slog.Logger) error {
 	client := telegram.NewClient(cfg.TelegramBotToken, httpClientTimeout)
 	usersRepo := users.NewRepository(db.Pool)
 	messagesRepo := messages.NewRepository(db)
+	outboxRepo := outbox.NewRepository(db)
 	businessSvc := business.NewService(db.Pool, client, usersRepo, cfg.OwnerTelegramUserID, logger)
-	handler := app.NewHandler(businessSvc, messagesRepo, client, logger)
+	handler := app.NewHandler(businessSvc, messagesRepo, logger)
 
 	go runRetentionLoop(ctx, usersRepo, messagesRepo, logger)
+	go runOutboxLoop(ctx, usersRepo, outbox.NewWorker(outboxRepo, client, logger), logger)
 
 	poller := telegram.NewPoller(client, logger)
 	logger.Info("démarrage du poller", slog.Any("allowed_updates", telegram.AllowedUpdates))
@@ -75,6 +79,37 @@ func run(logger *slog.Logger) error {
 		return nil
 	}
 	return err
+}
+
+func runOutboxLoop(ctx context.Context, usersRepo *users.Repository, worker *outbox.Worker, logger *slog.Logger) {
+	ticker := time.NewTicker(outboxInterval)
+	defer ticker.Stop()
+
+	for {
+		tenants, err := usersRepo.ListTenantsForRetention(ctx)
+		if err != nil {
+			logger.Error("outbox: échec listage tenants", slog.String("error", err.Error()))
+		} else {
+			for _, tenant := range tenants {
+				for processed := 0; processed < 100; processed++ {
+					didProcess, err := worker.ProcessOne(ctx, tenant.OwnerUserID, time.Now())
+					if err != nil {
+						logger.Error("outbox: échec traitement", slog.Int64("owner_user_id", tenant.OwnerUserID), slog.String("error", err.Error()))
+						break
+					}
+					if !didProcess {
+						break
+					}
+				}
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // runRetentionLoop exécute PurgeExpired à intervalle régulier. Boucle

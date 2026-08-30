@@ -15,6 +15,7 @@ CREATE TABLE notification_outbox (
     attempts                INT NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     next_attempt_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     locked_until            TIMESTAMPTZ NULL,
+    lease_token             TEXT NULL,
     last_error_class        TEXT NULL,
     created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -31,3 +32,8 @@ ALTER TABLE notification_outbox FORCE ROW LEVEL SECURITY;
 CREATE POLICY notification_outbox_tenant_isolation ON notification_outbox
     USING (owner_user_id = NULLIF(current_setting('app.current_owner_user_id', true), '')::bigint)
     WITH CHECK (owner_user_id = NULLIF(current_setting('app.current_owner_user_id', true), '')::bigint);
+
+-- Grants explicites : cette migration peut être exécutée dans une base où les
+-- default privileges n'ont pas été configurés par le rôle propriétaire.
+GRANT SELECT, INSERT, UPDATE, DELETE ON notification_outbox TO undelete_app;
+GRANT USAGE, SELECT ON SEQUENCE notification_outbox_id_seq TO undelete_app;

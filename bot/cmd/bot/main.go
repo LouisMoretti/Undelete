@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -67,13 +68,27 @@ func run(logger *slog.Logger) error {
 	businessSvc := business.NewService(db.Pool, client, usersRepo, cfg.OwnerTelegramUserID, logger)
 	handler := app.NewHandler(businessSvc, messagesRepo, logger)
 
-	go runRetentionLoop(ctx, usersRepo, messagesRepo, logger)
-	go runOutboxLoop(ctx, usersRepo, outbox.NewWorker(outboxRepo, client, logger), logger)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		runRetentionLoop(ctx, usersRepo, messagesRepo, logger)
+	}()
+	go func() {
+		defer wg.Done()
+		runOutboxLoop(ctx, usersRepo, outbox.NewWorker(outboxRepo, client, logger), logger)
+	}()
 
 	poller := telegram.NewPoller(client, logger)
 	logger.Info("démarrage du poller", slog.Any("allowed_updates", telegram.AllowedUpdates))
 
 	err = poller.Run(ctx, handler.HandleUpdate)
+	// L'arrêt sur signal annule ctx : on attend que la rétention et l'outbox
+	// terminent leur itération en cours avant de fermer le pool, sinon une
+	// alerte réservée resterait 'processing' jusqu'à expiration du lease et
+	// pourrait être redoublée au redémarrage.
+	stop()
+	wg.Wait()
 	if ctx.Err() != nil {
 		logger.Info("arrêt demandé, extinction propre")
 		return nil

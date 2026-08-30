@@ -1,66 +1,27 @@
-package telegram
+// Ce fichier est en package telegram_test (test externe) et non en package
+// telegram : il importe telegramtest, qui importe lui-même telegram. Le test
+// externe est ce qui rend cette dépendance légale, et il garantit au passage
+// que les contrats sont vérifiés via l'API publique du package, comme le font
+// app et business.
+package telegram_test
 
 import (
-	"bytes"
 	"context"
-	"io"
-	"net/http"
-	"net/http/httptest"
-	"os"
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
-	"time"
+
+	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
+	"github.com/LouisMoretti/Undelete/bot/internal/telegram/telegramtest"
 )
 
-const fixtureVersion = "bot-api-10.3"
-
-func fixture(t *testing.T, name string) []byte {
-	t.Helper()
-	data, err := os.ReadFile("testdata/" + fixtureVersion + "/" + name)
-	if err != nil {
-		t.Fatalf("lecture fixture %s: %v", name, err)
-	}
-	if !bytes.HasSuffix(data, []byte("\n")) || bytes.HasSuffix(data, []byte("\n\n")) || bytes.HasSuffix(data, []byte("\r\n")) {
-		t.Fatalf("fixture %s: attendu exactement une newline LF finale", name)
-	}
-	return data[:len(data)-1]
-}
-
-func fixtureClient(t *testing.T, method, requestFixture, responseFixture string) *Client {
-	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("méthode HTTP = %s, attendu POST", r.Method)
-		}
-		if r.URL.Path != "/bottest-token/"+method {
-			t.Errorf("chemin = %s, attendu /bottest-token/%s", r.URL.Path, method)
-		}
-		if got := r.Header.Get("Content-Type"); got != "application/json" {
-			t.Errorf("Content-Type = %q, attendu application/json", got)
-		}
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("lecture requête: %v", err)
-		}
-		want := fixture(t, requestFixture)
-		if !bytes.Equal(body, want) {
-			t.Errorf("JSON %s = %s, attendu %s", method, body, want)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		if _, err := w.Write(fixture(t, responseFixture)); err != nil {
-			t.Fatalf("écriture réponse: %v", err)
-		}
-	}))
-	t.Cleanup(server.Close)
-
-	client := NewClient("test-token", time.Second)
-	client.baseURL = server.URL + "/bot"
-	return client
-}
-
 func TestGetUpdatesBotAPIContract(t *testing.T) {
-	client := fixtureClient(t, "getUpdates", "get-updates-request.json", "get-updates-response.json")
+	client := telegramtest.NewClient(t, telegramtest.Call{
+		Method:          "getUpdates",
+		RequestFixture:  "get-updates-request.json",
+		ResponseFixture: "get-updates-response.json",
+	})
 	updates, err := client.GetUpdates(context.Background(), 9000, 50)
 	if err != nil {
 		t.Fatalf("GetUpdates(): %v", err)
@@ -88,7 +49,11 @@ func TestGetUpdatesBotAPIContract(t *testing.T) {
 }
 
 func TestGetBusinessConnectionBotAPIContract(t *testing.T) {
-	client := fixtureClient(t, "getBusinessConnection", "get-business-connection-request.json", "get-business-connection-response.json")
+	client := telegramtest.NewClient(t, telegramtest.Call{
+		Method:          "getBusinessConnection",
+		RequestFixture:  "get-business-connection-request.json",
+		ResponseFixture: "get-business-connection-response.json",
+	})
 	connection, err := client.GetBusinessConnection(context.Background(), "bc_fixture_001")
 	if err != nil {
 		t.Fatalf("GetBusinessConnection(): %v", err)
@@ -101,29 +66,74 @@ func TestGetBusinessConnectionBotAPIContract(t *testing.T) {
 	}
 }
 
-func TestSendMessageAlertContracts(t *testing.T) {
-	typ := reflect.TypeOf(SendMessageRequest{})
+// TestSendMessageRequestNeverSerializesBusinessConnectionID matérialise la
+// contrainte n°7 sans jamais nommer un champ Go : le type est inspecté par ses
+// tags JSON (récursivement, champs embarqués inclus) puis par la charge utile
+// qu'il produit réellement. Le test reste donc valide si SendMessageRequest
+// gagne, perd ou renomme des champs.
+func TestSendMessageRequestNeverSerializesBusinessConnectionID(t *testing.T) {
+	assertNoBusinessConnectionIDTag(t, reflect.TypeOf(telegram.SendMessageRequest{}), "SendMessageRequest")
+
+	payload, err := json.Marshal(telegram.SendMessageRequest{ChatID: 700001, Text: "charge utile de contrôle"})
+	if err != nil {
+		t.Fatalf("sérialisation SendMessageRequest: %v", err)
+	}
+	telegramtest.AssertNoBusinessConnectionID(t, payload)
+}
+
+func assertNoBusinessConnectionIDTag(t *testing.T, typ reflect.Type, path string) {
+	t.Helper()
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	if typ.Kind() != reflect.Struct {
+		return
+	}
 	for i := 0; i < typ.NumField(); i++ {
 		field := typ.Field(i)
-		if strings.Split(field.Tag.Get("json"), ",")[0] == "business_connection_id" {
-			t.Fatalf("SendMessageRequest.%s expose le tag JSON business_connection_id", field.Name)
+		if !field.IsExported() {
+			continue // non sérialisé par encoding/json
+		}
+		name := strings.Split(field.Tag.Get("json"), ",")[0]
+		if name == "-" {
+			continue
+		}
+		if name == "" {
+			name = field.Name
+		}
+		if name == "business_connection_id" {
+			t.Fatalf("%s.%s sérialise business_connection_id", path, field.Name)
+		}
+		// Un champ embarqué remonte ses propres clés au niveau parent : ses
+		// tags comptent donc autant que ceux du type lui-même.
+		if field.Anonymous {
+			assertNoBusinessConnectionIDTag(t, field.Type, path+"."+field.Name)
 		}
 	}
+}
 
+// TestSendMessageAlertContracts fige les deux charges utiles d'alerte telles
+// que construites par les builders de production, octet par octet.
+//
+// Les chemins d'appel qui alimentent ces builders en production sont couverts
+// à leur propre niveau, faute de quoi ce test ne prouverait rien sur ce que le
+// bot envoie vraiment : business.TestWelcomeAlertContract (bienvenue) et
+// app.TestDeletionAlertContract (suppression).
+func TestSendMessageAlertContracts(t *testing.T) {
 	tests := []struct {
 		name     string
 		fixture  string
-		requests []SendMessageRequest
+		requests []telegram.SendMessageRequest
 	}{
 		{
 			name:     "welcome",
 			fixture:  "send-message-welcome-request.json",
-			requests: []SendMessageRequest{BuildWelcomeMessageRequest(700002, 700001)},
+			requests: []telegram.SendMessageRequest{telegram.BuildWelcomeMessageRequest(700002, 700001)},
 		},
 		{
 			name:     "deletion",
 			fixture:  "send-message-deletion-request.json",
-			requests: BuildDeletionMessageRequests(700001, 800001, "Bonjour, café ☕ — déjà vu ?"),
+			requests: telegram.BuildDeletionMessageRequests(700001, 800001, "Bonjour, café ☕ — déjà vu ?"),
 		},
 	}
 
@@ -132,13 +142,31 @@ func TestSendMessageAlertContracts(t *testing.T) {
 			if len(tt.requests) != 1 {
 				t.Fatalf("nombre de requêtes = %d, attendu 1 pour cette fixture", len(tt.requests))
 			}
-			client := fixtureClient(t, "sendMessage", tt.fixture, "send-message-ok-envelope.json")
+			client := telegramtest.NewClient(t, telegramtest.Call{
+				Method:          "sendMessage",
+				RequestFixture:  tt.fixture,
+				ResponseFixture: telegramtest.OKEnvelopeFixture,
+			})
 			if err := client.SendMessage(context.Background(), tt.requests[0]); err != nil {
 				t.Fatalf("SendMessage(): %v", err)
 			}
-			if strings.Contains(string(fixture(t, tt.fixture)), "business_connection_id") {
-				t.Fatalf("fixture d'alerte %s contient business_connection_id", tt.fixture)
-			}
+			telegramtest.AssertNoBusinessConnectionID(t, telegramtest.Fixture(t, tt.fixture))
 		})
+	}
+}
+
+// TestWelcomeMessageTextIsTheProductionText verrouille le texte de bienvenue
+// figé dans la fixture sur celui que produit le builder de production : la
+// fixture ne peut pas dériver vers un texte « de test ».
+func TestWelcomeMessageTextIsTheProductionText(t *testing.T) {
+	var fixture struct {
+		ChatID int64  `json:"chat_id"`
+		Text   string `json:"text"`
+	}
+	if err := json.Unmarshal(telegramtest.Fixture(t, "send-message-welcome-request.json"), &fixture); err != nil {
+		t.Fatalf("décodage fixture bienvenue: %v", err)
+	}
+	if got := telegram.BuildWelcomeMessageRequest(700002, 700001).Text; got != fixture.Text {
+		t.Fatalf("texte de bienvenue de production = %q, fixture = %q", got, fixture.Text)
 	}
 }

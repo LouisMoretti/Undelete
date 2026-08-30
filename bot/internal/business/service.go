@@ -179,14 +179,25 @@ func (s *Service) HandleBusinessConnection(ctx context.Context, tc telegram.Busi
 		slog.Bool("can_reply", resolved.CanReply),
 		slog.Bool("is_enabled", resolved.IsEnabled))
 
-	// Contrainte n°7 : jamais de BusinessConnectionID ici, sous peine
-	// d'envoyer ce message EN TANT QUE le owner dans une conversation
-	// surveillée.
+	s.notifyWelcome(ctx, tc)
+
+	return nil
+}
+
+// notifyWelcome envoie l'alerte de bienvenue au owner.
+//
+// Contrainte n°7 : jamais de BusinessConnectionID ici, sous peine d'envoyer ce
+// message EN TANT QUE le owner dans une conversation surveillée. L'échec est
+// logué sans interrompre le traitement : la connexion est déjà persistée, la
+// perte d'un message de bienvenue ne doit pas faire rejouer l'update.
+//
+// Ces trois lignes sont isolées pour que le contrat filaire de l'alerte soit
+// testable sur le chemin de production lui-même, sans base de données (cf.
+// TestWelcomeAlertContract).
+func (s *Service) notifyWelcome(ctx context.Context, tc telegram.BusinessConnection) {
 	if err := s.client.SendMessage(ctx, telegram.BuildWelcomeMessageRequest(tc.UserChatID, tc.User.ID)); err != nil {
 		s.logger.Error("échec envoi message de bienvenue", slog.String("error", err.Error()))
 	}
-
-	return nil
 }
 
 // upsertFromTelegram upsert user + business_connections à partir d'une

@@ -62,10 +62,19 @@ docker run --detach --rm \
     --volume "$ROOT/db/init:/docker-entrypoint-initdb.d:ro" \
     postgres:16-alpine >/dev/null
 
+# Les deux conditions visent 127.0.0.1 et non le socket Unix : pendant
+# docker-entrypoint-initdb.d, l'image officielle démarre un serveur temporaire
+# accessible uniquement par socket. Un pg_isready sur socket réussirait donc
+# AVANT la fin des scripts d'init et avant l'écoute TCP, et le port publié
+# refuserait ensuite la connexion par intermittence. La requête sur pg_roles
+# confirme en plus que db/init/01-app-role.sh est allé au bout.
+# PGPASSWORD est indispensable : le pg_hba.conf généré par l'image impose
+# scram-sha-256 pour les connexions host, y compris depuis le conteneur.
 attempt=0
 until docker exec "$container" pg_isready -h 127.0.0.1 -U postgres -d undelete_integration >/dev/null 2>&1 &&
-    docker exec "$container" psql -h 127.0.0.1 -U postgres -d undelete_integration -tAc \
-        "SELECT 1 FROM pg_roles WHERE rolname = 'undelete_app'" | grep -qx 1; do
+    docker exec --env PGPASSWORD="$admin_password" "$container" \
+        psql -h 127.0.0.1 -U postgres -d undelete_integration -tAc \
+        "SELECT 1 FROM pg_roles WHERE rolname = 'undelete_app'" 2>/dev/null | grep -qx 1; do
     attempt=$((attempt + 1))
     if [ "$attempt" -ge 60 ]; then
         docker logs "$container" >&2 || true

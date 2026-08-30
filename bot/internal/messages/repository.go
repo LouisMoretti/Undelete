@@ -165,7 +165,7 @@ func (r *Repository) PurgeExpired(ctx context.Context, tenants []users.TenantRet
 			tag, err := tx.Exec(ctx, `
 				DELETE FROM messages
 				WHERE owner_user_id = $1
-				  AND saved_at < now() - ($2 || ' days')::interval
+				  AND saved_at < now() - make_interval(days => $2)
 			`, t.OwnerUserID, t.RetentionDays)
 			if err != nil {
 				return fmt.Errorf("purge tenant %d: %w", t.OwnerUserID, err)

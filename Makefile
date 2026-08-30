@@ -1,4 +1,4 @@
-.PHONY: build vet fmt tidy check up down logs
+.PHONY: build vet fmt tidy check test-integration up down logs
 
 # Les 4 commandes de livraison, regroupées.
 check:
@@ -15,6 +15,9 @@ vet:
 
 fmt:
 	cd bot && gofmt -l .
+
+test-integration:
+	./scripts/test-integration.sh
 
 up:
 	docker compose up --build -d

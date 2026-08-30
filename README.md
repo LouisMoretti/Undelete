@@ -55,6 +55,35 @@ Au boot, le binaire applique les migrations avec le DSN propriétaire
 restreint (`DATABASE_URL`, rôle `undelete_app`), avant de démarrer le
 long-polling.
 
+## Tests d’intégration PostgreSQL 16
+
+La suite réelle (sans mocks) vérifie les migrations et leur réexécution, le
+rôle runtime, les refus de rôles dangereux et de DDL, le fail-closed RLS,
+l’isolation CRUD de deux tenants et `PurgeExpired` tenant par tenant.
+
+```bash
+make test-integration
+```
+
+La commande démarre un conteneur PostgreSQL 16 jetable, sans volume Docker,
+puis supprime uniquement ce conteneur à la fin. Elle ne prune et ne modifie
+aucune ressource Docker existante. Si Docker n’est pas accessible, elle échoue
+explicitement et accepte à la place deux DSN vers une instance PostgreSQL 16
+locale préparée avec `db/init/01-app-role.sh`. Ce mode externe refuse toute
+opération tant que la base rapportée par `current_database()` ne s’appelle pas
+exactement `undelete_integration` et que l’opt-in destructif littéral n’est pas
+fourni :
+
+```bash
+POSTGRES_INTEGRATION_ADMIN_DSN='postgres://...' \
+POSTGRES_INTEGRATION_RUNTIME_DSN='postgres://undelete_app:...' \
+POSTGRES_INTEGRATION_ALLOW_DESTRUCTIVE=I_UNDERSTAND_THIS_WILL_DELETE_DATA \
+make test-integration
+```
+
+La recette Docker positionne elle-même cet opt-in, uniquement pour son
+conteneur éphémère et sa base dédiée.
+
 ## Architecture
 
 ```

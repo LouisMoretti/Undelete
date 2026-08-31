@@ -10,7 +10,10 @@ Version vérifiée : **Telegram Bot API 10.3 (24 août 2026)**, d'après la
 
 Le répertoire versionné `bot-api-10.3` couvre les quatre types d'updates
 Business, `rights.can_reply`, `user_chat_id`, une suppression groupée, Unicode,
-les champs optionnels et l'absence autorisée de `from`.
+les champs optionnels et l'absence autorisée de `from`. S'y ajoutent trois
+contrats de bord : le `can_reply` legacy (posé sur la connexion, sans bloc
+`rights`), l'enveloppe d'erreur `429` avec `parameters.retry_after`, et le tout
+premier `getUpdates`, dont l'`offset` 0 n'est pas sérialisé (`omitempty`).
 
 ## Convention de comparaison
 
@@ -37,6 +40,7 @@ test : ce sont les **chemins de production** qui les produisent.
 | `get-business-connection-*.json` | `telegram.Client.GetBusinessConnection` |
 | `send-message-welcome-request.json` | `business.Service.notifyWelcome` (+ le builder, côté `telegram`) |
 | `send-message-deletion-request.json` | `app.Handler.notifyDeletion` (+ le builder, côté `telegram`) |
+| `send-message-rate-limited-response.json` | `telegram.Client.SendMessage` (respect de `retry_after`) et `SendMessageOnce` |
 
 ## `send-message-ok-envelope.json` n'est pas un contrat
 

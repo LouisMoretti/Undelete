@@ -8,9 +8,12 @@ package telegram_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram/telegramtest"
@@ -63,6 +66,114 @@ func TestGetBusinessConnectionBotAPIContract(t *testing.T) {
 	}
 	if connection.User.LastName != "" || connection.User.Username != "" {
 		t.Fatalf("champs utilisateur optionnels inattendus: %#v", connection.User)
+	}
+}
+
+// TestGetBusinessConnectionLegacyCanReplyContract fige au filaire le chemin
+// legacy de BusinessConnection : `can_reply` posé directement sur la connexion,
+// sans bloc `rights`. Ce chemin n'était jusqu'ici exercé qu'en process (à
+// partir d'une structure Go construite à la main) ; la fixture prouve qu'une
+// réponse Bot API réellement formée ainsi est décodée comme « peut répondre »
+// et non silencieusement comme false.
+func TestGetBusinessConnectionLegacyCanReplyContract(t *testing.T) {
+	client := telegramtest.NewClient(t, telegramtest.Call{
+		Method:          "getBusinessConnection",
+		RequestFixture:  "get-business-connection-request.json",
+		ResponseFixture: "get-business-connection-legacy-can-reply-response.json",
+	})
+	connection, err := client.GetBusinessConnection(context.Background(), "bc_fixture_001")
+	if err != nil {
+		t.Fatalf("GetBusinessConnection(): %v", err)
+	}
+	if connection.Rights != nil {
+		t.Fatalf("la fixture legacy ne doit porter aucun bloc rights: %#v", connection.Rights)
+	}
+	if !connection.CanReplyLegacy || !connection.CanReply() {
+		t.Fatalf("can_reply legacy mal décodé: %#v", connection)
+	}
+}
+
+// TestGetUpdatesFirstPollOffsetZeroContract fige la sérialisation du TOUT
+// premier poll : `offset` est `omitempty`, donc l'offset 0 n'apparaît pas dans
+// le corps émis. C'est le comportement attendu — Telegram traite l'absence
+// d'offset comme « depuis le plus ancien update non confirmé » — mais il n'est
+// figé nulle part ailleurs, alors qu'il conditionne le premier appel de chaque
+// démarrage du bot.
+func TestGetUpdatesFirstPollOffsetZeroContract(t *testing.T) {
+	client := telegramtest.NewClient(t, telegramtest.Call{
+		Method:          "getUpdates",
+		RequestFixture:  "get-updates-first-poll-request.json",
+		ResponseFixture: "get-updates-empty-response.json",
+	})
+	updates, err := client.GetUpdates(context.Background(), 0, 50)
+	if err != nil {
+		t.Fatalf("GetUpdates(): %v", err)
+	}
+	if len(updates) != 0 {
+		t.Fatalf("nombre d'updates = %d, attendu 0", len(updates))
+	}
+
+	// Le corps a déjà été comparé octet par octet par le serveur de test ; on
+	// vérifie ici que c'est bien l'ABSENCE de la clé qui est figée, et non un
+	// "offset":0 qui aurait été recopié dans la fixture.
+	var body map[string]any
+	if err := json.Unmarshal(telegramtest.Fixture(t, "get-updates-first-poll-request.json"), &body); err != nil {
+		t.Fatalf("décodage fixture premier poll: %v", err)
+	}
+	if _, ok := body["offset"]; ok {
+		t.Fatalf("la fixture du premier poll sérialise offset: %v", body["offset"])
+	}
+}
+
+// TestSendMessageRetryAfterContract fige la requête RÉÉMISE après une
+// enveloppe 429 : le client doit respecter retry_after puis repartir avec des
+// octets strictement identiques. L'enveloppe elle-même n'était couverte qu'en
+// process ; le mécanisme octet par octet vérifie en plus qu'aucun paramètre
+// n'est ajouté ni perdu à la seconde tentative.
+//
+// retry_after vaut 1 seconde dans la fixture : suffisant pour exercer
+// l'attente réelle de SendMessage sans allonger la suite de tests.
+func TestSendMessageRetryAfterContract(t *testing.T) {
+	const fixture = "send-message-welcome-request.json"
+	client := telegramtest.NewClient(t,
+		telegramtest.Call{
+			Method:          "sendMessage",
+			RequestFixture:  fixture,
+			ResponseFixture: "send-message-rate-limited-response.json",
+		},
+		telegramtest.Call{
+			Method:          "sendMessage",
+			RequestFixture:  fixture,
+			ResponseFixture: telegramtest.OKEnvelopeFixture,
+		},
+	)
+
+	start := time.Now()
+	if err := client.SendMessage(context.Background(), telegram.BuildWelcomeMessageRequest(700002, 700001)); err != nil {
+		t.Fatalf("SendMessage(): %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < time.Second {
+		t.Fatalf("retry_after non respecté: réémission après %s, attendu >= 1s", elapsed)
+	}
+}
+
+// TestRateLimitedEnvelopeIsDecodedAsAPIError fige la lecture de l'enveloppe 429
+// elle-même : code et retry_after doivent remonter dans *telegram.APIError,
+// seule voie par laquelle le poller et SendMessage savent combien attendre.
+func TestRateLimitedEnvelopeIsDecodedAsAPIError(t *testing.T) {
+	client := telegramtest.NewClient(t, telegramtest.Call{
+		Method:          "sendMessage",
+		RequestFixture:  "send-message-welcome-request.json",
+		ResponseFixture: "send-message-rate-limited-response.json",
+	})
+
+	err := client.SendMessageOnce(context.Background(), telegram.BuildWelcomeMessageRequest(700002, 700001))
+	var apiErr *telegram.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("SendMessageOnce() = %v, attendu *telegram.APIError", err)
+	}
+	if apiErr.Code != http.StatusTooManyRequests || apiErr.RetryAfter != 1 || !apiErr.IsRateLimited() {
+		t.Fatalf("enveloppe 429 mal décodée: %#v", apiErr)
 	}
 }
 

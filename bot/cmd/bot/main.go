@@ -72,7 +72,7 @@ func run(logger *slog.Logger) error {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		runRetentionLoop(ctx, usersRepo, messagesRepo, logger)
+		runRetentionLoop(ctx, usersRepo, messagesRepo, outboxRepo, logger)
 	}()
 	go func() {
 		defer wg.Done()
@@ -127,11 +127,13 @@ func runOutboxLoop(ctx context.Context, usersRepo *users.Repository, worker *out
 	}
 }
 
-// runRetentionLoop exécute PurgeExpired à intervalle régulier. Boucle
-// indépendante du poller : une purge lente ou en erreur ne doit jamais
-// retarder le traitement des updates Telegram (contrainte de réactivité du
-// long-polling).
-func runRetentionLoop(ctx context.Context, usersRepo *users.Repository, messagesRepo *messages.Repository, logger *slog.Logger) {
+// runRetentionLoop exécute PurgeExpired à intervalle régulier, pour messages
+// ET pour notification_outbox : cette dernière contient payload_text (du
+// contenu utilisateur) et, sans purge, ses lignes 'sent'/'failed' croîtraient
+// indéfiniment en échappant à retention_days. Boucle indépendante du poller :
+// une purge lente ou en erreur ne doit jamais retarder le traitement des
+// updates Telegram (contrainte de réactivité du long-polling).
+func runRetentionLoop(ctx context.Context, usersRepo *users.Repository, messagesRepo *messages.Repository, outboxRepo *outbox.Repository, logger *slog.Logger) {
 	ticker := time.NewTicker(retentionInterval)
 	defer ticker.Stop()
 
@@ -150,7 +152,15 @@ func runRetentionLoop(ctx context.Context, usersRepo *users.Repository, messages
 				logger.Error("purge rétention: échec", slog.String("error", err.Error()), slog.Int64("purged_before_error", purged))
 				continue
 			}
-			logger.Info("purge rétention terminée", slog.Int64("purged", purged), slog.Int("tenants", len(tenants)))
+			purgedOutbox, err := outboxRepo.PurgeExpired(ctx, tenants)
+			if err != nil {
+				logger.Error("purge rétention outbox: échec", slog.String("error", err.Error()), slog.Int64("purged_before_error", purgedOutbox))
+				continue
+			}
+			logger.Info("purge rétention terminée",
+				slog.Int64("purged", purged),
+				slog.Int64("purged_outbox", purgedOutbox),
+				slog.Int("tenants", len(tenants)))
 		}
 	}
 }

@@ -192,6 +192,13 @@ func TestSendMessageRequestNeverSerializesBusinessConnectionID(t *testing.T) {
 	telegramtest.AssertNoBusinessConnectionID(t, payload)
 }
 
+// fixtureSenderID matérialise un from_user_id renseigné (la colonne est
+// NULLable, d'où le pointeur).
+func fixtureSenderID() *int64 {
+	id := int64(800001)
+	return &id
+}
+
 func assertNoBusinessConnectionIDTag(t *testing.T, typ reflect.Type, path string) {
 	t.Helper()
 	for typ.Kind() == reflect.Pointer {
@@ -228,8 +235,10 @@ func assertNoBusinessConnectionIDTag(t *testing.T, typ reflect.Type, path string
 //
 // Les chemins d'appel qui alimentent ces builders en production sont couverts
 // à leur propre niveau, faute de quoi ce test ne prouverait rien sur ce que le
-// bot envoie vraiment : business.TestWelcomeAlertContract (bienvenue) et
-// app.TestDeletionAlertContract (suppression).
+// bot envoie vraiment : business.TestWelcomeAlertContract (bienvenue) et, pour
+// la suppression, messages.Repository.MarkDeleted -- qui écrit ces mêmes
+// chunks en outbox -- vérifié par la suite d'intégration PostgreSQL
+// (« chat labels are tenant isolated and reach the alert »).
 func TestSendMessageAlertContracts(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -242,9 +251,21 @@ func TestSendMessageAlertContracts(t *testing.T) {
 			requests: []telegram.SendMessageRequest{telegram.BuildWelcomeMessageRequest(700002, 700001)},
 		},
 		{
-			name:     "deletion",
-			fixture:  "send-message-deletion-request.json",
-			requests: telegram.BuildDeletionMessageRequests(700001, 800001, "Bonjour, café ☕ — déjà vu ?"),
+			name:    "deletion",
+			fixture: "send-message-deletion-request.json",
+			// Même scénario que l'update business_message de
+			// get-updates-response.json, vu depuis la suppression : chat privé
+			// « Anaïs » (800001), expéditeur homonyme, date d'envoi du message.
+			requests: telegram.BuildDeletionMessageRequests(telegram.DeletionAlert{
+				OwnerTelegramUserID: 700001,
+				ChatID:              800001,
+				ChatTitle:           "Anaïs",
+				FromDisplay:         "Anaïs (@fixture_sender)",
+				FromUserID:          fixtureSenderID(),
+				MessageType:         "text",
+				TelegramDate:        1788019201,
+				Content:             "Bonjour, café ☕ — déjà vu ?",
+			}),
 		},
 	}
 

@@ -7,12 +7,12 @@ package messages
 import (
 	"context"
 	"fmt"
-	"unicode/utf16"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/LouisMoretti/Undelete/bot/internal/outbox"
 	"github.com/LouisMoretti/Undelete/bot/internal/storage"
+	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
 	"github.com/LouisMoretti/Undelete/bot/internal/users"
 )
 
@@ -141,11 +141,15 @@ func (r *Repository) MarkDeleted(ctx context.Context, ownerUserID, ownerTelegram
 		rows.Close()
 
 		for _, d := range found {
-			text := fmt.Sprintf("Message supprimé récupéré (chat %d) :\n\n%s", d.ChatID, d.TextContent)
-			for chunkIndex, chunk := range splitUTF16(text, 4096) {
+			// telegram.BuildDeletionMessageRequests est l'unique source du
+			// format et du découpage UTF-16 des alertes de suppression (les
+			// fixtures bot-api-10.3 sont produites par ce même chemin) : les
+			// chunks écrits en outbox ici sont exactement ceux que le worker
+			// enverra, sans reformulation locale parallèle.
+			for chunkIndex, request := range telegram.BuildDeletionMessageRequests(ownerTelegramUserID, d.ChatID, d.TextContent) {
 				if err := outbox.InsertTx(ctx, tx, ownerUserID, ownerTelegramUserID,
 					businessConnectionID, d.ChatID, d.MessageID, outbox.EventDeletedMessage,
-					chunkIndex, chunk); err != nil {
+					chunkIndex, request.Text); err != nil {
 					return err
 				}
 			}
@@ -162,29 +166,6 @@ func (r *Repository) MarkDeleted(ctx context.Context, ownerUserID, ownerTelegram
 	// niveau debug et la décision "on continue" sont du ressort de
 	// l'appelant (app/handler.go), qui a le contexte du lot complet.
 	return found, nil
-}
-
-func splitUTF16(text string, limit int) []string {
-	var chunks []string
-	current := make([]rune, 0, limit)
-	units := 0
-	for _, r := range text {
-		runeUnits := utf16.RuneLen(r)
-		if runeUnits < 1 {
-			runeUnits = 1
-		}
-		if units+runeUnits > limit && len(current) > 0 {
-			chunks = append(chunks, string(current))
-			current = current[:0]
-			units = 0
-		}
-		current = append(current, r)
-		units += runeUnits
-	}
-	if len(current) > 0 {
-		chunks = append(chunks, string(current))
-	}
-	return chunks
 }
 
 // PurgeExpired supprime les messages dont la rétention est dépassée,

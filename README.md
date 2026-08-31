@@ -84,6 +84,38 @@ make test-integration
 La recette Docker positionne elle-même cet opt-in, uniquement pour son
 conteneur éphémère et sa base dédiée.
 
+Le script câble aussi `OUTBOX_TEST_DATABASE_URL` (DSN runtime) et
+`OUTBOX_TEST_MIGRATION_DATABASE_URL` (DSN admin) vers la même base éphémère,
+pour que les tests outbox de `bot/internal/outbox` — gates par ces variables et
+sinon silencieusement ignorés — tournent dans la même exécution, après les
+migrations posées par la suite `bot/integration`. Des valeurs fournies par
+l’appelant sont respectées telles quelles.
+
+## CI
+
+`.github/workflows/ci.yml` s’exécute sur chaque `pull_request` et sur chaque
+`push` vers `main`, avec deux jobs :
+
+- **`lint + tests unitaires`** : `gofmt -l` (échec si sortie), `go vet ./...`,
+  `go test ./...` sur le module `bot/`.
+- **`intégration PostgreSQL 16`** : `make test-integration`, qui démarre son
+  propre conteneur PostgreSQL 16 jetable sur le runner et exécute la suite
+  d’intégration puis les tests outbox.
+
+Aucun secret n’est utilisé, aucune base réelle n’est exposée : uniquement des
+conteneurs éphémères avec des identifiants jetables. Le jeton `GITHUB_TOKEN`
+est en `contents: read`.
+
+**Protection de branche à activer côté GitHub** (*Settings → Branches → Add
+branch ruleset* / *Add rule* sur `main`) — non automatisable depuis ce dépôt :
+
+1. *Require a pull request before merging*.
+2. *Require status checks to pass before merging*, puis sélectionner les deux
+   checks `lint + tests unitaires` et `intégration PostgreSQL 16` (ils
+   n’apparaissent dans la liste qu’après une première exécution du workflow).
+3. *Require branches to be up to date before merging*.
+4. Interdire les force-push sur `main`.
+
 ## Architecture
 
 ```

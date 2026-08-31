@@ -10,6 +10,15 @@ run_tests() {
     (
         cd "$ROOT/bot"
         go test -tags=integration -count=1 -v ./integration
+        # Les tests outbox vivent hors du tag `integration` et sont gates par
+        # leurs propres variables : sans ce câblage ils s’ignoreraient (t.Skip)
+        # alors que la base migrée par la suite ci-dessus est juste là. Le DSN
+        # runtime alimente le rôle applicatif, le DSN admin la preuve de
+        # rollback atomique (trigger temporaire, donc propriétaire requis).
+        # Un réglage fourni par l’appelant reste prioritaire.
+        OUTBOX_TEST_DATABASE_URL="${OUTBOX_TEST_DATABASE_URL:-$POSTGRES_INTEGRATION_RUNTIME_DSN}" \
+            OUTBOX_TEST_MIGRATION_DATABASE_URL="${OUTBOX_TEST_MIGRATION_DATABASE_URL:-$POSTGRES_INTEGRATION_ADMIN_DSN}" \
+            go test -count=1 -v ./internal/outbox
     )
 }
 

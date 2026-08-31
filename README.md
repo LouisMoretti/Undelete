@@ -140,7 +140,7 @@ branch ruleset* / *Add rule* sur `main`) — non automatisable depuis ce dépôt
                               │
                               ▼
                         PostgreSQL 16
-       users / business_connections / messages / notification_outbox
+  users / business_connections / chats / messages / notification_outbox
              (FORCE RLS sur le contenu et l'outbox par tenant)
 ```
 
@@ -150,7 +150,7 @@ branch ruleset* / *Add rule* sur `main`) — non automatisable depuis ce dépôt
 - **`storage.RunMigrations`** applique `internal/storage/migrations/*.sql`
   avec le DSN propriétaire, au boot, avant l'ouverture du pool applicatif.
 - **`storage.DB.InTenant`** est le seul point d'entrée légitime vers les
-  tables `messages` et `notification_outbox` : il pose
+  tables `chats`, `messages` et `notification_outbox` : il pose
   `app.current_owner_user_id` en `LOCAL` (scope transaction) avant toute
   requête.
 - **Outbox durable** : `deleted_at` et les chunks de notification sont écrits
@@ -159,6 +159,12 @@ branch ruleset* / *Add rule* sur `main`) — non automatisable depuis ce dépôt
   respecte `retry_after` sur 429 et applique un backoff exponentiel sur les
   erreurs réseau et 5xx. Les états `pending`, `processing`, `sent` et `failed`
   restent observables sans journaliser le payload.
+- **Alertes lisibles** : chaque notification de suppression porte le chat (son
+  libellé quand il est connu, son `chat_id` toujours), l'expéditeur, le type et
+  la date d'envoi en UTC, avant le contenu restitué. Le libellé vient de la
+  table `chats`, écrite à chaque message reçu — c'est un libellé d'AFFICHAGE,
+  jamais un filtre (cf. piège n°8). Un chat sans libellé connu s'affiche
+  « chat &lt;id&gt; ».
 
 ### Garanties de livraison des alertes
 
@@ -210,7 +216,10 @@ branch ruleset* / *Add rule* sur `main`) — non automatisable depuis ce dépôt
 8. **Sauvegarde exhaustive et automatique.** Aucune table, commande,
    variable d'environnement ou condition ne permet de choisir quels chats
    enregistrer. `is_enabled` porte sur la connexion Business entière,
-   jamais sur une conversation individuelle.
+   jamais sur une conversation individuelle. La table `chats` ne fait
+   exception à rien : elle stocke un libellé pour rendre les alertes
+   lisibles, sans aucun drapeau d'activation, et n'est jamais consultée
+   pour décider quoi sauvegarder ou notifier.
 
 ## Confidentialité
 

@@ -130,22 +130,17 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeoutSeconds in
 
 const sendMessageAttempts = 3
 
-// SendMessage envoie un message. Voir le commentaire sur
-// SendMessageRequest.BusinessConnectionID (contrainte n°7) avant tout appel
-// depuis un nouveau point du code. Les erreurs transitoires sont rejouées de
-// façon bornée : l'offset Telegram doit avancer même si un handler échoue, donc
-// ces retries sont la seule fenêtre Phase 1 pour éviter de perdre une alerte
-// sur une panne réseau courte. Une outbox persistante reste hors scope.
+// SendMessage conserve les retries bornés pour les envois non persistés
+// (par exemple le message de bienvenue). Les alertes outbox appellent
+// SendMessageOnce afin que leur backoff soit persisté en PostgreSQL.
 func (c *Client) SendMessage(ctx context.Context, req SendMessageRequest) error {
 	backoff := time.Second
 	var lastErr error
-
 	for attempt := 1; attempt <= sendMessageAttempts; attempt++ {
-		lastErr = c.call(ctx, "sendMessage", req, nil)
+		lastErr = c.SendMessageOnce(ctx, req)
 		if lastErr == nil {
 			return nil
 		}
-
 		wait := backoff
 		var apiErr *APIError
 		if errors.As(lastErr, &apiErr) {
@@ -153,13 +148,12 @@ func (c *Client) SendMessage(ctx context.Context, req SendMessageRequest) error 
 			case apiErr.IsRateLimited():
 				wait = time.Duration(apiErr.RetryAfter) * time.Second
 			case apiErr.Code < http.StatusInternalServerError:
-				return lastErr // 4xx définitif : rejouer ne changera rien
+				return lastErr
 			}
 		}
 		if attempt == sendMessageAttempts {
 			break
 		}
-
 		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
@@ -170,6 +164,12 @@ func (c *Client) SendMessage(ctx context.Context, req SendMessageRequest) error 
 		backoff *= 2
 	}
 	return fmt.Errorf("sendMessage après %d tentatives: %w", sendMessageAttempts, lastErr)
+}
+
+// SendMessageOnce effectue une seule tentative. Le worker outbox est seul
+// responsable de la replanification durable des alertes de suppression.
+func (c *Client) SendMessageOnce(ctx context.Context, req SendMessageRequest) error {
+	return c.call(ctx, "sendMessage", req, nil)
 }
 
 // GetBusinessConnection interroge l'API pour une connexion Business par son

@@ -101,15 +101,15 @@ conteneur éphémère et sa base dédiée.
                               │
           ┌───────────────────┼───────────────────┐
           ▼                   ▼                   ▼
-  business.Service    messages.Repository   telegram.Client
-  (résolution :        (InTenant + RLS)      (sendMessage sans
-  cache→DB→API)         upsert/purge          business_connection_id
-                                               pour les alertes)
+  business.Service    messages.Repository   outbox.Worker
+  (résolution :        (InTenant + RLS)      (lease + backoff,
+  cache→DB→API)         deleted_at + outbox   sendMessage sans
+                         atomiques)            business_connection_id)
                               │
                               ▼
                         PostgreSQL 16
-              users / business_connections / messages
-                 (FORCE RLS sur messages uniquement)
+       users / business_connections / messages / notification_outbox
+             (FORCE RLS sur le contenu et l'outbox par tenant)
 ```
 
 - **`db/init/01-app-role.sh`** crée le rôle applicatif `undelete_app`
@@ -117,9 +117,16 @@ conteneur éphémère et sa base dédiée.
   du conteneur Postgres.
 - **`storage.RunMigrations`** applique `internal/storage/migrations/*.sql`
   avec le DSN propriétaire, au boot, avant l'ouverture du pool applicatif.
-- **`storage.DB.InTenant`** est le seul point d'entrée légitime vers la
-  table `messages` : il pose `app.current_owner_user_id` en `LOCAL` (scope
-  transaction) avant toute requête.
+- **`storage.DB.InTenant`** est le seul point d'entrée légitime vers les
+  tables `messages` et `notification_outbox` : il pose
+  `app.current_owner_user_id` en `LOCAL` (scope transaction) avant toute
+  requête.
+- **Outbox durable** : `deleted_at` et les chunks de notification sont écrits
+  dans la même transaction. Une contrainte unique absorbe les redélivrances.
+  Le worker reprend les jobs `pending` ou les leases `processing` expirés,
+  respecte `retry_after` sur 429 et applique un backoff exponentiel sur les
+  erreurs réseau et 5xx. Les états `pending`, `processing`, `sent` et `failed`
+  restent observables sans journaliser le payload.
 
 ## Les pièges (contraintes non négociables)
 

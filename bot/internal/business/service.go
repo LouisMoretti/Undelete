@@ -179,29 +179,25 @@ func (s *Service) HandleBusinessConnection(ctx context.Context, tc telegram.Busi
 		slog.Bool("can_reply", resolved.CanReply),
 		slog.Bool("is_enabled", resolved.IsEnabled))
 
-	// Pour cet update, Telegram fournit explicitement user_chat_id : on
-	// l'utilise pour joindre le owner au lieu de supposer qu'il est toujours
-	// égal à user.id. Le schéma Phase 1 imposé ne persiste pas ce champ ; les
-	// alertes ultérieures utilisent donc users.telegram_user_id.
-	ownerChatID := tc.UserChatID
-	if ownerChatID == 0 {
-		// Compatibilité défensive avec une ancienne réponse incomplète.
-		ownerChatID = tc.User.ID
-	}
-	// Contrainte n°7 : jamais de BusinessConnectionID ici, sous peine
-	// d'envoyer ce message EN TANT QUE le owner dans une conversation
-	// surveillée.
-	welcome := "undelete est connecté. Tous les chats accessibles via cette connexion Telegram Business " +
-		"seront désormais sauvegardés automatiquement, sans sélection possible par conversation. " +
-		"Vous serez notifié ici en cas de suppression."
-	if err := s.client.SendMessage(ctx, telegram.SendMessageRequest{
-		ChatID: ownerChatID,
-		Text:   welcome,
-	}); err != nil {
-		s.logger.Error("échec envoi message de bienvenue", slog.String("error", err.Error()))
-	}
+	s.notifyWelcome(ctx, tc)
 
 	return nil
+}
+
+// notifyWelcome envoie l'alerte de bienvenue au owner.
+//
+// Contrainte n°7 : jamais de BusinessConnectionID ici, sous peine d'envoyer ce
+// message EN TANT QUE le owner dans une conversation surveillée. L'échec est
+// logué sans interrompre le traitement : la connexion est déjà persistée, la
+// perte d'un message de bienvenue ne doit pas faire rejouer l'update.
+//
+// Ces trois lignes sont isolées pour que le contrat filaire de l'alerte soit
+// testable sur le chemin de production lui-même, sans base de données (cf.
+// TestWelcomeAlertContract).
+func (s *Service) notifyWelcome(ctx context.Context, tc telegram.BusinessConnection) {
+	if err := s.client.SendMessage(ctx, telegram.BuildWelcomeMessageRequest(tc.UserChatID, tc.User.ID)); err != nil {
+		s.logger.Error("échec envoi message de bienvenue", slog.String("error", err.Error()))
+	}
 }
 
 // upsertFromTelegram upsert user + business_connections à partir d'une

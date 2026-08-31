@@ -133,21 +133,16 @@ type getUpdatesRequest struct {
 	AllowedUpdates []string `json:"allowed_updates"`
 }
 
-// SendMessageRequest sérialise un appel sendMessage.
+// SendMessageRequest sérialise les alertes sendMessage du bot.
 //
-// Contrainte non négociable n°7 : BusinessConnectionID est volontairement
-// omitempty et NE DOIT JAMAIS être renseigné pour les alertes envoyées au
-// owner (messages internes du bot : bienvenue, notification de suppression
-// retrouvée). Si ce champ est posé, Telegram envoie le message EN TANT QUE
-// le titulaire de la connexion Business, DANS la conversation surveillée --
-// exactement l'inverse de l'effet recherché (une alerte discrète venant du
-// bot lui-même, hors de toute conversation surveillée). Ce champ n'existe
-// dans ce struct que pour documenter le piège ; le code d'alerte
-// (app/handler.go, business/service.go) ne le renseigne jamais.
+// Contrainte non négociable n°7 : ce type ne doit pas exposer
+// business_connection_id. Les seuls sendMessage de ce client sont les alertes
+// au owner (bienvenue et notification de suppression) ; ce paramètre les
+// enverrait EN TANT QUE le titulaire, DANS la conversation surveillée. Son
+// absence du type rend ce scénario impossible par construction.
 type SendMessageRequest struct {
-	ChatID               int64  `json:"chat_id"`
-	Text                 string `json:"text"`
-	BusinessConnectionID string `json:"business_connection_id,omitempty"`
+	ChatID int64  `json:"chat_id"`
+	Text   string `json:"text"`
 }
 
 // marshal est un raccourci utilisé par client.go.

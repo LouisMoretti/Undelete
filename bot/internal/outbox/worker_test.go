@@ -207,3 +207,77 @@ func TestClaimLeaseAllowsRecoveryAfterCrash(t *testing.T) {
 		t.Fatal("le job doit être repris après un crash et expiration du lease")
 	}
 }
+
+// sequentialStore livre les jobs dans l'ordre et sans échec : suffisant pour
+// vérifier le relais de tous les chunks d'un même message.
+type sequentialStore struct {
+	jobs []*Job
+	i    int
+	sent int
+}
+
+func (s *sequentialStore) Claim(context.Context, int64, time.Time, time.Duration) (*Job, error) {
+	if s.i >= len(s.jobs) {
+		return nil, nil
+	}
+	job := s.jobs[s.i]
+	s.i++
+	return job, nil
+}
+
+func (s *sequentialStore) MarkSent(context.Context, int64, int64, string, time.Time) error {
+	s.sent++
+	return nil
+}
+
+func (s *sequentialStore) MarkRetry(context.Context, int64, int64, string, time.Time, string) error {
+	return nil
+}
+
+func (s *sequentialStore) MarkFailed(context.Context, int64, int64, string, string) error {
+	return nil
+}
+
+// TestWorkerSendsEveryChunkInOrderToOwner est le contrat de suppression sur
+// le chemin de production actuel : les chunks sont écrits en outbox par
+// messages.MarkDeleted (via telegram.BuildDeletionMessageRequests) et le
+// worker doit les relayer TOUS, dans l'ordre, au owner, sans jamais
+// sérialiser business_connection_id.
+func TestWorkerSendsEveryChunkInOrderToOwner(t *testing.T) {
+	store := &sequentialStore{jobs: []*Job{
+		{ID: 1, OwnerUserID: 11, OwnerTelegramUserID: 42, BusinessConnectionID: "bc-secret", ChatID: 99, MessageID: 3, EventType: EventDeletedMessage, Text: "partie-un"},
+		{ID: 2, OwnerUserID: 11, OwnerTelegramUserID: 42, BusinessConnectionID: "bc-secret", ChatID: 99, MessageID: 3, EventType: EventDeletedMessage, Text: "partie-deux"},
+	}}
+	sender := &fakeSender{}
+	var logs bytes.Buffer
+	worker := newTestWorker(store, sender, &logs)
+
+	for i := 0; i < len(store.jobs); i++ {
+		processed, err := worker.ProcessOne(context.Background(), 11, time.Unix(100, 0))
+		if err != nil || !processed {
+			t.Fatalf("ProcessOne %d = (%t, %v), attendu (true, nil)", i, processed, err)
+		}
+	}
+
+	if len(sender.requests) != 2 || store.sent != 2 {
+		t.Fatalf("requests=%d sent=%d, attendu 2/2", len(sender.requests), store.sent)
+	}
+	for i, req := range sender.requests {
+		raw, err := json.Marshal(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), "business_connection_id") {
+			t.Fatalf("business_connection_id sérialisé sur le chunk %d: %s", i, raw)
+		}
+		if req.ChatID != 42 {
+			t.Fatalf("chunk %d adressé au chat %d, attendu le owner 42", i, req.ChatID)
+		}
+	}
+	if sender.requests[0].Text != "partie-un" || sender.requests[1].Text != "partie-deux" {
+		t.Fatalf("chunks relayés hors ordre: %q puis %q", sender.requests[0].Text, sender.requests[1].Text)
+	}
+	if strings.Contains(logs.String(), "partie-un") || strings.Contains(logs.String(), "bc-secret") {
+		t.Fatalf("fuite de contenu ou identifiant dans les logs: %s", logs.String())
+	}
+}

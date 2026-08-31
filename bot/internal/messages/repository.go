@@ -7,9 +7,11 @@ package messages
 import (
 	"context"
 	"fmt"
+	"unicode/utf16"
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/LouisMoretti/Undelete/bot/internal/outbox"
 	"github.com/LouisMoretti/Undelete/bot/internal/storage"
 	"github.com/LouisMoretti/Undelete/bot/internal/users"
 )
@@ -109,7 +111,7 @@ func (r *Repository) Save(ctx context.Context, ownerUserID int64, m Record, edit
 // COALESCE(deleted_at, now()) : idempotent si Telegram relivre le même
 // update deleted_business_messages (on ne veut pas écraser un deleted_at
 // déjà posé par un timestamp plus tardif).
-func (r *Repository) MarkDeleted(ctx context.Context, ownerUserID int64, businessConnectionID string, chatID int64, messageIDs []int64) ([]DeletedRecord, error) {
+func (r *Repository) MarkDeleted(ctx context.Context, ownerUserID, ownerTelegramUserID int64, businessConnectionID string, chatID int64, messageIDs []int64) ([]DeletedRecord, error) {
 	var found []DeletedRecord
 
 	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
@@ -133,7 +135,22 @@ func (r *Repository) MarkDeleted(ctx context.Context, ownerUserID int64, busines
 			}
 			found = append(found, d)
 		}
-		return rows.Err()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		rows.Close()
+
+		for _, d := range found {
+			text := fmt.Sprintf("Message supprimé récupéré (chat %d) :\n\n%s", d.ChatID, d.TextContent)
+			for chunkIndex, chunk := range splitUTF16(text, 4096) {
+				if err := outbox.InsertTx(ctx, tx, ownerUserID, ownerTelegramUserID,
+					businessConnectionID, d.ChatID, d.MessageID, outbox.EventDeletedMessage,
+					chunkIndex, chunk); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -145,6 +162,29 @@ func (r *Repository) MarkDeleted(ctx context.Context, ownerUserID int64, busines
 	// niveau debug et la décision "on continue" sont du ressort de
 	// l'appelant (app/handler.go), qui a le contexte du lot complet.
 	return found, nil
+}
+
+func splitUTF16(text string, limit int) []string {
+	var chunks []string
+	current := make([]rune, 0, limit)
+	units := 0
+	for _, r := range text {
+		runeUnits := utf16.RuneLen(r)
+		if runeUnits < 1 {
+			runeUnits = 1
+		}
+		if units+runeUnits > limit && len(current) > 0 {
+			chunks = append(chunks, string(current))
+			current = current[:0]
+			units = 0
+		}
+		current = append(current, r)
+		units += runeUnits
+	}
+	if len(current) > 0 {
+		chunks = append(chunks, string(current))
+	}
+	return chunks
 }
 
 // PurgeExpired supprime les messages dont la rétention est dépassée,

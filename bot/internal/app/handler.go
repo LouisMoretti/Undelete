@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"unicode/utf16"
 
 	"github.com/LouisMoretti/Undelete/bot/internal/business"
 	"github.com/LouisMoretti/Undelete/bot/internal/messages"
@@ -22,15 +21,13 @@ import (
 type Handler struct {
 	business *business.Service
 	messages *messages.Repository
-	client   *telegram.Client
 	logger   *slog.Logger
 }
 
-func NewHandler(businessSvc *business.Service, messagesRepo *messages.Repository, client *telegram.Client, logger *slog.Logger) *Handler {
+func NewHandler(businessSvc *business.Service, messagesRepo *messages.Repository, logger *slog.Logger) *Handler {
 	return &Handler{
 		business: businessSvc,
 		messages: messagesRepo,
-		client:   client,
 		logger:   logger,
 	}
 }
@@ -129,7 +126,7 @@ func (h *Handler) handleDeleted(ctx context.Context, del *telegram.BusinessMessa
 		return fmt.Errorf("résolution connexion pour suppression: %w", err)
 	}
 
-	found, err := h.messages.MarkDeleted(ctx, conn.OwnerUserID, del.BusinessConnectionID, del.Chat.ID, del.MessageIDs)
+	found, err := h.messages.MarkDeleted(ctx, conn.OwnerUserID, conn.OwnerTelegramUserID, del.BusinessConnectionID, del.Chat.ID, del.MessageIDs)
 	if err != nil {
 		return fmt.Errorf("marquage suppression: %w", err)
 	}
@@ -137,7 +134,6 @@ func (h *Handler) handleDeleted(ctx context.Context, del *telegram.BusinessMessa
 	foundIDs := make(map[int64]bool, len(found))
 	for _, d := range found {
 		foundIDs[d.MessageID] = true
-		h.notifyDeletion(ctx, conn.OwnerTelegramUserID, d)
 	}
 
 	// message_id absent de `found` : antérieur à la connexion Business, ou
@@ -159,62 +155,6 @@ func (h *Handler) handleDeleted(ctx context.Context, del *telegram.BusinessMessa
 		slog.Int("recovered", len(found)))
 
 	return nil
-}
-
-// notifyDeletion alerte le owner avec le contenu original retrouvé.
-//
-// Contrainte n°7 : chat_id = telegram_user_id du owner (chat privé
-// bot<->owner), et surtout PAS de BusinessConnectionID -- ce message vient
-// du bot lui-même, il ne doit jamais apparaître comme émis par le owner
-// dans la conversation surveillée.
-const telegramTextLimit = 4096
-
-func (h *Handler) notifyDeletion(ctx context.Context, ownerTelegramUserID int64, d messages.DeletedRecord) {
-	text := fmt.Sprintf("Message supprimé récupéré (chat %d) :\n\n%s", d.ChatID, d.TextContent)
-	for i, chunk := range splitTelegramText(text, telegramTextLimit) {
-		if err := h.client.SendMessage(ctx, telegram.SendMessageRequest{
-			ChatID: ownerTelegramUserID,
-			Text:   chunk,
-		}); err != nil {
-			// Le contenu et le chunk ne sont jamais logués. L'index suffit à
-			// diagnostiquer une notification partiellement envoyée.
-			h.logger.Error("échec notification suppression",
-				slog.String("error", err.Error()),
-				slog.Int("chunk_index", i))
-			return
-		}
-	}
-}
-
-// splitTelegramText respecte la limite sendMessage en unités UTF-16. Compter
-// les octets ou les runes ne suffit pas pour les caractères hors BMP (emoji),
-// qui occupent deux unités UTF-16 côté Telegram. Le découpage conserve chaque
-// rune entière et ne tronque jamais le contenu récupéré.
-func splitTelegramText(text string, limit int) []string {
-	if text == "" || limit < 1 {
-		return nil
-	}
-
-	var chunks []string
-	current := make([]rune, 0, limit)
-	units := 0
-	for _, r := range text {
-		runeUnits := utf16.RuneLen(r)
-		if runeUnits < 1 {
-			runeUnits = 1
-		}
-		if units+runeUnits > limit && len(current) > 0 {
-			chunks = append(chunks, string(current))
-			current = current[:0]
-			units = 0
-		}
-		current = append(current, r)
-		units += runeUnits
-	}
-	if len(current) > 0 {
-		chunks = append(chunks, string(current))
-	}
-	return chunks
 }
 
 func displayName(u *telegram.User) string {

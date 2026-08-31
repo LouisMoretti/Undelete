@@ -1,6 +1,7 @@
 // Package app assemble les dépendances et route chaque Update Telegram vers
-// le traitement métier adéquat. C'est le seul endroit du code qui connaît
-// la totalité du flux (résolution de connexion -> sauvegarde -> notification).
+// le traitement métier adéquat. C'est le seul endroit du code qui connaît la
+// totalité du flux entrant (résolution de connexion -> sauvegarde -> mise en
+// outbox). Le flux sortant, lui, appartient à outbox.Worker.
 package app
 
 import (
@@ -116,7 +117,13 @@ func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited
 }
 
 // handleDeleted résout la connexion, boucle sur message_ids (contrainte
-// n°6), marque chaque message trouvé comme supprimé et notifie le owner.
+// n°6) et délègue à messages.MarkDeleted, qui marque deleted_at ET écrit les
+// chunks d'alerte dans notification_outbox au sein d'une même transaction.
+//
+// Aucun appel Telegram n'est fait ici depuis #27 : la livraison est
+// asynchrone, assurée par outbox.Worker. Un retour nil signifie donc « la
+// suppression est enregistrée et l'alerte est garantie de partir », pas
+// « l'alerte est partie ».
 func (h *Handler) handleDeleted(ctx context.Context, del *telegram.BusinessMessagesDeleted) error {
 	conn, err := h.business.Resolve(ctx, del.BusinessConnectionID)
 	if err != nil {

@@ -107,7 +107,7 @@ func runOutboxLoop(ctx context.Context, usersRepo *users.Repository, worker *out
 		} else {
 			for _, tenant := range tenants {
 				for processed := 0; processed < 100; processed++ {
-					didProcess, err := worker.ProcessOne(ctx, tenant.OwnerUserID, time.Now())
+					didProcess, err := worker.ProcessOne(ctx, tenant.OwnerUserID)
 					if err != nil {
 						logger.Error("outbox: échec traitement", slog.Int64("owner_user_id", tenant.OwnerUserID), slog.String("error", err.Error()))
 						break

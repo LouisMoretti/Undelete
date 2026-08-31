@@ -32,8 +32,10 @@ type apiResponse[T any] struct {
 
 type responseParams struct {
 	// RetryAfter est présent sur les erreurs 429 (rate limit) : nombre de
-	// secondes à attendre avant de réessayer. Le poller doit le respecter
-	// strictement plutôt que d'appliquer son propre backoff.
+	// secondes à attendre avant de réessayer. Les deux boucles qui appellent
+	// l'API — telegram.Poller sur getUpdates et outbox.Worker sur sendMessage
+	// — doivent le respecter strictement plutôt que d'appliquer leur propre
+	// backoff.
 	RetryAfter int `json:"retry_after,omitempty"`
 }
 
@@ -137,7 +139,8 @@ type getUpdatesRequest struct {
 //
 // Contrainte non négociable n°7 : ce type ne doit pas exposer
 // business_connection_id. Les seuls sendMessage de ce client sont les alertes
-// au owner (bienvenue et notification de suppression) ; ce paramètre les
+// au owner — bienvenue émise par business.Service, notification de suppression
+// relayée par outbox.Worker depuis notification_outbox ; ce paramètre les
 // enverrait EN TANT QUE le titulaire, DANS la conversation surveillée. Son
 // absence du type rend ce scénario impossible par construction.
 type SendMessageRequest struct {

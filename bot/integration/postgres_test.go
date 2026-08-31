@@ -4,12 +4,11 @@ package integration_test
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -20,32 +19,6 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/users"
 )
 
-func TestDestructiveInterlockRefusesUnsafeConfiguration(t *testing.T) {
-	tests := []struct {
-		name         string
-		optIn        string
-		databaseName string
-	}{
-		{name: "missing explicit opt-in", databaseName: "undelete_integration"},
-		{name: "wrong explicit opt-in", optIn: "true", databaseName: "undelete_integration"},
-		{name: "production database name", optIn: "I_UNDERSTAND_THIS_WILL_DELETE_DATA", databaseName: "undelete"},
-		{name: "near-match database name", optIn: "I_UNDERSTAND_THIS_WILL_DELETE_DATA", databaseName: "undelete_integration_copy"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if err := validateDestructiveInterlock(tt.optIn, tt.databaseName); err == nil {
-				t.Fatal("unsafe integration configuration unexpectedly accepted")
-			}
-		})
-	}
-}
-
-func TestDestructiveInterlockAcceptsExactConfiguration(t *testing.T) {
-	if err := validateDestructiveInterlock("I_UNDERSTAND_THIS_WILL_DELETE_DATA", "undelete_integration"); err != nil {
-		t.Fatalf("exact integration configuration rejected: %v", err)
-	}
-}
-
 func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 	adminDSN := requireEnv(t, "POSTGRES_INTEGRATION_ADMIN_DSN")
 	runtimeDSN := requireEnv(t, "POSTGRES_INTEGRATION_RUNTIME_DSN")
@@ -53,7 +26,15 @@ func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 	if err := validateExplicitDestructiveOptIn(optIn); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Un unique fusible de 30 s couvrait auparavant la connexion, les deux
+	// passes de migration, le TRUNCATE ET tous les sous-tests : sur une
+	// machine chargée (CI partagée, conteneur qui démarre à froid) il sautait
+	// au milieu et faisait échouer en cascade des sous-tests sans rapport,
+	// avec un message trompeur. On sépare donc les budgets — un plafond
+	// global généreux pour la préparation, puis une échéance propre à chaque
+	// sous-test via phaseContext — ce qui borne toujours une opération
+	// réellement bloquée sans transformer la lenteur en échec.
+	ctx, cancel := context.WithTimeout(context.Background(), setupTimeout)
 	defer cancel()
 
 	admin, err := pgx.Connect(ctx, adminDSN)
@@ -101,6 +82,7 @@ func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 	}
 
 	t.Run("runtime role is least privileged", func(t *testing.T) {
+		ctx := phaseContext(t)
 		var superuser, createDB, createRole, bypassRLS bool
 		if err := admin.QueryRow(ctx, `
 			SELECT rolsuper, rolcreatedb, rolcreaterole, rolbypassrls
@@ -120,6 +102,7 @@ func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 	defer db.Close()
 
 	t.Run("dangerous and wrong roles are rejected", func(t *testing.T) {
+		ctx := phaseContext(t)
 		assertPoolRejected(t, ctx, adminDSN)
 		for _, role := range []struct {
 			name       string
@@ -137,11 +120,16 @@ func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 			t.Cleanup(func() {
 				_, _ = admin.Exec(context.Background(), `DROP ROLE IF EXISTS `+pgx.Identifier{role.name}.Sanitize())
 			})
-			assertPoolRejected(t, ctx, replaceDSNUser(runtimeDSN, role.name, "integration-only"))
+			roleDSN, err := replaceDSNUser(runtimeDSN, role.name, "integration-only")
+			if err != nil {
+				t.Fatalf("rewrite DSN for role %s: %v", role.name, err)
+			}
+			assertPoolRejected(t, ctx, roleDSN)
 		}
 	})
 
 	t.Run("runtime role cannot execute DDL", func(t *testing.T) {
+		ctx := phaseContext(t)
 		if _, err := db.Pool.Exec(ctx, `CREATE TABLE runtime_must_not_create_tables (id bigint)`); err == nil {
 			t.Fatal("runtime DDL unexpectedly succeeded")
 		}
@@ -169,6 +157,7 @@ func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 	}
 
 	t.Run("RLS fails closed without tenant context", func(t *testing.T) {
+		ctx := phaseContext(t)
 		var count int
 		if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM messages`).Scan(&count); err != nil {
 			t.Fatalf("raw select: %v", err)
@@ -185,6 +174,7 @@ func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 	})
 
 	t.Run("CRUD is isolated between tenants", func(t *testing.T) {
+		ctx := phaseContext(t)
 		wrongTenant, err := msgRepo.MarkDeleted(ctx, owner2.ID, owner2.TelegramUserID, "owner-1", 77, []int64{1})
 		if err != nil {
 			t.Fatalf("cross-tenant update: %v", err)
@@ -213,6 +203,7 @@ func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 	})
 
 	t.Run("PurgeExpired purges tenant by tenant", func(t *testing.T) {
+		ctx := phaseContext(t)
 		for _, fixture := range []struct {
 			ownerID int64
 			conn    string
@@ -250,23 +241,23 @@ func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 	})
 }
 
-func validateExplicitDestructiveOptIn(optIn string) error {
-	const required = "I_UNDERSTAND_THIS_WILL_DELETE_DATA"
-	if optIn != required {
-		return fmt.Errorf("refusing destructive integration test: POSTGRES_INTEGRATION_ALLOW_DESTRUCTIVE must equal %q", required)
-	}
-	return nil
-}
+const (
+	// Budget de la préparation partagée : connexion admin, deux passes de
+	// migration et remise à zéro des fixtures.
+	setupTimeout = 3 * time.Minute
+	// Budget d'un sous-test. Chacun ne fait que quelques requêtes ; 60 s
+	// laissent une marge confortable même sur une machine saturée tout en
+	// gardant une borne en cas de blocage réel (verrou, connexion morte).
+	phaseTimeout = time.Minute
+)
 
-func validateDestructiveInterlock(optIn, databaseName string) error {
-	if err := validateExplicitDestructiveOptIn(optIn); err != nil {
-		return err
-	}
-	const requiredDatabase = "undelete_integration"
-	if databaseName != requiredDatabase {
-		return fmt.Errorf("refusing destructive integration test: server reports database %q, require exact dedicated name %q", databaseName, requiredDatabase)
-	}
-	return nil
+// phaseContext donne à chaque sous-test son propre budget, indépendant des
+// précédents : la lenteur d'un sous-test ne consomme plus celui des suivants.
+func phaseContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), phaseTimeout)
+	t.Cleanup(cancel)
+	return ctx
 }
 
 func requireEnv(t *testing.T, name string) string {
@@ -278,24 +269,18 @@ func requireEnv(t *testing.T, name string) string {
 	return value
 }
 
+// assertPoolRejected s'appuie sur le sentinel exporté par storage, jamais sur
+// le libellé du message : reformuler l'erreur ne doit pas transformer ce
+// garde-fou en test qui passe pour la mauvaise raison.
 func assertPoolRejected(t *testing.T, ctx context.Context, dsn string) {
 	t.Helper()
 	db, err := storage.NewPool(ctx, dsn)
 	if db != nil {
 		db.Close()
 	}
-	if err == nil || !strings.Contains(err.Error(), "rôle runtime PostgreSQL dangereux") {
-		t.Fatalf("pool should reject role, got %v", err)
+	if !errors.Is(err, storage.ErrUnsafeRuntimeRole) {
+		t.Fatalf("pool should reject role with storage.ErrUnsafeRuntimeRole, got %v", err)
 	}
-}
-
-func replaceDSNUser(dsn, user, password string) string {
-	parts := strings.Split(dsn, "@")
-	prefix := parts[0]
-	if scheme := strings.Index(prefix, "://"); scheme >= 0 {
-		prefix = prefix[:scheme+3] + user + ":" + password
-	}
-	return prefix + "@" + strings.Join(parts[1:], "@")
 }
 
 func assertTenantCount(t *testing.T, ctx context.Context, db *storage.DB, ownerID int64, want int) {

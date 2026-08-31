@@ -6,6 +6,7 @@ package storage
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -29,6 +30,12 @@ type DB struct {
 }
 
 const runtimeRole = "undelete_app"
+
+// ErrUnsafeRuntimeRole est renvoyé (enveloppé) par NewPool quand le rôle
+// réellement authentifié n'est pas le rôle applicatif restreint. Sentinel
+// exporté pour que les tests puissent l'identifier par errors.Is plutôt que
+// par le libellé du message, qui reste libre d'évoluer.
+var ErrUnsafeRuntimeRole = errors.New("rôle runtime PostgreSQL dangereux")
 
 // NewPool ouvre le pool applicatif. dsn doit être DATABASE_URL (rôle
 // undelete_app), jamais MIGRATION_DATABASE_URL. La comparaison textuelle des
@@ -57,8 +64,8 @@ func NewPool(ctx context.Context, dsn string) (*DB, error) {
 	}
 	if role != runtimeRole || isSuperuser || bypassRLS {
 		pool.Close()
-		return nil, fmt.Errorf("rôle runtime PostgreSQL dangereux: rôle=%q superuser=%t bypassrls=%t; attendu %q sans privilèges de contournement RLS",
-			role, isSuperuser, bypassRLS, runtimeRole)
+		return nil, fmt.Errorf("%w: rôle=%q superuser=%t bypassrls=%t; attendu %q sans privilèges de contournement RLS",
+			ErrUnsafeRuntimeRole, role, isSuperuser, bypassRLS, runtimeRole)
 	}
 
 	return &DB{Pool: pool}, nil

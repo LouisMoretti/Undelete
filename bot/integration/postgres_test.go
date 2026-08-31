@@ -185,14 +185,14 @@ func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 	})
 
 	t.Run("CRUD is isolated between tenants", func(t *testing.T) {
-		wrongTenant, err := msgRepo.MarkDeleted(ctx, owner2.ID, "owner-1", 77, []int64{1})
+		wrongTenant, err := msgRepo.MarkDeleted(ctx, owner2.ID, owner2.TelegramUserID, "owner-1", 77, []int64{1})
 		if err != nil {
 			t.Fatalf("cross-tenant update: %v", err)
 		}
 		if len(wrongTenant) != 0 {
 			t.Fatalf("cross-tenant update returned %d rows", len(wrongTenant))
 		}
-		ownTenant, err := msgRepo.MarkDeleted(ctx, owner1.ID, "owner-1", 77, []int64{1})
+		ownTenant, err := msgRepo.MarkDeleted(ctx, owner1.ID, owner1.TelegramUserID, "owner-1", 77, []int64{1})
 		if err != nil {
 			t.Fatalf("own-tenant update: %v", err)
 		}

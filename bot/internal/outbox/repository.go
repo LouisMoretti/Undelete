@@ -51,8 +51,8 @@ func (r *Repository) Claim(ctx context.Context, ownerUserID int64, now time.Time
 				SELECT current_job.id
 				FROM notification_outbox current_job
 				WHERE current_job.status IN ('pending', 'processing')
-				  AND current_job.next_attempt_at <= clock_timestamp()
-				  AND (current_job.locked_until IS NULL OR current_job.locked_until <= clock_timestamp())
+				  AND current_job.next_attempt_at <= $3
+				  AND (current_job.locked_until IS NULL OR current_job.locked_until <= $3)
 				  AND NOT EXISTS (
 					SELECT 1 FROM notification_outbox prior
 					WHERE prior.owner_user_id = current_job.owner_user_id
@@ -69,14 +69,14 @@ func (r *Repository) Claim(ctx context.Context, ownerUserID int64, now time.Time
 			)
 			UPDATE notification_outbox o
 			SET status = 'processing',
-			    locked_until = clock_timestamp() + make_interval(secs => $1),
-			    lease_token = $2, updated_at = clock_timestamp()
+			    locked_until = $3 + make_interval(secs => $1),
+			    lease_token = $2, updated_at = $3
 			FROM candidate
 			WHERE o.id = candidate.id
 			RETURNING o.id, o.owner_user_id, o.owner_telegram_user_id,
 			          o.business_connection_id, o.chat_id, o.message_id,
 			          o.event_type, o.payload_text, o.attempts, o.lease_token
-		`, lease.Seconds(), leaseToken)
+		`, lease.Seconds(), leaseToken, now)
 		var claimed Job
 		if err := row.Scan(&claimed.ID, &claimed.OwnerUserID, &claimed.OwnerTelegramUserID,
 			&claimed.BusinessConnectionID, &claimed.ChatID, &claimed.MessageID,
@@ -96,7 +96,7 @@ func (r *Repository) MarkSent(ctx context.Context, ownerUserID, id int64, leaseT
 	return r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			UPDATE notification_outbox
-			SET status = 'sent', sent_at = $2, locked_until = NULL,
+			SET status = 'sent', sent_at = $3, locked_until = NULL,
 			    lease_token = NULL, last_error_class = NULL, updated_at = $3
 			WHERE id = $1 AND status = 'processing' AND lease_token = $2
 		`, id, leaseToken, now)

@@ -23,16 +23,33 @@ type Client struct {
 	baseURL    string
 }
 
+// Option ajuste un Client à la construction.
+type Option func(*Client)
+
+// WithBaseURL remplace l'URL de base de la Bot API (préfixe, jeton exclu).
+//
+// Unique raison d'être : permettre aux tests de contrat de pointer un vrai
+// Client vers un serveur httptest, y compris depuis les packages appelants
+// (app, business) qui exercent les chemins de production réels. La production
+// n'utilise jamais cette option.
+func WithBaseURL(baseURL string) Option {
+	return func(c *Client) { c.baseURL = baseURL }
+}
+
 // NewClient construit un client. httpTimeout doit rester strictement
 // supérieur au timeout de long-polling passé à GetUpdates (50s) : sinon le
 // client HTTP coupe la requête avant que Telegram n'ait eu la chance de
 // répondre "pas d'update" au bout des 50s.
-func NewClient(token string, httpTimeout time.Duration) *Client {
-	return &Client{
+func NewClient(token string, httpTimeout time.Duration, opts ...Option) *Client {
+	c := &Client{
 		token:      token,
 		httpClient: &http.Client{Timeout: httpTimeout},
 		baseURL:    apiBaseURL,
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 func (c *Client) call(ctx context.Context, method string, params any, out any) error {

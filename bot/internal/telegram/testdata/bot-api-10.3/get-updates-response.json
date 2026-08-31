@@ -1,0 +1,69 @@
+{
+  "ok": true,
+  "result": [
+    {
+      "update_id": 9000,
+      "business_connection": {
+        "id": "bc_fixture_001",
+        "user": {
+          "id": 700001,
+          "is_bot": false,
+          "first_name": "Zoë",
+          "last_name": "Test",
+          "username": "fixture_owner"
+        },
+        "user_chat_id": 700002,
+        "date": 1788019200,
+        "rights": {
+          "can_reply": true
+        },
+        "is_enabled": true
+      }
+    },
+    {
+      "update_id": 9001,
+      "business_message": {
+        "message_id": 501,
+        "from": {
+          "id": 800001,
+          "is_bot": false,
+          "first_name": "Anaïs",
+          "username": "fixture_sender"
+        },
+        "chat": {
+          "id": 800001,
+          "type": "private",
+          "first_name": "Anaïs"
+        },
+        "date": 1788019201,
+        "text": "Bonjour, café ☕ — déjà vu ?",
+        "business_connection_id": "bc_fixture_001"
+      }
+    },
+    {
+      "update_id": 9002,
+      "edited_business_message": {
+        "message_id": 502,
+        "chat": {
+          "id": 800001,
+          "type": "private",
+          "first_name": "Anaïs"
+        },
+        "date": 1788019202,
+        "text": "Texte corrigé 🧪",
+        "business_connection_id": "bc_fixture_001"
+      }
+    },
+    {
+      "update_id": 9003,
+      "deleted_business_messages": {
+        "business_connection_id": "bc_fixture_001",
+        "chat": {
+          "id": 800001,
+          "type": "private"
+        },
+        "message_ids": [501, 502, 503]
+      }
+    }
+  ]
+}

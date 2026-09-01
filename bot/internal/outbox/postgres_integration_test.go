@@ -84,16 +84,22 @@ func TestPostgresOutboxIsAtomicTenantAwareAndIdempotent(t *testing.T) {
 	outboxRepo := outbox.NewRepository(db)
 	// Le lease et next_attempt_at sont évalués ET écrits sur l'horloge
 	// PostgreSQL (clock_timestamp) : aucune date Go n'entre dans le
-	// scénario, on pilote les transitions via de courts leases réels, des
+	// scénario, on pilote les transitions via des leases réels, des
 	// délais de retry explicites et le fencing token.
-	job, err := outboxRepo.Claim(ctx, ownerID, 30*time.Millisecond)
+	// Le lease de 1 s (et non « le plus court possible ») est un choix
+	// délibéré : en CI, deux Claim consécutifs peuvent être espacés de
+	// plusieurs dizaines de ms (scheduling + aller-retour BD) ; un lease
+	// de 30 ms pouvait expirer AVANT le claim dupliqué, et le sleep de
+	// 60 ms n'était que 2× le lease. Les marges 1 s / 1,2 s absorbent
+	// cette latence dans les deux sens, au prix d'une seconde de test.
+	job, err := outboxRepo.Claim(ctx, ownerID, time.Second)
 	if err != nil || job == nil || job.LeaseToken == "" {
 		t.Fatalf("claim PostgreSQL: job=%+v err=%v", job, err)
 	}
 	if duplicate, err := outboxRepo.Claim(ctx, ownerID, time.Minute); err != nil || duplicate != nil {
 		t.Fatalf("claim avant expiration du lease: job=%v err=%v", duplicate, err)
 	}
-	time.Sleep(60 * time.Millisecond)
+	time.Sleep(1200 * time.Millisecond)
 	recovered, err := outboxRepo.Claim(ctx, ownerID, time.Minute)
 	if err != nil || recovered == nil || recovered.ID != job.ID {
 		t.Fatalf("reprise après expiration du lease: job=%v err=%v", recovered, err)
@@ -321,5 +327,60 @@ func TestPostgresStaleWorkerCannotAcknowledgeReclaimedLease(t *testing.T) {
 	}
 	if status != "processing" || leaseToken != workerB.LeaseToken {
 		t.Fatalf("état de B écrasé par A: status=%s token=%s", status, leaseToken)
+	}
+}
+
+// TestPostgresCountBacklogAgregeTousLesTenantsMalgreRLS couvre la jauge
+// undelete_outbox_backlog, et surtout la raison d'être de sa boucle
+// tenant-par-tenant : le même COUNT(*) lancé sur le pool applicatif SANS
+// contexte tenant renvoie 0 sans erreur (RLS), donc une jauge écrite
+// naïvement afficherait « aucun retard » quel que soit l'état réel.
+func TestPostgresCountBacklogAgregeTousLesTenantsMalgreRLS(t *testing.T) {
+	ctx, db := openRuntimeDB(t)
+	ownerA := createTestOwner(t, ctx, db, 900015)
+	ownerB := createTestOwner(t, ctx, db, 900016)
+	insert := func(ownerID, telegramID int64, status string, messageID int64) {
+		t.Helper()
+		if err := db.InTenant(ctx, ownerID, func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `
+				INSERT INTO notification_outbox (
+					owner_user_id, owner_telegram_user_id, business_connection_id,
+					chat_id, message_id, event_type, chunk_index, payload_text, status
+				) VALUES ($1, $2, 'bc-backlog', 5, $3, 'deleted_message', 0, 'private', $4)
+			`, ownerID, telegramID, messageID, status)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert(ownerA, 900015, "pending", 1)
+	insert(ownerA, 900015, "processing", 2)
+	insert(ownerA, 900015, "sent", 3)   // livrée : hors backlog
+	insert(ownerA, 900015, "failed", 4) // abandonnée : hors backlog
+	insert(ownerB, 900016, "pending", 5)
+
+	repo := outbox.NewRepository(db)
+	tenants := []users.TenantRetention{{OwnerUserID: ownerA, RetentionDays: 7}, {OwnerUserID: ownerB, RetentionDays: 7}}
+	backlog, err := repo.CountBacklog(ctx, tenants)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backlog != 3 {
+		t.Fatalf("CountBacklog = %d, attendu 3 (2 pour A, 1 pour B)", backlog)
+	}
+
+	// Un seul tenant demandé : la jauge n'agrège que ce qu'on lui donne.
+	if backlog, err := repo.CountBacklog(ctx, tenants[1:]); err != nil || backlog != 1 {
+		t.Fatalf("CountBacklog(B seul) = (%d, %v), attendu (1, nil)", backlog, err)
+	}
+
+	var naive int64
+	if err := db.Pool.QueryRow(ctx, `
+		SELECT count(*) FROM notification_outbox WHERE status IN ('pending', 'processing')
+	`).Scan(&naive); err != nil {
+		t.Fatal(err)
+	}
+	if naive != 0 {
+		t.Fatalf("COUNT(*) hors InTenant = %d, attendu 0 : RLS ne masque plus les lignes, la boucle tenant-par-tenant de CountBacklog perdrait sa justification", naive)
 	}
 }

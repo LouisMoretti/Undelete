@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync/atomic"
 	"time"
+
+	"github.com/LouisMoretti/Undelete/bot/internal/metrics"
 )
 
 const (
@@ -36,10 +39,27 @@ type Poller struct {
 	client *Client
 	logger *slog.Logger
 	offset int64
+
+	// lastSuccessUnixNano date le dernier getUpdates réussi. Écrit par la
+	// boucle Run, lu par la probe de readiness depuis une autre goroutine :
+	// d'où l'atomique, alors que offset reste un simple champ (jamais lu
+	// hors de Run).
+	lastSuccessUnixNano atomic.Int64
 }
 
 func NewPoller(client *Client, logger *slog.Logger) *Poller {
 	return &Poller{client: client, logger: logger}
+}
+
+// LastSuccessfulPoll renvoie la date du dernier getUpdates réussi, ou la
+// valeur zéro si aucun poll n'a encore abouti depuis le démarrage. Sert de
+// signal de fraîcheur à la readiness (health.FreshnessSource).
+func (p *Poller) LastSuccessfulPoll() time.Time {
+	nanos := p.lastSuccessUnixNano.Load()
+	if nanos == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nanos)
 }
 
 // Run boucle jusqu'à annulation du contexte.
@@ -71,6 +91,7 @@ func (p *Poller) Run(ctx context.Context, handle Handler) error {
 				}
 			}
 
+			metrics.AddUpdateErrors(1)
 			p.logger.Error("échec getUpdates", slog.String("error", err.Error()), slog.Duration("wait", wait))
 			select {
 			case <-ctx.Done():
@@ -81,9 +102,12 @@ func (p *Poller) Run(ctx context.Context, handle Handler) error {
 		}
 
 		backoff = minBackoff // succès : on réinitialise le backoff
+		p.lastSuccessUnixNano.Store(time.Now().UnixNano())
+		metrics.AddUpdates(int64(len(updates)))
 
 		for _, u := range updates {
 			if err := handle(ctx, u); err != nil {
+				metrics.AddUpdateErrors(1)
 				p.logger.Error("échec traitement update",
 					slog.Int64("update_id", u.UpdateID),
 					slog.String("error", err.Error()))

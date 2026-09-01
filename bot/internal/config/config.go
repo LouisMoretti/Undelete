@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 )
@@ -28,7 +29,18 @@ type Config struct {
 	// connexion Business provenant d'un autre telegram_user_id est
 	// refusée. 0 = pas de restriction (déconseillé en dehors du dev local).
 	OwnerTelegramUserID int64
+
+	// HealthAddr est l'adresse d'écoute des probes /livez, /readyz et
+	// /metrics. Vaut defaultHealthAddr si HEALTH_ADDR n'est pas définie ;
+	// une valeur explicitement VIDE désactive le serveur (aucun port
+	// ouvert). Ces endpoints n'exposent aucun contenu utilisateur, mais ils
+	// restent destinés au réseau interne : ne pas les publier tels quels.
+	HealthAddr string
 }
+
+// defaultHealthAddr : port dédié à la supervision, distinct de tout trafic
+// applicatif (le bot n'écoute rien d'autre, il est en long polling sortant).
+const defaultHealthAddr = ":9090"
 
 // Load lit la configuration depuis l'environnement et la valide.
 //
@@ -44,6 +56,25 @@ func Load() (*Config, error) {
 		DatabaseURL:          os.Getenv("DATABASE_URL"),
 		MigrationDatabaseURL: os.Getenv("MIGRATION_DATABASE_URL"),
 		TelegramBotToken:     os.Getenv("TELEGRAM_BOT_TOKEN"),
+		HealthAddr:           defaultHealthAddr,
+	}
+
+	// LookupEnv et non Getenv : "variable absente" (on veut le défaut) et
+	// "variable posée à vide" (on veut désactiver le serveur) sont deux
+	// intentions différentes.
+	if raw, ok := os.LookupEnv("HEALTH_ADDR"); ok {
+		cfg.HealthAddr = raw
+	}
+
+	// Validée ici, et pas seulement au net.Listen : une valeur mal formée
+	// (« 9090 » sans deux-points) laisserait le bot démarrer normalement puis
+	// perdre TOUTES ses probes et ses métriques sur un unique log Error, sans
+	// que rien d'autre ne bouge. Une supervision muette est exactement ce que
+	// l'issue #6 cherche à éliminer : on échoue au démarrage, franchement.
+	if cfg.HealthAddr != "" {
+		if _, _, err := net.SplitHostPort(cfg.HealthAddr); err != nil {
+			return nil, fmt.Errorf("HEALTH_ADDR invalide (attendu « hôte:port », par exemple %q ; vide pour désactiver le serveur de santé): %w", defaultHealthAddr, err)
+		}
 	}
 
 	if cfg.DatabaseURL == "" {

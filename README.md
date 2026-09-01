@@ -160,6 +160,27 @@ branch ruleset* / *Add rule* sur `main`) — non automatisable depuis ce dépôt
   erreurs réseau et 5xx. Les états `pending`, `processing`, `sent` et `failed`
   restent observables sans journaliser le payload.
 
+### Garanties de livraison des alertes
+
+- **At-least-once, pas exactly-once.** Le worker envoie l'alerte à Telegram
+  *puis* acquitte la ligne d'outbox. Un crash entre les deux laisse la ligne en
+  `processing` ; son lease expire et un worker la reprend. **Une alerte déjà
+  reçue peut donc être livrée une seconde fois.** Aucun dédoublonnage n'est
+  fait côté Telegram : l'inverse (acquitter avant d'envoyer) échangerait ce
+  doublon contre une alerte perdue, ce qui est inacceptable pour ce produit.
+- **Ordre garanti au sein d'un message, pas entre messages.** Les chunks d'un
+  même message supprimé (même `business_connection_id`, `chat_id`,
+  `message_id`, `event_type`) partent dans l'ordre de `chunk_index` : `Claim`
+  refuse un chunk tant qu'un chunk d'index inférieur n'est pas `sent` ou
+  `failed`. **Aucun ordre n'est garanti ENTRE deux messages différents** — un
+  message replanifié par un backoff peut arriver après un message supprimé
+  plus tard. Les alertes portent l'identifiant du chat, jamais un numéro de
+  séquence : ne pas s'appuyer sur leur ordre d'arrivée.
+- **Horloge unique.** Échéances de retry et expirations de lease sont
+  entièrement évaluées et écrites par PostgreSQL (`clock_timestamp()`). Une
+  dérive entre l'horloge du bot et celle de la base ne peut ni masquer un job
+  ni le rendre réclamable trop tôt.
+
 ## Les pièges (contraintes non négociables)
 
 1. **`allowed_updates` explicite** dans `getUpdates` :

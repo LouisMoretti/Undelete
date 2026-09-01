@@ -12,32 +12,38 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
 )
 
+// fakeStore tient l'horloge que le vrai Repository délègue à PostgreSQL : le
+// worker ne passe plus que des durées, c'est donc le store qui date les
+// transitions. Les tests avancent `clock` explicitement.
 type fakeStore struct {
 	job       *Job
+	clock     time.Time
 	claimedAt time.Time
 	lease     time.Duration
 	sent      bool
 	failed    bool
 	retryAt   time.Time
+	retryIn   time.Duration
 	attempts  int
 }
 
-func (s *fakeStore) Claim(_ context.Context, _ int64, now time.Time, lease time.Duration) (*Job, error) {
-	if s.job == nil || s.sent || s.failed || (!s.retryAt.IsZero() && now.Before(s.retryAt)) || (!s.claimedAt.IsZero() && now.Before(s.claimedAt.Add(s.lease))) {
+func (s *fakeStore) Claim(_ context.Context, _ int64, lease time.Duration) (*Job, error) {
+	if s.job == nil || s.sent || s.failed || (!s.retryAt.IsZero() && s.clock.Before(s.retryAt)) || (!s.claimedAt.IsZero() && s.clock.Before(s.claimedAt.Add(s.lease))) {
 		return nil, nil
 	}
-	s.claimedAt, s.lease = now, lease
+	s.claimedAt, s.lease = s.clock, lease
 	copy := *s.job
 	copy.Attempts = s.attempts
 	return &copy, nil
 }
-func (s *fakeStore) MarkSent(context.Context, int64, int64, string, time.Time) error {
+func (s *fakeStore) MarkSent(context.Context, int64, int64, string) error {
 	s.sent = true
 	return nil
 }
-func (s *fakeStore) MarkRetry(_ context.Context, _, _ int64, _ string, next time.Time, _ string) error {
+func (s *fakeStore) MarkRetry(_ context.Context, _, _ int64, _ string, wait time.Duration, _ string) error {
 	s.attempts++
-	s.retryAt, s.claimedAt = next, time.Time{}
+	s.retryIn = wait
+	s.retryAt, s.claimedAt = s.clock.Add(wait), time.Time{}
 	return nil
 }
 func (s *fakeStore) MarkFailed(context.Context, int64, int64, string, string) error {
@@ -69,7 +75,7 @@ func TestWorkerSuccessSendsAsBotAndMarksSent(t *testing.T) {
 	var logs bytes.Buffer
 	worker := newTestWorker(store, sender, &logs)
 
-	processed, err := worker.ProcessOne(context.Background(), 11, time.Unix(100, 0))
+	processed, err := worker.ProcessOne(context.Background(), 11)
 	if err != nil || !processed {
 		t.Fatalf("ProcessOne = (%t, %v), attendu (true, nil)", processed, err)
 	}
@@ -95,14 +101,13 @@ func TestWorker429UsesRetryAfter(t *testing.T) {
 	store := &fakeStore{job: testJob()}
 	sender := &fakeSender{err: &telegram.APIError{Method: "sendMessage", Code: 429, RetryAfter: 17}}
 	worker := newTestWorker(store, sender, &bytes.Buffer{})
-	now := time.Unix(100, 0)
 
-	processed, err := worker.ProcessOne(context.Background(), 11, now)
+	processed, err := worker.ProcessOne(context.Background(), 11)
 	if err != nil || !processed {
 		t.Fatalf("ProcessOne = (%t, %v)", processed, err)
 	}
-	if want := now.Add(17 * time.Second); !store.retryAt.Equal(want) {
-		t.Fatalf("next_attempt_at=%v, attendu %v", store.retryAt, want)
+	if store.retryIn != 17*time.Second {
+		t.Fatalf("délai de retry=%v, attendu 17s", store.retryIn)
 	}
 }
 
@@ -121,12 +126,11 @@ func TestWorker5xxAndTimeoutUseExponentialBackoff(t *testing.T) {
 			store := &fakeStore{job: job, attempts: 2}
 			sender := &fakeSender{err: tc.err}
 			worker := newTestWorker(store, sender, &bytes.Buffer{})
-			now := time.Unix(100, 0)
-			if _, err := worker.ProcessOne(context.Background(), 11, now); err != nil {
+			if _, err := worker.ProcessOne(context.Background(), 11); err != nil {
 				t.Fatal(err)
 			}
-			if want := now.Add(4 * time.Second); !store.retryAt.Equal(want) {
-				t.Fatalf("next_attempt_at=%v, attendu %v", store.retryAt, want)
+			if store.retryIn != 4*time.Second {
+				t.Fatalf("délai de retry=%v, attendu 4s", store.retryIn)
 			}
 		})
 	}
@@ -144,7 +148,7 @@ func TestWorker5xxAndTimeoutReachFailedAfterMaxAttempts(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store := &fakeStore{job: testJob(), attempts: maxDeliveryAttempts - 1}
 			worker := newTestWorker(store, &fakeSender{err: tc.err}, &bytes.Buffer{})
-			if _, err := worker.ProcessOne(context.Background(), 11, time.Unix(100, 0)); err != nil {
+			if _, err := worker.ProcessOne(context.Background(), 11); err != nil {
 				t.Fatal(err)
 			}
 			if !store.failed || !store.retryAt.IsZero() {
@@ -158,7 +162,7 @@ func TestWorkerPermanent4xxMarksFailed(t *testing.T) {
 	store := &fakeStore{job: testJob()}
 	sender := &fakeSender{err: &telegram.APIError{Method: "sendMessage", Code: 400}}
 	worker := newTestWorker(store, sender, &bytes.Buffer{})
-	if _, err := worker.ProcessOne(context.Background(), 11, time.Unix(100, 0)); err != nil {
+	if _, err := worker.ProcessOne(context.Background(), 11); err != nil {
 		t.Fatal(err)
 	}
 	if !store.failed || !store.retryAt.IsZero() {
@@ -172,7 +176,7 @@ func TestWorkerShutdownCancellationLeavesJobToLeaseExpiry(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	processed, err := worker.ProcessOne(ctx, 11, time.Unix(100, 0))
+	processed, err := worker.ProcessOne(ctx, 11)
 	if err != nil || processed {
 		t.Fatalf("ProcessOne = (%t, %v), attendu (false, nil)", processed, err)
 	}
@@ -194,16 +198,17 @@ func TestRetryDelaySaturatesInsteadOfOverflowing(t *testing.T) {
 }
 
 func TestClaimLeaseAllowsRecoveryAfterCrash(t *testing.T) {
-	store := &fakeStore{job: testJob()}
-	now := time.Unix(100, 0)
-	claimed, err := store.Claim(context.Background(), 11, now, time.Minute)
+	store := &fakeStore{job: testJob(), clock: time.Unix(100, 0)}
+	claimed, err := store.Claim(context.Background(), 11, time.Minute)
 	if err != nil || claimed == nil {
 		t.Fatal("première réservation impossible")
 	}
-	if again, _ := store.Claim(context.Background(), 11, now.Add(30*time.Second), time.Minute); again != nil {
+	store.clock = store.clock.Add(30 * time.Second)
+	if again, _ := store.Claim(context.Background(), 11, time.Minute); again != nil {
 		t.Fatal("le job ne doit pas être repris avant expiration du lease")
 	}
-	if recovered, _ := store.Claim(context.Background(), 11, now.Add(time.Minute), time.Minute); recovered == nil {
+	store.clock = store.clock.Add(30 * time.Second)
+	if recovered, _ := store.Claim(context.Background(), 11, time.Minute); recovered == nil {
 		t.Fatal("le job doit être repris après un crash et expiration du lease")
 	}
 }
@@ -216,7 +221,7 @@ type sequentialStore struct {
 	sent int
 }
 
-func (s *sequentialStore) Claim(context.Context, int64, time.Time, time.Duration) (*Job, error) {
+func (s *sequentialStore) Claim(context.Context, int64, time.Duration) (*Job, error) {
 	if s.i >= len(s.jobs) {
 		return nil, nil
 	}
@@ -225,12 +230,12 @@ func (s *sequentialStore) Claim(context.Context, int64, time.Time, time.Duration
 	return job, nil
 }
 
-func (s *sequentialStore) MarkSent(context.Context, int64, int64, string, time.Time) error {
+func (s *sequentialStore) MarkSent(context.Context, int64, int64, string) error {
 	s.sent++
 	return nil
 }
 
-func (s *sequentialStore) MarkRetry(context.Context, int64, int64, string, time.Time, string) error {
+func (s *sequentialStore) MarkRetry(context.Context, int64, int64, string, time.Duration, string) error {
 	return nil
 }
 
@@ -253,7 +258,7 @@ func TestWorkerSendsEveryChunkInOrderToOwner(t *testing.T) {
 	worker := newTestWorker(store, sender, &logs)
 
 	for i := 0; i < len(store.jobs); i++ {
-		processed, err := worker.ProcessOne(context.Background(), 11, time.Unix(100, 0))
+		processed, err := worker.ProcessOne(context.Background(), 11)
 		if err != nil || !processed {
 			t.Fatalf("ProcessOne %d = (%t, %v), attendu (true, nil)", i, processed, err)
 		}

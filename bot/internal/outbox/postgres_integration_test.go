@@ -82,30 +82,31 @@ func TestPostgresOutboxIsAtomicTenantAwareAndIdempotent(t *testing.T) {
 	}
 
 	outboxRepo := outbox.NewRepository(db)
-	// Claim évalue le lease et l'éligibilité sur le `now` fourni : on passe
-	// l'horloge réelle et on pilote les transitions via de courts leases
-	// réels et le fencing token.
-	job, err := outboxRepo.Claim(ctx, ownerID, time.Now(), 30*time.Millisecond)
+	// Le lease et next_attempt_at sont évalués ET écrits sur l'horloge
+	// PostgreSQL (clock_timestamp) : aucune date Go n'entre dans le
+	// scénario, on pilote les transitions via de courts leases réels, des
+	// délais de retry explicites et le fencing token.
+	job, err := outboxRepo.Claim(ctx, ownerID, 30*time.Millisecond)
 	if err != nil || job == nil || job.LeaseToken == "" {
 		t.Fatalf("claim PostgreSQL: job=%+v err=%v", job, err)
 	}
-	if duplicate, err := outboxRepo.Claim(ctx, ownerID, time.Now(), time.Minute); err != nil || duplicate != nil {
+	if duplicate, err := outboxRepo.Claim(ctx, ownerID, time.Minute); err != nil || duplicate != nil {
 		t.Fatalf("claim avant expiration du lease: job=%v err=%v", duplicate, err)
 	}
 	time.Sleep(60 * time.Millisecond)
-	recovered, err := outboxRepo.Claim(ctx, ownerID, time.Now(), time.Minute)
+	recovered, err := outboxRepo.Claim(ctx, ownerID, time.Minute)
 	if err != nil || recovered == nil || recovered.ID != job.ID {
 		t.Fatalf("reprise après expiration du lease: job=%v err=%v", recovered, err)
 	}
 	// L'ancien lease ne doit plus pouvoir acquitter la ligne reprise.
-	if err := outboxRepo.MarkSent(ctx, ownerID, job.ID, job.LeaseToken, time.Now()); !errors.Is(err, outbox.ErrLeaseLost) {
+	if err := outboxRepo.MarkSent(ctx, ownerID, job.ID, job.LeaseToken); !errors.Is(err, outbox.ErrLeaseLost) {
 		t.Fatalf("MarkSent avec lease périmé = %v, attendu ErrLeaseLost", err)
 	}
 	// Un retry planifié loin dans le futur bloque toute reprise immédiate.
-	if err := outboxRepo.MarkRetry(ctx, ownerID, recovered.ID, recovered.LeaseToken, time.Now().Add(time.Hour), "timeout"); err != nil {
+	if err := outboxRepo.MarkRetry(ctx, ownerID, recovered.ID, recovered.LeaseToken, time.Hour, "timeout"); err != nil {
 		t.Fatal(err)
 	}
-	if early, err := outboxRepo.Claim(ctx, ownerID, time.Now(), time.Minute); err != nil || early != nil {
+	if early, err := outboxRepo.Claim(ctx, ownerID, time.Minute); err != nil || early != nil {
 		t.Fatalf("claim avant next_attempt_at: job=%v err=%v", early, err)
 	}
 
@@ -117,14 +118,14 @@ func TestPostgresOutboxIsAtomicTenantAwareAndIdempotent(t *testing.T) {
 	if _, err := repo.MarkDeleted(ctx, ownerID, 900001, permanent.BusinessConnectionID, permanent.ChatID, []int64{permanent.MessageID}); err != nil {
 		t.Fatal(err)
 	}
-	failedJob, err := outboxRepo.Claim(ctx, ownerID, time.Now(), time.Minute)
+	failedJob, err := outboxRepo.Claim(ctx, ownerID, time.Minute)
 	if err != nil || failedJob == nil {
 		t.Fatalf("claim avant échec définitif: job=%v err=%v", failedJob, err)
 	}
 	if err := outboxRepo.MarkFailed(ctx, ownerID, failedJob.ID, failedJob.LeaseToken, "telegram_400"); err != nil {
 		t.Fatal(err)
 	}
-	if failedAgain, err := outboxRepo.Claim(ctx, ownerID, time.Now(), time.Minute); err != nil || failedAgain != nil {
+	if failedAgain, err := outboxRepo.Claim(ctx, ownerID, time.Minute); err != nil || failedAgain != nil {
 		t.Fatalf("un job failed a été repris: job=%v err=%v", failedAgain, err)
 	}
 
@@ -209,32 +210,37 @@ func TestPostgresClaimPreservesChunkOrderAcrossRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// now est capturé APRÈS les inserts : leurs next_attempt_at valent
-	// now() PostgreSQL, postérieur à toute horloge capturée avant.
-	now := time.Now()
 	repo := outbox.NewRepository(db)
-	first, err := repo.Claim(ctx, ownerID, now, time.Minute)
+	first, err := repo.Claim(ctx, ownerID, time.Minute)
 	if err != nil || first == nil {
 		t.Fatalf("claim chunk 0: job=%v err=%v", first, err)
 	}
-	if err := repo.MarkRetry(ctx, ownerID, first.ID, first.LeaseToken, now.Add(time.Hour), "timeout"); err != nil {
+	if err := repo.MarkRetry(ctx, ownerID, first.ID, first.LeaseToken, time.Hour, "timeout"); err != nil {
 		t.Fatal(err)
 	}
-	blocked, err := repo.Claim(ctx, ownerID, now.Add(time.Minute), time.Minute)
+	blocked, err := repo.Claim(ctx, ownerID, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if blocked != nil {
 		t.Fatalf("chunk suivant réclamé avant le retry du premier: %+v", blocked)
 	}
-	retried, err := repo.Claim(ctx, ownerID, now.Add(time.Hour), time.Minute)
+	// Le retry est réel : on ramène next_attempt_at dans le passé côté
+	// serveur plutôt que d'avancer une horloge Go, qui n'a plus aucun effet.
+	if err := db.InTenant(ctx, ownerID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE notification_outbox SET next_attempt_at = clock_timestamp() WHERE id = $1`, first.ID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	retried, err := repo.Claim(ctx, ownerID, time.Minute)
 	if err != nil || retried == nil || retried.ID != first.ID {
 		t.Fatalf("retry chunk 0: job=%v err=%v", retried, err)
 	}
-	if err := repo.MarkSent(ctx, ownerID, retried.ID, retried.LeaseToken, now.Add(time.Hour)); err != nil {
+	if err := repo.MarkSent(ctx, ownerID, retried.ID, retried.LeaseToken); err != nil {
 		t.Fatal(err)
 	}
-	next, err := repo.Claim(ctx, ownerID, now.Add(time.Hour), time.Minute)
+	next, err := repo.Claim(ctx, ownerID, time.Minute)
 	if err != nil || next == nil || next.ID == first.ID {
 		t.Fatalf("claim chunk 1 après chunk 0 sent: job=%v err=%v", next, err)
 	}
@@ -292,19 +298,19 @@ func TestPostgresStaleWorkerCannotAcknowledgeReclaimedLease(t *testing.T) {
 	}
 
 	repo := outbox.NewRepository(db)
-	workerA, err := repo.Claim(ctx, ownerID, time.Now(), 20*time.Millisecond)
+	workerA, err := repo.Claim(ctx, ownerID, 20*time.Millisecond)
 	if err != nil || workerA == nil || workerA.LeaseToken == "" {
 		t.Fatalf("claim A: job=%+v err=%v", workerA, err)
 	}
 	time.Sleep(50 * time.Millisecond)
-	workerB, err := repo.Claim(ctx, ownerID, time.Now(), time.Minute)
+	workerB, err := repo.Claim(ctx, ownerID, time.Minute)
 	if err != nil || workerB == nil || workerB.ID != workerA.ID || workerB.LeaseToken == workerA.LeaseToken {
 		t.Fatalf("reclaim B: A=%+v B=%+v err=%v", workerA, workerB, err)
 	}
-	if err := repo.MarkSent(ctx, ownerID, workerA.ID, workerA.LeaseToken, time.Now()); !errors.Is(err, outbox.ErrLeaseLost) {
+	if err := repo.MarkSent(ctx, ownerID, workerA.ID, workerA.LeaseToken); !errors.Is(err, outbox.ErrLeaseLost) {
 		t.Fatalf("ack stale A = %v, attendu ErrLeaseLost", err)
 	}
-	if err := repo.MarkRetry(ctx, ownerID, workerA.ID, workerA.LeaseToken, time.Now(), "timeout"); !errors.Is(err, outbox.ErrLeaseLost) {
+	if err := repo.MarkRetry(ctx, ownerID, workerA.ID, workerA.LeaseToken, 0, "timeout"); !errors.Is(err, outbox.ErrLeaseLost) {
 		t.Fatalf("retry stale A = %v, attendu ErrLeaseLost", err)
 	}
 	var status, leaseToken string

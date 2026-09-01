@@ -38,10 +38,12 @@ type Job struct {
 	LeaseToken           string
 }
 
+// Store porte l'horloge : toutes les dates écrites ou comparées le sont côté
+// PostgreSQL. Le worker ne fournit que des durées (lease, délai de retry).
 type Store interface {
-	Claim(context.Context, int64, time.Time, time.Duration) (*Job, error)
-	MarkSent(context.Context, int64, int64, string, time.Time) error
-	MarkRetry(context.Context, int64, int64, string, time.Time, string) error
+	Claim(context.Context, int64, time.Duration) (*Job, error)
+	MarkSent(context.Context, int64, int64, string) error
+	MarkRetry(context.Context, int64, int64, string, time.Duration, string) error
 	MarkFailed(context.Context, int64, int64, string, string) error
 }
 
@@ -50,7 +52,8 @@ type Sender interface {
 }
 
 // Worker réserve puis livre une alerte à la fois. Le lease rend un job de
-// nouveau disponible si le processus s'arrête entre Claim et l'acquittement.
+// nouveau disponible si le processus s'arrête entre Claim et l'acquittement :
+// la livraison est donc at-least-once, un doublon d'alerte reste possible.
 type Worker struct {
 	store  Store
 	sender Sender
@@ -64,8 +67,8 @@ func NewWorker(store Store, sender Sender, logger *slog.Logger) *Worker {
 
 // ProcessOne traite au plus une alerte du tenant. Le contenu, la connexion et
 // le texte des erreurs Telegram ne sont jamais journalisés.
-func (w *Worker) ProcessOne(ctx context.Context, ownerUserID int64, now time.Time) (bool, error) {
-	job, err := w.store.Claim(ctx, ownerUserID, now, w.lease)
+func (w *Worker) ProcessOne(ctx context.Context, ownerUserID int64) (bool, error) {
+	job, err := w.store.Claim(ctx, ownerUserID, w.lease)
 	if err != nil {
 		if isShutdown(ctx, err) {
 			return false, nil
@@ -82,7 +85,7 @@ func (w *Worker) ProcessOne(ctx context.Context, ownerUserID int64, now time.Tim
 		// BusinessConnectionID reste volontairement vide : l'alerte vient du bot.
 	})
 	if err == nil {
-		if err := w.store.MarkSent(ctx, ownerUserID, job.ID, job.LeaseToken, now); err != nil {
+		if err := w.store.MarkSent(ctx, ownerUserID, job.ID, job.LeaseToken); err != nil {
 			if isShutdown(ctx, err) {
 				// Alerte partie mais non acquittée : le lease expirera et le job
 				// sera repris, donc au pire un doublon après redémarrage.
@@ -128,7 +131,7 @@ func (w *Worker) ProcessOne(ctx context.Context, ownerUserID int64, now time.Tim
 	if apiErr != nil && apiErr.IsRateLimited() {
 		wait = time.Duration(apiErr.RetryAfter) * time.Second
 	}
-	if markErr := w.store.MarkRetry(ctx, ownerUserID, job.ID, job.LeaseToken, now.Add(wait), code); markErr != nil {
+	if markErr := w.store.MarkRetry(ctx, ownerUserID, job.ID, job.LeaseToken, wait, code); markErr != nil {
 		return true, fmt.Errorf("planification retry outbox: %w", markErr)
 	}
 	w.logger.Warn("alerte outbox replanifiée", slog.Int64("outbox_id", job.ID), slog.String("error_class", code), slog.Duration("retry_in", wait))

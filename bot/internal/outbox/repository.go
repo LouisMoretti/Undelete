@@ -39,7 +39,12 @@ func InsertTx(ctx context.Context, tx pgx.Tx, ownerUserID, ownerTelegramUserID i
 	return nil
 }
 
-func (r *Repository) Claim(ctx context.Context, ownerUserID int64, now time.Time, lease time.Duration) (*Job, error) {
+// Claim réserve au plus un job du tenant. Toutes les dates (échéance de
+// retry, expiration de lease) sont évaluées sur l'horloge du serveur
+// PostgreSQL : aucun `now` Go n'entre dans la décision, une dérive entre
+// l'horloge du bot et celle de la base ne peut donc ni masquer un job ni le
+// rendre réclamable trop tôt.
+func (r *Repository) Claim(ctx context.Context, ownerUserID int64, lease time.Duration) (*Job, error) {
 	leaseToken, err := newLeaseToken()
 	if err != nil {
 		return nil, err
@@ -51,8 +56,8 @@ func (r *Repository) Claim(ctx context.Context, ownerUserID int64, now time.Time
 				SELECT current_job.id
 				FROM notification_outbox current_job
 				WHERE current_job.status IN ('pending', 'processing')
-				  AND current_job.next_attempt_at <= $3
-				  AND (current_job.locked_until IS NULL OR current_job.locked_until <= $3)
+				  AND current_job.next_attempt_at <= clock_timestamp()
+				  AND (current_job.locked_until IS NULL OR current_job.locked_until <= clock_timestamp())
 				  AND NOT EXISTS (
 					SELECT 1 FROM notification_outbox prior
 					WHERE prior.owner_user_id = current_job.owner_user_id
@@ -69,14 +74,14 @@ func (r *Repository) Claim(ctx context.Context, ownerUserID int64, now time.Time
 			)
 			UPDATE notification_outbox o
 			SET status = 'processing',
-			    locked_until = $3 + make_interval(secs => $1),
-			    lease_token = $2, updated_at = $3
+			    locked_until = clock_timestamp() + make_interval(secs => $1),
+			    lease_token = $2, updated_at = clock_timestamp()
 			FROM candidate
 			WHERE o.id = candidate.id
 			RETURNING o.id, o.owner_user_id, o.owner_telegram_user_id,
 			          o.business_connection_id, o.chat_id, o.message_id,
 			          o.event_type, o.payload_text, o.attempts, o.lease_token
-		`, lease.Seconds(), leaseToken, now)
+		`, lease.Seconds(), leaseToken)
 		var claimed Job
 		if err := row.Scan(&claimed.ID, &claimed.OwnerUserID, &claimed.OwnerTelegramUserID,
 			&claimed.BusinessConnectionID, &claimed.ChatID, &claimed.MessageID,
@@ -92,27 +97,33 @@ func (r *Repository) Claim(ctx context.Context, ownerUserID int64, now time.Time
 	return job, err
 }
 
-func (r *Repository) MarkSent(ctx context.Context, ownerUserID, id int64, leaseToken string, now time.Time) error {
+// MarkSent acquitte le job. sent_at et updated_at sont datés par PostgreSQL,
+// comme les comparaisons faites par Claim.
+func (r *Repository) MarkSent(ctx context.Context, ownerUserID, id int64, leaseToken string) error {
 	return r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			UPDATE notification_outbox
-			SET status = 'sent', sent_at = $3, locked_until = NULL,
-			    lease_token = NULL, last_error_class = NULL, updated_at = $3
+			SET status = 'sent', sent_at = clock_timestamp(), locked_until = NULL,
+			    lease_token = NULL, last_error_class = NULL, updated_at = clock_timestamp()
 			WHERE id = $1 AND status = 'processing' AND lease_token = $2
-		`, id, leaseToken, now)
+		`, id, leaseToken)
 		return verifyLeaseUpdate(tag.RowsAffected(), id, err)
 	})
 }
 
-func (r *Repository) MarkRetry(ctx context.Context, ownerUserID, id int64, leaseToken string, next time.Time, errorClass string) error {
+// MarkRetry replanifie le job dans `wait` : le délai est calculé côté Go
+// (backoff, retry_after de Telegram) mais l'échéance absolue est dérivée de
+// l'horloge PostgreSQL, celle-là même que Claim compare.
+func (r *Repository) MarkRetry(ctx context.Context, ownerUserID, id int64, leaseToken string, wait time.Duration, errorClass string) error {
 	return r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			UPDATE notification_outbox
 			SET status = 'pending', attempts = attempts + 1,
-			    next_attempt_at = $3, locked_until = NULL, lease_token = NULL,
+			    next_attempt_at = clock_timestamp() + make_interval(secs => $3),
+			    locked_until = NULL, lease_token = NULL,
 			    last_error_class = $4, updated_at = clock_timestamp()
 			WHERE id = $1 AND status = 'processing' AND lease_token = $2
-		`, id, leaseToken, next, errorClass)
+		`, id, leaseToken, wait.Seconds(), errorClass)
 		return verifyLeaseUpdate(tag.RowsAffected(), id, err)
 	})
 }

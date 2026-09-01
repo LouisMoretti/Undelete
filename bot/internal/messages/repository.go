@@ -1,11 +1,15 @@
-// Package messages gère la table messages, protégée par FORCE ROW LEVEL
-// SECURITY. Toute méthode de ce package qui touche à messages passe par
-// storage.DB.InTenant : il n'existe volontairement aucun chemin qui
-// requêterait messages via le pool nu.
+// Package messages gère les tables messages et chats, toutes deux protégées
+// par FORCE ROW LEVEL SECURITY. Toute méthode de ce package qui les touche
+// passe par storage.DB.InTenant : il n'existe volontairement aucun chemin qui
+// les requêterait via le pool nu.
+//
+// chats ne porte que des libellés d'affichage (cf. migration 0003) : aucune
+// méthode d'ici ne l'interroge pour décider quoi sauvegarder ou notifier.
 package messages
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -32,16 +36,25 @@ type Record struct {
 	MessageType  string
 	TextContent  string
 	TelegramDate int64
+	// ChatTitle/ChatUsername/ChatType sont le libellé du chat porté par
+	// l'update. Ils ne sont pas des colonnes de messages : ils alimentent la
+	// table chats, upsertée dans la même transaction que le message (c'est le
+	// seul moment où le code voit le Chat complet, cf. migration 0003).
+	ChatTitle    string
+	ChatUsername string
+	ChatType     string
 }
 
 // DeletedRecord est ce qui est restitué à la suppression : juste assez pour
 // notifier le owner sans avoir à requêter la ligne complète séparément.
 type DeletedRecord struct {
-	ChatID      int64
-	MessageID   int64
-	FromDisplay string
-	MessageType string
-	TextContent string
+	ChatID       int64
+	MessageID    int64
+	FromUserID   *int64
+	FromDisplay  string
+	MessageType  string
+	TextContent  string
+	TelegramDate int64
 }
 
 // Repository donne accès à la table messages, exclusivement via InTenant.
@@ -75,6 +88,31 @@ func NewRepository(db *storage.DB) *Repository {
 // amont par business.Service.Resolve, pas ici).
 func (r *Repository) Save(ctx context.Context, ownerUserID int64, m Record, edited bool) error {
 	return r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
+		// Libellé du chat d'abord, dans la MÊME transaction : c'est ici, et
+		// nulle part ailleurs, que le Chat complet est visible (l'update
+		// deleted_business_messages ne le transporte pas de façon fiable pour
+		// les chats déjà connus). Un renommage de contact est donc répercuté
+		// au message suivant, jamais rétroactivement.
+		//
+		// Contrainte n°8 : aucune condition sur chat_id ici non plus, cette
+		// table décrit les chats vus, elle n'en sélectionne aucun.
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO chats (owner_user_id, business_connection_id, chat_id, title, username, type)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (owner_user_id, business_connection_id, chat_id)
+			DO UPDATE SET
+				-- Un update qui n'apporte aucun libellé (Telegram omet les
+				-- champs optionnels du Chat selon le type d'update) ne doit
+				-- pas EFFACER celui déjà connu : on ne remplace que par une
+				-- valeur non vide.
+				title        = CASE WHEN EXCLUDED.title    <> '' THEN EXCLUDED.title    ELSE chats.title    END,
+				username     = CASE WHEN EXCLUDED.username <> '' THEN EXCLUDED.username ELSE chats.username END,
+				type         = CASE WHEN EXCLUDED.type     <> '' THEN EXCLUDED.type     ELSE chats.type     END,
+				last_seen_at = now()
+		`, ownerUserID, m.BusinessConnectionID, m.ChatID, m.ChatTitle, m.ChatUsername, m.ChatType); err != nil {
+			return fmt.Errorf("upsert libellé de chat: %w", err)
+		}
+
 		_, err := tx.Exec(ctx, `
 			INSERT INTO messages (
 				owner_user_id, business_connection_id, chat_id, message_id,
@@ -115,13 +153,26 @@ func (r *Repository) MarkDeleted(ctx context.Context, ownerUserID, ownerTelegram
 	var found []DeletedRecord
 
 	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
+		// Une seule requête supplémentaire, dans la même transaction : le
+		// libellé du chat sert uniquement à rendre l'alerte lisible. Absence
+		// de ligne = chat jamais revu depuis la migration 0003 (pas de
+		// backfill), l'alerte retombe sur son repli « chat <id> ».
+		var chatTitle, chatUsername string
+		if err := tx.QueryRow(ctx, `
+			SELECT title, username FROM chats
+			WHERE business_connection_id = $1 AND chat_id = $2
+		`, businessConnectionID, chatID).Scan(&chatTitle, &chatUsername); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("lecture libellé de chat: %w", err)
+		}
+
 		rows, err := tx.Query(ctx, `
 			UPDATE messages
 			SET deleted_at = COALESCE(deleted_at, now())
 			WHERE business_connection_id = $1
 			  AND chat_id = $2
 			  AND message_id = ANY($3)
-			RETURNING chat_id, message_id, from_display, message_type, text_content
+			RETURNING chat_id, message_id, from_user_id, COALESCE(from_display, ''),
+			          message_type, COALESCE(text_content, ''), telegram_date
 		`, businessConnectionID, chatID, messageIDs)
 		if err != nil {
 			return fmt.Errorf("update deleted_at: %w", err)
@@ -130,7 +181,8 @@ func (r *Repository) MarkDeleted(ctx context.Context, ownerUserID, ownerTelegram
 
 		for rows.Next() {
 			var d DeletedRecord
-			if err := rows.Scan(&d.ChatID, &d.MessageID, &d.FromDisplay, &d.MessageType, &d.TextContent); err != nil {
+			if err := rows.Scan(&d.ChatID, &d.MessageID, &d.FromUserID, &d.FromDisplay,
+				&d.MessageType, &d.TextContent, &d.TelegramDate); err != nil {
 				return fmt.Errorf("lecture message supprimé: %w", err)
 			}
 			found = append(found, d)
@@ -146,7 +198,18 @@ func (r *Repository) MarkDeleted(ctx context.Context, ownerUserID, ownerTelegram
 			// fixtures bot-api-10.3 sont produites par ce même chemin) : les
 			// chunks écrits en outbox ici sont exactement ceux que le worker
 			// enverra, sans reformulation locale parallèle.
-			for chunkIndex, request := range telegram.BuildDeletionMessageRequests(ownerTelegramUserID, d.ChatID, d.TextContent) {
+			alert := telegram.DeletionAlert{
+				OwnerTelegramUserID: ownerTelegramUserID,
+				ChatID:              d.ChatID,
+				ChatTitle:           chatTitle,
+				ChatUsername:        chatUsername,
+				FromDisplay:         d.FromDisplay,
+				FromUserID:          d.FromUserID,
+				MessageType:         d.MessageType,
+				TelegramDate:        d.TelegramDate,
+				Content:             d.TextContent,
+			}
+			for chunkIndex, request := range telegram.BuildDeletionMessageRequests(alert) {
 				if err := outbox.InsertTx(ctx, tx, ownerUserID, ownerTelegramUserID,
 					businessConnectionID, d.ChatID, d.MessageID, outbox.EventDeletedMessage,
 					chunkIndex, request.Text); err != nil {

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -77,7 +78,7 @@ func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 	if migrationCount != 1 {
 		t.Fatalf("migration 1 recorded %d times, want exactly once", migrationCount)
 	}
-	if _, err := admin.Exec(ctx, `TRUNCATE messages, business_connections, users RESTART IDENTITY CASCADE`); err != nil {
+	if _, err := admin.Exec(ctx, `TRUNCATE chats, messages, business_connections, users RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatalf("reset integration fixtures: %v", err)
 	}
 
@@ -147,7 +148,7 @@ func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 	msgRepo := messages.NewRepository(db)
 
 	messageFor := func(connection string, id int64, text string) messages.Record {
-		return messages.Record{BusinessConnectionID: connection, ChatID: 77, MessageID: id, FromDisplay: "integration", MessageType: "text", TextContent: text, TelegramDate: time.Now().Unix()}
+		return messages.Record{BusinessConnectionID: connection, ChatID: 77, MessageID: id, FromDisplay: "integration", MessageType: "text", TextContent: text, TelegramDate: 1788019201, ChatTitle: "chat " + connection, ChatType: "private"}
 	}
 	if err := msgRepo.Save(ctx, owner1.ID, messageFor("owner-1", 1, "owner one"), false); err != nil {
 		t.Fatalf("save owner 1: %v", err)
@@ -186,7 +187,7 @@ func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 		if err != nil {
 			t.Fatalf("own-tenant update: %v", err)
 		}
-		if len(ownTenant) != 1 || ownTenant[0].TextContent != "owner one" {
+		if len(ownTenant) != 1 || ownTenant[0].TextContent != "owner one" || ownTenant[0].TelegramDate != 1788019201 {
 			t.Fatalf("unexpected own-tenant update result: %#v", ownTenant)
 		}
 		assertTenantCount(t, ctx, db, owner1.ID, 1)
@@ -199,6 +200,45 @@ func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 		}
 		if leaked != 0 {
 			t.Fatalf("owner 1 read %d owner 2 rows", leaked)
+		}
+	})
+
+	t.Run("chat labels are tenant isolated and reach the alert", func(t *testing.T) {
+		var raw int
+		if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM chats`).Scan(&raw); err != nil {
+			t.Fatalf("raw select on chats: %v", err)
+		}
+		if raw != 0 {
+			t.Fatalf("raw select exposed %d chat labels without tenant context", raw)
+		}
+		var title string
+		if err := db.InTenant(ctx, owner1.ID, func(tx pgx.Tx) error {
+			return tx.QueryRow(ctx, `SELECT title FROM chats WHERE business_connection_id = 'owner-1' AND chat_id = 77`).Scan(&title)
+		}); err != nil {
+			t.Fatalf("read own chat label: %v", err)
+		}
+		if title != "chat owner-1" {
+			t.Fatalf("chat label = %q, want %q", title, "chat owner-1")
+		}
+		if err := db.InTenant(ctx, owner1.ID, func(tx pgx.Tx) error {
+			return tx.QueryRow(ctx, `SELECT count(*) FROM chats WHERE business_connection_id = 'owner-2'`).Scan(&raw)
+		}); err != nil {
+			t.Fatalf("cross-tenant chat label read: %v", err)
+		}
+		if raw != 0 {
+			t.Fatalf("owner 1 read %d owner 2 chat labels", raw)
+		}
+
+		// L'alerte figée en outbox par MarkDeleted doit porter le libellé lu
+		// dans chats, pas le seul chat_id numérique.
+		var payload string
+		if err := db.InTenant(ctx, owner1.ID, func(tx pgx.Tx) error {
+			return tx.QueryRow(ctx, `SELECT payload_text FROM notification_outbox WHERE chat_id = 77 AND message_id = 1 ORDER BY chunk_index LIMIT 1`).Scan(&payload)
+		}); err != nil {
+			t.Fatalf("read outbox payload: %v", err)
+		}
+		if !strings.Contains(payload, "Chat : chat owner-1 (77)") || !strings.Contains(payload, "Date : 2026-08-29 16:00 UTC") {
+			t.Fatalf("deletion alert lacks chat identity or date: %q", payload)
 		}
 	})
 

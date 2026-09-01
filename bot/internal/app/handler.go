@@ -97,6 +97,9 @@ func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited
 		MessageType:          "text", // Phase 1 : texte uniquement
 		TextContent:          msg.Text,
 		TelegramDate:         msg.Date,
+		ChatTitle:            chatTitle(msg.Chat),
+		ChatUsername:         msg.Chat.Username,
+		ChatType:             msg.Chat.Type,
 	}
 
 	if err := h.messages.Save(ctx, conn.OwnerUserID, record, edited); err != nil {
@@ -162,6 +165,25 @@ func (h *Handler) handleDeleted(ctx context.Context, del *telegram.BusinessMessa
 		slog.Int("recovered", len(found)))
 
 	return nil
+}
+
+// chatTitle calcule le libellé d'affichage d'un chat. Telegram ne renseigne
+// title que pour les chats qui en ont un (groupes, canaux) : un chat privé
+// n'est décrit que par first_name/last_name, qui deviennent alors le libellé.
+// Un chat sans aucun de ces champs reste sans libellé -- l'alerte affiche son
+// id, jamais une valeur inventée.
+func chatTitle(c telegram.Chat) string {
+	if c.Title != "" {
+		return c.Title
+	}
+	name := c.FirstName
+	if c.LastName != "" {
+		if name != "" {
+			name += " "
+		}
+		name += c.LastName
+	}
+	return name
 }
 
 func displayName(u *telegram.User) string {

@@ -39,8 +39,16 @@ test : ce sont les **chemins de production** qui les produisent.
 | `get-updates-*.json` | `telegram.Client.GetUpdates` |
 | `get-business-connection-*.json` | `telegram.Client.GetBusinessConnection` |
 | `send-message-welcome-request.json` | `business.Service.notifyWelcome` (+ le builder, côté `telegram`) |
-| `send-message-deletion-request.json` | `app.Handler.notifyDeletion` (+ le builder, côté `telegram`) |
+| `send-message-deletion-request.json` | `telegram.BuildDeletionMessageRequests`, seul producteur du format (les chunks écrits en outbox par `messages.Repository.MarkDeleted` sortent de ce builder) |
 | `send-message-rate-limited-response.json` | `telegram.Client.SendMessage` (respect de `retry_after`) et `SendMessageOnce` |
+
+Toute évolution du format d'une alerte impose donc de **régénérer** la fixture
+correspondante depuis le builder de production (jamais de retouche à la main) :
+sérialiser la requête produite avec `encoding/json` et écrire le résultat suivi
+de l'unique newline LF de stockage. `send-message-deletion-request.json` a été
+régénérée ainsi lors du passage au format enrichi (chat, expéditeur, type,
+date). `send-message-welcome-request.json` est inchangée, le texte de bienvenue
+n'ayant pas bougé.
 
 ## `send-message-ok-envelope.json` n'est pas un contrat
 

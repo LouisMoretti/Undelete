@@ -83,7 +83,7 @@ make test-restore
 En un seul appel, `scripts/restore-test.sh` :
 
 1. démarre un PostgreSQL 16 **source** jetable (`docker run --rm`, nom unique
-   horodaté, port publié choisi par Docker, aucun volume nommé) ;
+   horodaté, aucun port publié sur l'hôte, aucun volume nommé) ;
 2. y applique `bot/internal/storage/migrations/*.sql` dans l'ordre numérique,
    en reproduisant fidèlement le runner Go (`storage.RunMigrations`) : même DDL
    pour `schema_migrations`, même tri par nom de fichier, migration et
@@ -96,7 +96,8 @@ En un seul appel, `scripts/restore-test.sh` :
    temporaire, jamais dans le `./backups` du dépôt ;
 5. vérifie l'intégrité de l'archive avec `gzip -t` ;
 6. démarre un second conteneur **cible**, distinct, avec une base vierge, et
-   vérifie qu'elle est effectivement vide avant restauration ;
+   vérifie qu'elle est effectivement vide avant restauration — si elle ne l'est
+   pas, le script s'arrête là, sans rien écraser ;
 7. restaure (`gunzip` puis `psql`) en chronométrant l'opération ;
 8. vérifie après restauration : présence des tables attendues (`users`,
    `business_connections`, `chats`, `messages`, `notification_outbox`,
@@ -154,21 +155,34 @@ Procédure pas-à-pas, à faire **vers une cible neuve** :
    restaurer dans la base en service, et **ne jamais supprimer le volume
    existant** : tant que la restauration n'est pas validée, ce volume est la
    seule copie des données.
-3. **Restaurer.**
+3. **Restaurer.** En deux commandes, et avec `-v ON_ERROR_STOP=1` :
    ```sh
-   gunzip -c backups/undelete-<horodatage>.sql.gz \
-     | psql "postgres://postgres:<motdepasse>@127.0.0.1:5432/undelete_restore"
+   gunzip -c backups/undelete-<horodatage>.sql.gz > /tmp/undelete-restore.sql
+   psql -v ON_ERROR_STOP=1 \
+     -f /tmp/undelete-restore.sql \
+     "postgres://postgres:<motdepasse>@127.0.0.1:5432/undelete_restore"
    ```
-   Utiliser `ON_ERROR_STOP` (`psql -v ON_ERROR_STOP=1`) : sans lui, `psql`
-   poursuit après une erreur et sort en 0, ce qui présenterait une restauration
-   partielle comme réussie.
+   Les deux détails de cette commande sont ceux qui distinguent une
+   restauration vérifiée d'une restauration supposée :
+   - **`-v ON_ERROR_STOP=1`** : sans lui, `psql` poursuit après une erreur et
+     sort en 0, ce qui présenterait une restauration partielle comme réussie.
+   - **pas de pipe `gunzip | psql`** : dans un pipe, le code de sortie retenu
+     est celui de `psql`, donc une décompression qui échoue en cours de route
+     est masquée par un `psql` satisfait de ce qu'il a reçu. En décomposant,
+     chaque maillon est testé pour lui-même (c'est aussi ce que fait
+     `scripts/restore-test.sh`).
+
+   Supprimer `/tmp/undelete-restore.sql` après coup : ce fichier contient tout
+   le contenu des messages en clair.
 4. **Vérifier avant de basculer.** Les mêmes contrôles que la recette :
    ```sql
    SELECT version FROM schema_migrations ORDER BY version;
    SELECT count(*) FROM users;
    SELECT count(*) FROM messages;
    SELECT relname, relrowsecurity, relforcerowsecurity
-     FROM pg_class WHERE relname IN ('messages', 'notification_outbox', 'chats');
+     FROM pg_class
+     WHERE relnamespace = 'public'::regnamespace
+       AND relname IN ('messages', 'notification_outbox', 'chats');
    ```
    `relforcerowsecurity` doit être vrai pour les trois tables : sans lui,
    l'isolation multi-tenant ne tient plus.

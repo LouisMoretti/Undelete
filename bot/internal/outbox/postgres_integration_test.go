@@ -84,16 +84,22 @@ func TestPostgresOutboxIsAtomicTenantAwareAndIdempotent(t *testing.T) {
 	outboxRepo := outbox.NewRepository(db)
 	// Le lease et next_attempt_at sont évalués ET écrits sur l'horloge
 	// PostgreSQL (clock_timestamp) : aucune date Go n'entre dans le
-	// scénario, on pilote les transitions via de courts leases réels, des
+	// scénario, on pilote les transitions via des leases réels, des
 	// délais de retry explicites et le fencing token.
-	job, err := outboxRepo.Claim(ctx, ownerID, 30*time.Millisecond)
+	// Le lease de 1 s (et non « le plus court possible ») est un choix
+	// délibéré : en CI, deux Claim consécutifs peuvent être espacés de
+	// plusieurs dizaines de ms (scheduling + aller-retour BD) ; un lease
+	// de 30 ms pouvait expirer AVANT le claim dupliqué, et le sleep de
+	// 60 ms n'était que 2× le lease. Les marges 1 s / 1,2 s absorbent
+	// cette latence dans les deux sens, au prix d'une seconde de test.
+	job, err := outboxRepo.Claim(ctx, ownerID, time.Second)
 	if err != nil || job == nil || job.LeaseToken == "" {
 		t.Fatalf("claim PostgreSQL: job=%+v err=%v", job, err)
 	}
 	if duplicate, err := outboxRepo.Claim(ctx, ownerID, time.Minute); err != nil || duplicate != nil {
 		t.Fatalf("claim avant expiration du lease: job=%v err=%v", duplicate, err)
 	}
-	time.Sleep(60 * time.Millisecond)
+	time.Sleep(1200 * time.Millisecond)
 	recovered, err := outboxRepo.Claim(ctx, ownerID, time.Minute)
 	if err != nil || recovered == nil || recovered.ID != job.ID {
 		t.Fatalf("reprise après expiration du lease: job=%v err=%v", recovered, err)

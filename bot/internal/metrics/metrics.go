@@ -114,9 +114,6 @@ var allSeries = []series{
 	},
 }
 
-// RenderPrometheus rend l'exposition texte de l'instance par défaut.
-func RenderPrometheus() string { return std.RenderPrometheus() }
-
 // RenderPrometheus rend l'exposition texte : un bloc HELP/TYPE puis la valeur
 // pour chaque série. Aucun label n'est émis, donc aucune valeur issue d'un
 // update ne peut se retrouver dans la sortie.

@@ -11,6 +11,7 @@ package health
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -163,9 +164,14 @@ func Serve(ctx context.Context, addr string, handler *Handler, logger *slog.Logg
 		return nil
 	}
 
+	// Timeouts complets : les probes répondent en millisecondes (le seul
+	// travail bloquant est un ping borné à 2 s), donc aucune raison de
+	// laisser une connexion de scrape traîner indéfiniment.
 	srv := &http.Server{
 		Handler:           handler.Mux(),
 		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	ln, err := net.Listen("tcp", addr)
@@ -181,7 +187,7 @@ func Serve(ctx context.Context, addr string, handler *Handler, logger *slog.Logg
 
 	select {
 	case err := <-errCh:
-		if err == http.ErrServerClosed {
+		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
 		return err

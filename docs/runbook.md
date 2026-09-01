@@ -55,7 +55,7 @@ Il rapporte une ligne par vérification et sort en code 1 dès un `[ECHEC]` :
 | Vérification | Détail |
 |---|---|
 | `.env` présent et chargé | parsé clé=valeur, jamais sourcé ; l'environnement l'emporte sur le fichier, comme docker compose |
-| permissions de `.env` | attendu `600` (contient le jeton et les mots de passe Postgres) |
+| permissions de `.env` | attendu `600` ou `400` (contient le jeton et les mots de passe Postgres) |
 | variables requises | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `APP_DB_PASSWORD`, `MIGRATION_DATABASE_URL`, `DATABASE_URL`, `TELEGRAM_BOT_TOKEN` (cf. `.env.example`) |
 | `OWNER_TELEGRAM_USER_ID` | garde-fou mono-tenant Phase 1 ; **échec si vide** hors dev local |
 | `BACKUP_RETENTION_DAYS` | entier ; absent ⇒ `backup.sh` applique 14 jours |

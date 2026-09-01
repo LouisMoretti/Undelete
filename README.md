@@ -107,7 +107,7 @@ jeton Telegram via `getMe` — jeton jamais affiché. Sortie en code 1 si un
 point échoue.
 
 La procédure de restauration d'un dump est documentée à part dans
-`docs/backup-restore.md` (livré avec `make test-restore`).
+`docs/backup-restore.md` (livré par la PR #40, couche du dessous dans la stack — existe dès que la stack est mergée).
 
 ## Tests d’intégration PostgreSQL 16
 

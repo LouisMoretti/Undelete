@@ -1,4 +1,4 @@
-.PHONY: build vet fmt tidy check test-integration up down logs
+.PHONY: build vet fmt tidy check test-integration test-restore up down logs
 
 # Les 4 commandes de livraison, regroupées.
 check:
@@ -18,6 +18,11 @@ fmt:
 
 test-integration:
 	./scripts/test-integration.sh
+
+# Restaure une sauvegarde dans une base jetable distincte et la vérifie.
+# Voir docs/backup-restore.md (RPO/RTO, recette périodique).
+test-restore:
+	./scripts/restore-test.sh
 
 up:
 	docker compose up --build -d

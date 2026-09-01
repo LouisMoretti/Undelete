@@ -5,6 +5,7 @@
 |------|---------|
 | Build + lint + vet + fmt | `make check` |
 | Run integration tests (Docker) | `make test-integration` |
+| Verify a backup is restorable (Docker) | `make test-restore` |
 | Start dev stack | `docker compose up --build -d` |
 | View bot logs | `docker compose logs -f bot` |
 | Stop stack | `docker compose down` |
@@ -28,6 +29,7 @@
 - Unit tests: `cd bot && go test ./...` (no special tags)
 - Integration tests: `make test-integration` (requires Docker) OR provide `POSTGRES_INTEGRATION_ADMIN_DSN`, `POSTGRES_INTEGRATION_RUNTIME_DSN`, `POSTGRES_INTEGRATION_ALLOW_DESTRUCTIVE=I_UNDERSTAND_THIS_WILL_DELETE_DATA`
 - Integration tests run against real Postgres 16, verify migrations, RLS, multi-tenant isolation, outbox retry/backoff
+- Restore test: `make test-restore` (requires Docker) — dumps a throwaway source DB with `scripts/backup.sh`, restores into a **separate blank** target container, checks gzip integrity, tables, `schema_migrations`, row counts, canary rows, `FORCE RLS`, and reports the measured RTO. Refuses to run if `MIGRATION_DATABASE_URL`/`DATABASE_URL` are set. Never touches existing volumes. See `docs/backup-restore.md` (RPO/RTO, weekly recipe).
 
 ## Environment
 - Copy `.env.example` → `.env`, fill in tokens/passwords

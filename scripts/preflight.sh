@@ -221,14 +221,19 @@ fi
 # --- 7. Jeton Telegram (getMe) ---------------------------------------------
 # getMe est en lecture seule et ne consomme aucun update. Le jeton transite
 # dans l'URL : ni l'URL ni la réponse brute ne sont imprimées telles quelles.
+#
+# L'URL est passée à curl par --config - (entrée standard) et JAMAIS en
+# argument : la ligne de commande d'un processus est lisible par tout
+# utilisateur local via ps et /proc/<pid>/cmdline, ce qui exposerait le jeton
+# pendant la durée de l'appel -- hors du canal que masquer_jeton() protège.
 if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
     skip "jeton Telegram : TELEGRAM_BOT_TOKEN manquant, appel getMe non effectué"
 elif ! command -v curl >/dev/null 2>&1; then
     skip "jeton Telegram : curl indisponible sur cette machine"
 else
     reponse=""
-    if reponse="$(curl -sS --max-time 10 \
-        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" 2>&1)"; then
+    if reponse="$(printf 'url = "https://api.telegram.org/bot%s/getMe"\n' \
+        "$TELEGRAM_BOT_TOKEN" | curl -sS --max-time 10 --config - 2>&1)"; then
         case "$reponse" in
             *'"ok":true'*)
                 # Extraction du username sans jq (absent de l'image alpine).

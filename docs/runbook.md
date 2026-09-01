@@ -250,10 +250,23 @@ conversation privée couverte par la connexion Business.
 `<owner_id>` par la valeur de `OWNER_TELEGRAM_USER_ID` de `.env` — elle
 n'existe pas dans le shell de la VM (§1.1).
 
-> **Contexte de tenant.** `messages`, `notification_outbox` et `chats` sont en
-> `FORCE ROW LEVEL SECURITY`. Poser `app.current_owner_user_id` dans la même
-> transaction avec `users.id` (clé de substitution) et **non** le
-> `telegram_user_id` : `owner_user_id` référence `users(id)`.
+> **Contexte de tenant, et ce que la commande ci-dessous montre vraiment.**
+> `messages`, `notification_outbox` et `chats` sont en `FORCE ROW LEVEL
+> SECURITY`, ce qui applique la policy **même au propriétaire de la table**.
+> Mais `POSTGRES_USER` est *superuser* dans l'image `postgres` officielle, et
+> superuser comme `BYPASSRLS` contournent RLS **y compris avec `FORCE`** (cf.
+> `bot/internal/storage/migrations/0001_init.sql`). Depuis ce conteneur, le
+> `count(*)` est donc global, tous tenants confondus : en Phase 1 mono-tenant
+> c'est le résultat attendu, et un `0` veut bien dire « aucun message
+> capturé », pas « contexte non posé ».
+>
+> Le `set_config` est conservé parce qu'il est correct et sans effet de bord
+> ici, et **indispensable** dès qu'on rejoue ces requêtes avec un rôle
+> non-superuser — `undelete_app`, ou un propriétaire dépourvu de `BYPASSRLS` :
+> là, un `SELECT count(*)` sans contexte renvoie `0` **sans erreur**, un zéro
+> qui ne veut rien dire. Il se pose dans la même transaction, avec `users.id`
+> (clé de substitution) et **non** le `telegram_user_id` : `owner_user_id`
+> référence `users(id)`.
 
 ```bash
 docker compose exec -T postgres \

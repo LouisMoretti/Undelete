@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 )
@@ -63,6 +64,17 @@ func Load() (*Config, error) {
 	// intentions différentes.
 	if raw, ok := os.LookupEnv("HEALTH_ADDR"); ok {
 		cfg.HealthAddr = raw
+	}
+
+	// Validée ici, et pas seulement au net.Listen : une valeur mal formée
+	// (« 9090 » sans deux-points) laisserait le bot démarrer normalement puis
+	// perdre TOUTES ses probes et ses métriques sur un unique log Error, sans
+	// que rien d'autre ne bouge. Une supervision muette est exactement ce que
+	// l'issue #6 cherche à éliminer : on échoue au démarrage, franchement.
+	if cfg.HealthAddr != "" {
+		if _, _, err := net.SplitHostPort(cfg.HealthAddr); err != nil {
+			return nil, fmt.Errorf("HEALTH_ADDR invalide (attendu « hôte:port », par exemple %q ; vide pour désactiver le serveur de santé): %w", defaultHealthAddr, err)
+		}
 	}
 
 	if cfg.DatabaseURL == "" {

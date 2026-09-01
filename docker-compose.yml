@@ -37,7 +37,11 @@ services:
       OWNER_TELEGRAM_USER_ID: ${OWNER_TELEGRAM_USER_ID}
       # Probes /livez, /readyz et /metrics. Pas de "ports" ici non plus : le
       # port reste interne au réseau Docker, comme Postgres.
-      HEALTH_ADDR: ":9090"
+      # Forme ${VAR-défaut} et non ${VAR:-défaut} : une HEALTH_ADDR posée à
+      # vide dans .env doit garder son sens (« serveur désactivé »), pas
+      # retomber sur le défaut. Le healthcheck ci-dessous suppose le port
+      # 9090 : le changer ici impose de le changer là aussi.
+      HEALTH_ADDR: ${HEALTH_ADDR-:9090}
     volumes:
       - ./media:/app/media
     # Conteneur durci : utilisateur non-root fixe, système de fichiers en

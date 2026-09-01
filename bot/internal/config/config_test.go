@@ -48,6 +48,35 @@ func TestLoadHealthAddr(t *testing.T) {
 	}
 }
 
+// Une adresse mal formée doit tomber au démarrage : sinon le bot tourne
+// normalement, net.Listen échoue dans sa goroutine et la supervision est
+// perdue en silence, sur un seul log.
+func TestLoadRejectsMalformedHealthAddr(t *testing.T) {
+	for _, addr := range []string{"9090", "127.0.0.1", ":"} {
+		t.Run(addr, func(t *testing.T) {
+			validEnv(t)
+			t.Setenv("HEALTH_ADDR", addr)
+
+			cfg, err := Load()
+			if addr == ":" {
+				// « :port » vide reste un port valide au sens de
+				// SplitHostPort (écoute sur un port libre) : on n'invente
+				// pas une règle plus stricte que net.Listen.
+				if err != nil {
+					t.Fatalf("HEALTH_ADDR=%q rejetée à tort: %v", addr, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("HEALTH_ADDR=%q acceptée, attendu une erreur (HealthAddr=%q)", addr, cfg.HealthAddr)
+			}
+			if !strings.Contains(err.Error(), "HEALTH_ADDR") {
+				t.Fatalf("erreur peu explicite: %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsIdenticalDatabaseURLs(t *testing.T) {
 	validEnv(t)
 	t.Setenv("MIGRATION_DATABASE_URL", "postgres://undelete_app:app@postgres/undelete")

@@ -60,13 +60,21 @@ dst_container="undelete-restore-dst-$suffix"
 src_db="undelete_restore_src"
 dst_db="undelete_restore_dst"
 admin_password="restore-test-throwaway"
-app_password="restore-test-throwaway-app"
 
 workdir=$(mktemp -d)
-# L'archive est écrite depuis le conteneur (uid postgres) dans ce répertoire
-# temporaire monté : il doit être inscriptible par cet uid. Répertoire créé à
-# l'instant par mktemp et supprimé par le trap, jamais un chemin du dépôt.
-chmod 0777 "$workdir"
+# Le conteneur écrit son archive dans ce répertoire monté, sous un uid qui
+# n'est pas celui de l'hôte : il faut donc lui ouvrir un chemin d'écriture.
+# On ne l'ouvre PAS sur tout $workdir. Celui-ci contient le SQL rejoué
+# ensuite (migration.sql, restore.sql) : un 0777 y laisserait n'importe quel
+# utilisateur local du même hôte substituer ce SQL entre sa production et son
+# rejeu, et le test rendrait alors son verdict sur autre chose que l'archive.
+#   0711 sur $workdir      -> traversée seule : ni listage ni création par un tiers
+#   0777 sur $workdir/backups -> le seul point d'écriture dont le conteneur a besoin
+# Répertoire créé à l'instant par mktemp et supprimé par le trap, jamais un
+# chemin du dépôt.
+chmod 0711 "$workdir"
+mkdir -p "$workdir/backups"
+chmod 0777 "$workdir/backups"
 
 cleanup() {
     docker rm -f "$src_container" >/dev/null 2>&1 || true
@@ -93,14 +101,16 @@ expect_eq() {
 
 # --- Démarrage d'un PostgreSQL 16 jetable ------------------------------------
 # `--rm` + aucun `--volume` nommé : les données vivent dans la couche
-# éphémère du conteneur et disparaissent avec lui. `--publish 127.0.0.1::5432`
-# laisse Docker choisir un port libre, donc aucun conflit avec la stack locale.
+# éphémère du conteneur et disparaissent avec lui. Aucun `--publish` non plus :
+# tous les accès (psql, pg_isready, backup.sh) passent par `docker exec` vers
+# 127.0.0.1 À L'INTÉRIEUR du conteneur, donc publier un port n'apporterait
+# rien et exposerait sur l'hôte un superuser dont le mot de passe est un
+# littéral de ce script.
 start_pg() {
     name="$1"
     dbname="$2"
     docker run --detach --rm \
         --name "$name" \
-        --publish 127.0.0.1::5432 \
         --env POSTGRES_USER=postgres \
         --env POSTGRES_PASSWORD="$admin_password" \
         --env POSTGRES_DB="$dbname" \
@@ -148,14 +158,16 @@ start_pg "$src_container" "$src_db"
 # Les migrations 0002 et 0003 posent des GRANT explicites sur le rôle
 # applicatif : il doit exister avant de les rejouer. db/init n'est pas utilisé
 # ici (ce test ne valide pas le provisioning, seulement la sauvegarde), donc le
-# rôle est créé au minimum syndical. NOLOGIN suffit : personne ne s'y connecte
-# pendant ce test. Les rôles ne sont pas dans un pg_dump de base (ce sont des
-# objets globaux), la CIBLE doit donc le créer elle aussi avant restauration.
+# rôle est créé au minimum syndical. NOLOGIN et SANS mot de passe : personne
+# ne s'y connecte pendant ce test, un mot de passe n'aurait donc rien à
+# protéger et devrait être concaténé dans ce SQL. Les rôles ne sont pas dans un
+# pg_dump de base (ce sont des objets globaux), la CIBLE doit donc le créer
+# elle aussi avant restauration.
 create_app_role() {
     psql_in "$1" "$2" -q -c \
         "DO \$\$ BEGIN
              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'undelete_app') THEN
-                 CREATE ROLE undelete_app NOLOGIN PASSWORD '$app_password';
+                 CREATE ROLE undelete_app NOLOGIN;
              END IF;
          END \$\$;"
 }
@@ -175,15 +187,44 @@ psql_in "$src_container" "$src_db" -q -c \
          applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
      )"
 
+# Comme le runner Go, on valide TOUTES les versions avant d'exécuter le moindre
+# DDL : entier strictement positif, et pas de doublon. Sans cette passe
+# préalable, deux fichiers de version équivalente ("10_x.sql" et "0010_y.sql")
+# passeraient ici pour échouer à mi-parcours sur la clé primaire de
+# schema_migrations, là où le binaire refuse net de démarrer.
+parse_version() {
+    # "0001_init.sql" -> 1, comme parseVersion() côté Go.
+    case "$1" in
+        *_*) ;;
+        *) return 1 ;;
+    esac
+    prefix="${1%%_*}"
+    case "$prefix" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    # Décapage des zéros de tête par sed, PAS par $((10#$prefix)) : la notation
+    # base#nombre est un bashism que dash refuse, et $((0010)) seul serait lu
+    # en octal. "0000" -> "" -> rejeté par le test > 0 côté appelant.
+    printf '%s' "$prefix" | sed 's/^0*//'
+}
+
 expected_versions=""
 for file in "$MIGRATIONS_DIR"/*.sql; do
     base=$(basename "$file")
-    # "0001_init.sql" -> 1, comme parseVersion() côté Go.
-    version=$(printf '%s' "${base%%_*}" | sed 's/^0*//')
-    if [ -z "$version" ]; then
-        echo "restore-test: nom de migration invalide: $base" >&2
+    # `|| true` : parse_version signale un nom invalide par un statut non nul et
+    # une sortie vide, que le test -z ci-dessous rattrape. Sans lui, set -e
+    # ferait sortir sur l'affectation avant le message d'erreur explicite.
+    version=$(parse_version "$base" || true)
+    if [ -z "$version" ] || [ "$version" -le 0 ]; then
+        echo "restore-test: nom de migration invalide: $base (format attendu <version>_<nom>.sql, version > 0)" >&2
         exit 1
     fi
+    for seen in $expected_versions; do
+        if [ "$seen" = "$version" ]; then
+            echo "restore-test: version de migration $version dupliquée (dernier fichier: $base)" >&2
+            exit 1
+        fi
+    done
     expected_versions="${expected_versions}${version}
 "
     # Migration + enregistrement de sa version dans la même transaction :
@@ -276,9 +317,19 @@ start_pg "$dst_container" "$dst_db"
 create_app_role "$dst_container" "$dst_db"
 
 # Preuve que la cible est bien vierge avant restauration : aucune table.
+# Verdict BLOQUANT et non simple compteur d'échec : « cible distincte et
+# vierge » est la garantie centrale de cette recette. Si elle ne tient pas, on
+# s'arrête AVANT de restaurer, plutôt que d'écrire par-dessus un contenu
+# existant puis de le signaler après coup.
 dst_tables_before=$(query "$dst_container" "$dst_db" \
     "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'")
-expect_eq "cible vierge avant restauration (tables publiques)" "0" "$dst_tables_before"
+if [ "$dst_tables_before" = "0" ]; then
+    ok "cible vierge avant restauration (tables publiques) : 0"
+else
+    echo "restore-test: la base CIBLE n'est pas vierge ($dst_tables_before table(s) publique(s))." >&2
+    echo "restore-test: restauration ABANDONNÉE, aucune donnée écrasée." >&2
+    exit 1
+fi
 
 echo "restore-test: restauration (gunzip puis psql)"
 restore_started=$(date -u +%s)
@@ -332,9 +383,12 @@ expect_eq "payload outbox restauré" "RESTORE-TEST payload canari" \
 
 # La RLS FORCE est une propriété du schéma : si le dump la perdait, la base
 # restaurée serait ouverte à tous les tenants sans que les comptages bougent.
+# Le filtre sur relnamespace est nécessaire : pg_class couvre TOUS les schémas,
+# donc un homonyme ailleurs fausserait le compte dans un sens comme dans l'autre.
 rls_forced=$(query "$dst_container" "$dst_db" \
     "SELECT count(*) FROM pg_class
-     WHERE relname IN ('messages', 'notification_outbox', 'chats')
+     WHERE relnamespace = 'public'::regnamespace
+       AND relname IN ('messages', 'notification_outbox', 'chats')
        AND relrowsecurity AND relforcerowsecurity")
 expect_eq "FORCE ROW LEVEL SECURITY restauré (3 tables)" "3" "$rls_forced"
 

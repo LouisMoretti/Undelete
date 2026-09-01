@@ -81,9 +81,18 @@ depuis le conteneur Postgres, qui embarque `psql` :
 
 ```bash
 docker compose exec -T postgres \
-  psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAX \
-  -c "SELECT rolname, rolsuper, rolbypassrls FROM pg_roles WHERE rolname IN ('undelete_app', current_user)"
+  sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAX -f -' <<'SQL'
+SELECT rolname, rolsuper, rolbypassrls FROM pg_roles
+ WHERE rolname IN ('undelete_app', current_user);
+SQL
 ```
+
+> **`$POSTGRES_USER` et `$POSTGRES_DB` sont résolus dans le conteneur**, d'où
+> le `sh -c '…'` en quotes simples. Côté VM ces variables ne sont pas
+> définies : `docker compose` lit `.env` pour lui-même et n'exporte rien dans
+> le shell de l'opérateur. Une commande qui les laisse s'expanser sur l'hôte
+> se réduit à `psql -U "" -d ""` et échoue à la connexion. Même remarque pour
+> tous les blocs `psql` de ce runbook.
 
 Attendu : `undelete_app|f|f`. Si `undelete_app` est absent, c'est que
 `db/init/01-app-role.sh` n'a pas tourné — il ne s'exécute qu'au **premier**
@@ -231,49 +240,59 @@ jamais de contenu de message : identifiants, types et compteurs uniquement.
 **c. Test synthétique bout-en-bout** — le seul contrôle qui prouve que la
 chaîne complète fonctionne :
 
-1. Depuis un second compte Telegram, envoyer un message dans une conversation
-   privée couverte par la connexion Business.
-2. Vérifier son enregistrement (compteur, sans lire le contenu).
+Les blocs `psql` ci-dessous sont volontairement à la marge : le délimiteur de
+`heredoc` doit rester en colonne 0 pour être copiable tel quel.
 
-   > **Piège RLS.** `messages`, `notification_outbox` et `chats` sont en
-   > `FORCE ROW LEVEL SECURITY` : la policy s'applique **aussi au rôle
-   > propriétaire**. Un `SELECT count(*) FROM messages` sans contexte posé
-   > renvoie `0` **sans erreur** — un zéro qui ne veut rien dire. Il faut
-   > poser `app.current_owner_user_id` dans la même transaction, avec
-   > `users.id` (clé de substitution) et **non** le `telegram_user_id` :
-   > `owner_user_id` référence `users(id)`.
+**1.** Depuis un second compte Telegram, envoyer un message dans une
+conversation privée couverte par la connexion Business.
 
-   ```bash
-   docker compose exec -T postgres \
-     psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAX -c "
-       SELECT set_config('app.current_owner_user_id',
-                         (SELECT id::text FROM users
-                          WHERE telegram_user_id = ${OWNER_TELEGRAM_USER_ID}), true);
-       SELECT count(*) FROM messages WHERE saved_at > now() - interval '5 minutes';
-     "
-   ```
+**2.** Vérifier son enregistrement (compteur, sans lire le contenu). Remplacer
+`<owner_id>` par la valeur de `OWNER_TELEGRAM_USER_ID` de `.env` — elle
+n'existe pas dans le shell de la VM (§1.1).
 
-   Les deux instructions doivent rester dans **un seul** `-c` : `set_config`
-   est posé en `LOCAL` (3ᵉ argument `true`) et ne survit pas à la transaction.
-   Un `set_config` renvoyant une ligne vide signifie que l'utilisateur n'existe
-   pas encore en base — c'est alors ça, le vrai résultat du test.
-3. Supprimer ce message depuis le second compte.
-4. **Attendre l'alerte du bot sur le compte titulaire** (quelques secondes :
-   le worker d'outbox tourne à la seconde). L'alerte doit porter le chat,
-   l'expéditeur, le type, la date UTC et le contenu restitué.
-5. Vérifier qu'aucun job d'outbox ne reste bloqué (même contexte RLS que
-   ci-dessus, `notification_outbox` est également en `FORCE RLS`) :
-   ```bash
-   docker compose exec -T postgres \
-     psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAX -c "
-       SELECT set_config('app.current_owner_user_id',
-                         (SELECT id::text FROM users
-                          WHERE telegram_user_id = ${OWNER_TELEGRAM_USER_ID}), true);
-       SELECT status, count(*) FROM notification_outbox GROUP BY status;
-     "
-   ```
-   `sent` attendu ; des `failed` ou des `processing` qui persistent signalent
-   un problème d'envoi côté Telegram.
+> **Contexte de tenant.** `messages`, `notification_outbox` et `chats` sont en
+> `FORCE ROW LEVEL SECURITY`. Poser `app.current_owner_user_id` dans la même
+> transaction avec `users.id` (clé de substitution) et **non** le
+> `telegram_user_id` : `owner_user_id` référence `users(id)`.
+
+```bash
+docker compose exec -T postgres \
+  sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAX --single-transaction -f -' <<'SQL'
+SELECT set_config('app.current_owner_user_id',
+                  (SELECT id::text FROM users
+                   WHERE telegram_user_id = <owner_id>), true);
+SELECT count(*) FROM messages WHERE saved_at > now() - interval '5 minutes';
+SQL
+```
+
+`--single-transaction` n'est pas décoratif : `set_config` est posé en `LOCAL`
+(3ᵉ argument `true`) et ne survit pas à la transaction. Sans lui, `psql -f`
+exécute chaque instruction dans sa propre transaction et le contexte est
+perdu avant le `count(*)`. Un `set_config` renvoyant une ligne vide signifie
+que l'utilisateur n'existe pas encore en base — c'est alors ça, le vrai
+résultat du test.
+
+**3.** Supprimer ce message depuis le second compte.
+
+**4.** **Attendre l'alerte du bot sur le compte titulaire** (quelques
+secondes : le worker d'outbox tourne à la seconde). L'alerte doit porter le
+chat, l'expéditeur, le type, la date UTC et le contenu restitué.
+
+**5.** Vérifier qu'aucun job d'outbox ne reste bloqué (même contexte que
+ci-dessus, `notification_outbox` est également en `FORCE RLS`) :
+
+```bash
+docker compose exec -T postgres \
+  sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAX --single-transaction -f -' <<'SQL'
+SELECT set_config('app.current_owner_user_id',
+                  (SELECT id::text FROM users
+                   WHERE telegram_user_id = <owner_id>), true);
+SELECT status, count(*) FROM notification_outbox GROUP BY status;
+SQL
+```
+
+`sent` attendu ; des `failed` ou des `processing` qui persistent signalent
+un problème d'envoi côté Telegram.
 
 Une alerte reçue **deux fois** n'est pas un bug : la livraison est
 at-least-once par conception (cf. README).
@@ -382,9 +401,12 @@ aligne le DSN.
 #    Saisir le nouveau mot de passe via \password : il n'apparaît ni dans
 #    l'historique shell ni dans les logs Postgres (contrairement à un
 #    ALTER ROLE ... PASSWORD '...' en clair).
-docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-  -c "\password undelete_app"
+docker compose exec postgres \
+  sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "\password undelete_app"'
 ```
+
+Pas de `-T` ici : `\password` est une méta-commande `psql` qui demande la
+saisie, elle a besoin d'un TTY.
 
 2. Mettre à jour `.env` : `APP_DB_PASSWORD` **et** le mot de passe embarqué
    dans `DATABASE_URL` (les deux, sinon le bot ne se connecte plus).
@@ -402,8 +424,9 @@ rotation est purement un `ALTER ROLE`, pas une réinitialisation.
 Même logique, un cran plus délicat : ce rôle joue les migrations et les
 backups.
 
-1. `docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"
-   -c "\password $POSTGRES_USER"`.
+1. `docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d
+   "$POSTGRES_DB" -c "\password $POSTGRES_USER"'` (sans `-T`, `\password`
+   demande la saisie).
 2. Mettre à jour `.env` : `POSTGRES_PASSWORD` **et** le mot de passe dans
    `MIGRATION_DATABASE_URL`.
 3. `docker compose up -d bot backup` (le service `backup` utilise aussi

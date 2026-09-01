@@ -87,6 +87,27 @@ message ou jeton ne peut se retrouver dans un scrape. Les réponses `/readyz`
 suivent la même règle : les checks dégradés sont décrits par des raisons
 courtes et fixes (`unreachable`, `stale`, `no_successful_poll_yet`), jamais
 par le message d'erreur PostgreSQL, qui contiendrait le DSN.
+## Exploitation
+
+Le déploiement homelab est entièrement manuel : **[`docs/runbook.md`](docs/runbook.md)**
+est la procédure de référence (préflight, ordre backup → migration → rollout →
+vérifications, rollback, rotation des secrets, recette staging), et la liste
+fermée des actions destructives interdites sans confirmation explicite.
+
+Avant tout déploiement :
+
+```bash
+sh scripts/preflight.sh
+```
+
+Contrôle en lecture seule des variables requises, des permissions de `.env`,
+de l'espace disque, de la distinction des deux DSN, des rôles PostgreSQL
+(`undelete_app` sans privilège de contournement RLS) et de la validité du
+jeton Telegram via `getMe` — jeton jamais affiché. Sortie en code 1 si un
+point échoue.
+
+La procédure de restauration d'un dump est documentée à part dans
+`docs/backup-restore.md` (livré par la PR #40, couche du dessous dans la stack — existe dès que la stack est mergée).
 
 ## Tests d’intégration PostgreSQL 16
 

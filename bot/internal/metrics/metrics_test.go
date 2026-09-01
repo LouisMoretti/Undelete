@@ -12,6 +12,7 @@ var expectedSeries = []string{
 	"undelete_updates_total",
 	"undelete_update_errors_total",
 	"undelete_outbox_retries_total",
+	"undelete_outbox_failed_total",
 	"undelete_deletions_total",
 	"undelete_outbox_backlog",
 }
@@ -21,6 +22,7 @@ func TestRenderPrometheusExposeLesSeriesAttendues(t *testing.T) {
 	c.AddUpdates(3)
 	c.AddUpdateErrors(1)
 	c.AddOutboxRetries(2)
+	c.AddOutboxFailed(6)
 	c.AddDeletions(7)
 	c.SetOutboxBacklog(4)
 
@@ -30,6 +32,7 @@ func TestRenderPrometheusExposeLesSeriesAttendues(t *testing.T) {
 		"undelete_updates_total 3",
 		"undelete_update_errors_total 1",
 		"undelete_outbox_retries_total 2",
+		"undelete_outbox_failed_total 6",
 		"undelete_deletions_total 7",
 		"undelete_outbox_backlog 4",
 	} {

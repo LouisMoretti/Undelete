@@ -73,8 +73,13 @@ externe ferait redémarrer en boucle un bot par ailleurs sain.
 
 Métriques exposées (compteurs, sauf la dernière qui est une jauge) :
 `undelete_updates_total`, `undelete_update_errors_total`,
-`undelete_outbox_retries_total`, `undelete_deletions_total`,
-`undelete_outbox_backlog`.
+`undelete_outbox_retries_total`, `undelete_outbox_failed_total`,
+`undelete_deletions_total`, `undelete_outbox_backlog`.
+
+`undelete_outbox_failed_total` compte les alertes abandonnées définitivement
+(4xx non rejouable, ou tentatives épuisées). Elles quittent
+`undelete_outbox_backlog`, qui ne compte que `pending`/`processing` : sans ce
+compteur, une vague d'échecs se lirait comme une simple décrue du backlog.
 
 Aucune série n'a de label, et la liste des noms est écrite en dur : la
 cardinalité est bornée par construction et aucun identifiant, nom, texte de

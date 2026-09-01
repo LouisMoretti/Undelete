@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/LouisMoretti/Undelete/bot/internal/metrics"
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
 )
 
@@ -167,6 +169,74 @@ func TestWorkerPermanent4xxMarksFailed(t *testing.T) {
 	}
 	if !store.failed || !store.retryAt.IsZero() {
 		t.Fatalf("failed=%t retryAt=%v", store.failed, store.retryAt)
+	}
+}
+
+// outboxFailedCount lit la série exposée plutôt qu'un champ interne : c'est
+// la valeur que verra réellement un scrape.
+func outboxFailedCount(t *testing.T) int64 {
+	t.Helper()
+	const name = "undelete_outbox_failed_total"
+	for _, line := range strings.Split(metrics.Default().RenderPrometheus(), "\n") {
+		value, found := strings.CutPrefix(line, name+" ")
+		if !found {
+			continue
+		}
+		n, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			t.Fatalf("valeur illisible pour %s: %q", name, value)
+		}
+		return n
+	}
+	t.Fatalf("série %s absente de l'exposition", name)
+	return 0
+}
+
+// Une alerte abandonnée quitte le backlog sans avoir été livrée : sans ce
+// compteur, les deux chemins MarkFailed ne laisseraient aucune trace
+// métrique et l'échec ne serait visible que dans les logs.
+func TestWorkerComptabiliseLesAlertesAbandonnees(t *testing.T) {
+	cases := map[string]*fakeSender{
+		"4xx définitif":       {err: &telegram.APIError{Method: "sendMessage", Code: 400}},
+		"tentatives épuisées": {err: &telegram.APIError{Method: "sendMessage", Code: 500}},
+	}
+
+	for name, sender := range cases {
+		t.Run(name, func(t *testing.T) {
+			// attempts sur le store : c'est Claim qui date la tentative.
+			store := &fakeStore{job: testJob(), attempts: maxDeliveryAttempts - 1}
+			worker := newTestWorker(store, sender, &bytes.Buffer{})
+
+			before := outboxFailedCount(t)
+			if _, err := worker.ProcessOne(context.Background(), 11); err != nil {
+				t.Fatal(err)
+			}
+			if !store.failed {
+				t.Fatal("le job devait être marqué failed")
+			}
+			if got := outboxFailedCount(t) - before; got != 1 {
+				t.Fatalf("undelete_outbox_failed_total a progressé de %d, attendu 1", got)
+			}
+		})
+	}
+}
+
+// Un retry n'est PAS un abandon : le compteur ne doit pas bouger tant que le
+// job reste rejouable, sinon la métrique perdrait tout pouvoir d'alerte.
+func TestWorkerNeComptePasUnRetryCommeAbandon(t *testing.T) {
+	store := &fakeStore{job: testJob()}
+	sender := &fakeSender{err: &telegram.APIError{Method: "sendMessage", Code: 500}}
+	worker := newTestWorker(store, sender, &bytes.Buffer{})
+
+	before := outboxFailedCount(t)
+	if _, err := worker.ProcessOne(context.Background(), 11); err != nil {
+		t.Fatal(err)
+	}
+	if store.failed {
+		t.Fatal("un 500 sur une première tentative doit être replanifié, pas abandonné")
+	}
+	if got := outboxFailedCount(t); got != before {
+		t.Fatalf("undelete_outbox_failed_total = %d, attendu inchangé (%d)", got, before)
 	}
 }
 

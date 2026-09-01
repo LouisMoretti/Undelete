@@ -116,6 +116,7 @@ func (w *Worker) ProcessOne(ctx context.Context, ownerUserID int64) (bool, error
 			if markErr := w.store.MarkFailed(ctx, ownerUserID, job.ID, job.LeaseToken, code); markErr != nil {
 				return true, fmt.Errorf("échec définitif outbox: %w", markErr)
 			}
+			metrics.AddOutboxFailed(1)
 			w.logger.Warn("alerte outbox en échec définitif", slog.Int64("outbox_id", job.ID), slog.String("error_class", code))
 			return true, nil
 		}
@@ -124,6 +125,7 @@ func (w *Worker) ProcessOne(ctx context.Context, ownerUserID int64) (bool, error
 		if markErr := w.store.MarkFailed(ctx, ownerUserID, job.ID, job.LeaseToken, code); markErr != nil {
 			return true, fmt.Errorf("épuisement des tentatives outbox: %w", markErr)
 		}
+		metrics.AddOutboxFailed(1)
 		w.logger.Warn("alerte outbox en échec après épuisement des tentatives", slog.Int64("outbox_id", job.ID), slog.String("error_class", code), slog.Int("attempt", job.Attempts+1))
 		return true, nil
 	}

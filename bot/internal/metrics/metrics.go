@@ -26,6 +26,7 @@ type Counters struct {
 	updates       atomic.Int64
 	updateErrors  atomic.Int64
 	outboxRetries atomic.Int64
+	outboxFailed  atomic.Int64
 	deletions     atomic.Int64
 	outboxBacklog atomic.Int64
 }
@@ -43,6 +44,12 @@ func (c *Counters) AddUpdateErrors(n int64)  { c.updateErrors.Add(n) }
 func (c *Counters) AddOutboxRetries(n int64) { c.outboxRetries.Add(n) }
 func (c *Counters) AddDeletions(n int64)     { c.deletions.Add(n) }
 
+// AddOutboxFailed compte les alertes ABANDONNÉES définitivement. Sans cette
+// série, une alerte en échec définitif ne laisse aucune trace métrique : elle
+// quitte undelete_outbox_backlog (qui ne compte que pending/processing) sans
+// être livrée, et un pic de 4xx se lirait comme une simple décrue du backlog.
+func (c *Counters) AddOutboxFailed(n int64) { c.outboxFailed.Add(n) }
+
 // SetOutboxBacklog publie le nombre de lignes d'outbox restant à livrer.
 // C'est une jauge : elle monte et descend, contrairement aux compteurs.
 func (c *Counters) SetOutboxBacklog(n int64) { c.outboxBacklog.Store(n) }
@@ -51,6 +58,7 @@ func (c *Counters) SetOutboxBacklog(n int64) { c.outboxBacklog.Store(n) }
 func AddUpdates(n int64)       { std.AddUpdates(n) }
 func AddUpdateErrors(n int64)  { std.AddUpdateErrors(n) }
 func AddOutboxRetries(n int64) { std.AddOutboxRetries(n) }
+func AddOutboxFailed(n int64)  { std.AddOutboxFailed(n) }
 func AddDeletions(n int64)     { std.AddDeletions(n) }
 func SetOutboxBacklog(n int64) { std.SetOutboxBacklog(n) }
 
@@ -85,6 +93,12 @@ var allSeries = []series{
 		help:  "Nombre total de replanifications d'alertes de l'outbox.",
 		kind:  "counter",
 		value: func(c *Counters) int64 { return c.outboxRetries.Load() },
+	},
+	{
+		name:  "undelete_outbox_failed_total",
+		help:  "Nombre total d'alertes de l'outbox abandonnées définitivement (jamais livrées).",
+		kind:  "counter",
+		value: func(c *Counters) int64 { return c.outboxFailed.Load() },
 	},
 	{
 		name:  "undelete_deletions_total",

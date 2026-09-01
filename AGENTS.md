@@ -8,7 +8,8 @@
 | Verify a backup is restorable (Docker) | `make test-restore` |
 | Start dev stack | `docker compose up --build -d` |
 | View bot logs | `docker compose logs -f bot` |
-| Stop stack | `docker compose down` |
+| Stop stack | `docker compose down` (never `-v` — deletes the DB volume) |
+| Preflight before deploy | `sh scripts/preflight.sh` |
 
 ## Project Structure
 - `bot/` — Go 1.23 module (`github.com/LouisMoretti/Undelete/bot`)
@@ -24,6 +25,11 @@
 4. **`InTenant` is the ONLY path to `messages`/`notification_outbox`**: sets `app.current_owner_user_id` LOCAL per transaction. `PurgeExpired` loops tenant-by-tenant.
 5. **FORCE ROW LEVEL SECURITY** on `messages`. `ENABLE` alone doesn't apply to table owner.
 6. **Alerts sent WITHOUT `business_connection_id`**: that field would send as the owner into the monitored chat.
+
+## Operations
+- `docs/runbook.md` is the reference procedure: preflight → backup → migration → rollout → verification, plus rollback, secret rotation and staging recipe. Follow its order.
+- **Destructive actions are a closed list** (`docker compose down -v`, `docker volume rm/prune`, `docker system prune`, `DROP DATABASE`/`TRUNCATE`, restoring a dump over prod, deleting `./backups`). None is ever required to deploy or roll back. **Never run or suggest one without Louis's explicit confirmation** — see the boxed section at the top of `docs/runbook.md`.
+- Rolling back the DB is the last resort: migrations are additive, so an older bot runs fine on a newer schema. Restoring loses every message captured since the dump.
 
 ## Testing
 - Unit tests: `cd bot && go test ./...` (no special tags)

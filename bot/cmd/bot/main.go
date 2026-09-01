@@ -13,7 +13,9 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/app"
 	"github.com/LouisMoretti/Undelete/bot/internal/business"
 	"github.com/LouisMoretti/Undelete/bot/internal/config"
+	"github.com/LouisMoretti/Undelete/bot/internal/health"
 	"github.com/LouisMoretti/Undelete/bot/internal/messages"
+	"github.com/LouisMoretti/Undelete/bot/internal/metrics"
 	"github.com/LouisMoretti/Undelete/bot/internal/outbox"
 	"github.com/LouisMoretti/Undelete/bot/internal/storage"
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
@@ -29,6 +31,12 @@ const httpClientTimeout = 60 * time.Second
 // quotidienne suffit largement (retention_days minimum = 1 jour).
 const retentionInterval = 24 * time.Hour
 const outboxInterval = time.Second
+
+// backlogInterval fixe le rafraîchissement de la jauge de backlog outbox.
+// Volontairement bien plus lent que outboxInterval : la jauge sert à repérer
+// une livraison qui décroche, pas à suivre chaque job à la seconde, et un
+// COUNT(*) par tenant chaque seconde coûterait plus cher que le travail utile.
+const backlogInterval = 15 * time.Second
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -68,8 +76,10 @@ func run(logger *slog.Logger) error {
 	businessSvc := business.NewService(db.Pool, client, usersRepo, cfg.OwnerTelegramUserID, logger)
 	handler := app.NewHandler(businessSvc, messagesRepo, logger)
 
+	poller := telegram.NewPoller(client, logger)
+
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(4)
 	go func() {
 		defer wg.Done()
 		runRetentionLoop(ctx, usersRepo, messagesRepo, outboxRepo, logger)
@@ -78,8 +88,21 @@ func run(logger *slog.Logger) error {
 		defer wg.Done()
 		runOutboxLoop(ctx, usersRepo, outbox.NewWorker(outboxRepo, client, logger), logger)
 	}()
+	go func() {
+		defer wg.Done()
+		runBacklogLoop(ctx, usersRepo, outboxRepo, logger)
+	}()
+	go func() {
+		defer wg.Done()
+		// Readiness = base joignable ET poller frais. Le serveur ne reçoit
+		// que le pool et le poller : ni le jeton, ni la config, rien qui
+		// puisse se retrouver dans une réponse HTTP.
+		healthHandler := health.NewHandler(db.Pool, poller, metrics.Default(), nil)
+		if err := health.Serve(ctx, cfg.HealthAddr, healthHandler, logger); err != nil {
+			logger.Error("serveur de santé arrêté sur erreur", slog.String("error", err.Error()))
+		}
+	}()
 
-	poller := telegram.NewPoller(client, logger)
 	logger.Info("démarrage du poller", slog.Any("allowed_updates", telegram.AllowedUpdates))
 
 	err = poller.Run(ctx, handler.HandleUpdate)
@@ -117,6 +140,35 @@ func runOutboxLoop(ctx context.Context, usersRepo *users.Repository, worker *out
 					}
 				}
 			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// runBacklogLoop rafraîchit la jauge undelete_outbox_backlog. Boucle séparée
+// de l'outbox : un COUNT(*) lent ou en erreur ne doit pas ralentir la
+// livraison des alertes, et une jauge périmée est moins grave qu'une alerte
+// en retard.
+func runBacklogLoop(ctx context.Context, usersRepo *users.Repository, outboxRepo *outbox.Repository, logger *slog.Logger) {
+	ticker := time.NewTicker(backlogInterval)
+	defer ticker.Stop()
+
+	for {
+		tenants, err := usersRepo.ListTenantsForRetention(ctx)
+		if err == nil {
+			var backlog int64
+			backlog, err = outboxRepo.CountBacklog(ctx, tenants)
+			if err == nil {
+				metrics.SetOutboxBacklog(backlog)
+			}
+		}
+		if err != nil && ctx.Err() == nil {
+			logger.Error("backlog outbox: échec du comptage", slog.String("error", err.Error()))
 		}
 
 		select {

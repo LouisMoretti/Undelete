@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/LouisMoretti/Undelete/bot/internal/metrics"
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
 )
 
@@ -134,6 +135,7 @@ func (w *Worker) ProcessOne(ctx context.Context, ownerUserID int64) (bool, error
 	if markErr := w.store.MarkRetry(ctx, ownerUserID, job.ID, job.LeaseToken, wait, code); markErr != nil {
 		return true, fmt.Errorf("planification retry outbox: %w", markErr)
 	}
+	metrics.AddOutboxRetries(1)
 	w.logger.Warn("alerte outbox replanifiée", slog.Int64("outbox_id", job.ID), slog.String("error_class", code), slog.Duration("retry_in", wait))
 	return true, nil
 }

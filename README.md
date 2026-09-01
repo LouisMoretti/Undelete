@@ -55,6 +55,34 @@ Au boot, le binaire applique les migrations avec le DSN propriétaire
 restreint (`DATABASE_URL`, rôle `undelete_app`), avant de démarrer le
 long-polling.
 
+## Supervision (probes et métriques)
+
+Le bot ouvre un serveur HTTP dédié sur `HEALTH_ADDR` (défaut `:9090`, valeur
+vide = serveur désactivé). Ce port reste interne au réseau Docker : il n'est
+pas publié sur l'hôte, comme Postgres.
+
+| Route | Réponse |
+| --- | --- |
+| `GET /livez` | `200 {"status":"ok"}` dès que le processus sert du HTTP, sans dépendance externe. |
+| `GET /readyz` | `200` si la base répond (ping, 2 s) **et** si le dernier `getUpdates` réussi date de moins de 90 s ; sinon `503 {"status":"degraded","checks":{...}}`. |
+| `GET /metrics` | Exposition texte Prometheus. |
+
+Le healthcheck Compose du service `bot` interroge `/livez` et non `/readyz` :
+la liveness ne doit dépendre ni de Postgres ni de Telegram, sinon un incident
+externe ferait redémarrer en boucle un bot par ailleurs sain.
+
+Métriques exposées (compteurs, sauf la dernière qui est une jauge) :
+`undelete_updates_total`, `undelete_update_errors_total`,
+`undelete_outbox_retries_total`, `undelete_deletions_total`,
+`undelete_outbox_backlog`.
+
+Aucune série n'a de label, et la liste des noms est écrite en dur : la
+cardinalité est bornée par construction et aucun identifiant, nom, texte de
+message ou jeton ne peut se retrouver dans un scrape. Les réponses `/readyz`
+suivent la même règle : les checks dégradés sont décrits par des raisons
+courtes et fixes (`unreachable`, `stale`, `no_successful_poll_yet`), jamais
+par le message d'erreur PostgreSQL, qui contiendrait le DSN.
+
 ## Tests d’intégration PostgreSQL 16
 
 La suite réelle (sans mocks) vérifie les migrations et leur réexécution, le

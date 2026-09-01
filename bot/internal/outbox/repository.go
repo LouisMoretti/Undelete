@@ -141,6 +141,40 @@ func (r *Repository) MarkFailed(ctx context.Context, ownerUserID, id int64, leas
 	})
 }
 
+// CountBacklog somme, tenant par tenant, les alertes restant à livrer
+// (status pending ou processing). C'est la source de la jauge
+// undelete_outbox_backlog : un compteur agrégé, sans aucune ventilation par
+// tenant, chat ou message -- exposer le backlog PAR tenant reviendrait à
+// publier l'activité de chaque titulaire sur /metrics.
+//
+// La boucle InTenant n'est pas un détail de style : notification_outbox est
+// en FORCE ROW LEVEL SECURITY et le rôle applicatif n'a pas BYPASSRLS. Un
+// unique `SELECT count(*) FROM notification_outbox` exécuté sur le pool
+// applicatif sans app.current_owner_user_id posé ne verrait AUCUNE ligne et
+// renverrait 0 en permanence, sans la moindre erreur -- exactement le genre
+// de métrique faussement rassurante que cette issue cherche à éviter. On
+// reprend donc le motif de PurgeExpired, avec le contexte tenant posé.
+func (r *Repository) CountBacklog(ctx context.Context, tenants []users.TenantRetention) (int64, error) {
+	var total int64
+	for _, tenant := range tenants {
+		err := r.db.InTenant(ctx, tenant.OwnerUserID, func(tx pgx.Tx) error {
+			var count int64
+			if err := tx.QueryRow(ctx, `
+				SELECT count(*) FROM notification_outbox
+				WHERE owner_user_id = $1 AND status IN ('pending', 'processing')
+			`, tenant.OwnerUserID).Scan(&count); err != nil {
+				return fmt.Errorf("comptage backlog outbox tenant %d: %w", tenant.OwnerUserID, err)
+			}
+			total += count
+			return nil
+		})
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
 func (r *Repository) PurgeExpired(ctx context.Context, tenants []users.TenantRetention) (int64, error) {
 	var total int64
 	for _, tenant := range tenants {

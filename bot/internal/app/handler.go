@@ -12,6 +12,7 @@ import (
 
 	"github.com/LouisMoretti/Undelete/bot/internal/business"
 	"github.com/LouisMoretti/Undelete/bot/internal/messages"
+	"github.com/LouisMoretti/Undelete/bot/internal/metrics"
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
 )
 
@@ -157,6 +158,10 @@ func (h *Handler) handleDeleted(ctx context.Context, del *telegram.BusinessMessa
 				slog.Int64("message_id", id))
 		}
 	}
+
+	// Compteur agrégé : le nombre de messages effectivement retrouvés et
+	// marqués supprimés. Aucun id ni texte ne sort d'ici (cf. metrics).
+	metrics.AddDeletions(int64(len(found)))
 
 	h.logger.Info("suppression traitée",
 		slog.String("business_connection_id", del.BusinessConnectionID),

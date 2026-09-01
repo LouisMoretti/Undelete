@@ -31,7 +31,7 @@ Toutes les commandes se lancent depuis la racine du dépôt sur la VM.
 > | `docker volume rm undelete_postgres_data` | idem, sans même arrêter proprement |
 > | `docker volume prune` / `docker system prune` | peut emporter `postgres_data` et d'autres volumes de la VM |
 > | `DROP DATABASE` / `DROP SCHEMA` / `TRUNCATE` | vide la base sous le bot en cours d'exécution |
-> | `psql < dump.sql` sur la base de production | écrase l'état courant (restauration : voir §4) |
+> | `psql < dump.sql` sur la base de production | écrase l'état courant (restauration : voir §3.3) |
 > | `rm -rf ./backups` (ou suppression de dumps hors purge de rétention) | supprime le seul filet de sécurité |
 >
 > **Règle d'exploitation** : arrêter la stack se fait avec `make down`
@@ -142,7 +142,7 @@ docker compose exec -T -e BACKUP_DIR=/backups backup sh /scripts/backup.sh
 > le rôle propriétaire ; c'est le seul moment où le schéma peut changer de
 > façon non réversible.
 
-Noter le nom du dump : c'est le point de retour de la §4.
+Noter le nom du dump : c'est le point de retour de la §3.3.
 
 ### Étape 2 — Migration
 
@@ -159,8 +159,9 @@ git diff --stat <commit_déployé>..HEAD -- bot/internal/storage/migrations/
 ```
 
 Une migration **destructive** (`DROP`, `ALTER ... DROP COLUMN`, `TRUNCATE`,
-changement de type avec perte) impose de relire la §4 *avant* le rollout : le
-rollback devient une restauration de dump, pas un simple retour d'image.
+changement de type avec perte) impose de relire les §3.2 et §3.3 *avant* le
+rollout : le rollback devient une restauration de dump, pas un simple retour
+d'image.
 
 Le contrôle d'application se fait après l'étape 3, dans les logs JSON :
 
@@ -366,7 +367,7 @@ et `docker volume rm/prune` restent interdits (§0).**
 4. Propager : `docker compose up -d bot` (recréation du conteneur — une simple
    `restart` ne relit pas `.env`).
 5. Vérifier `"msg":"démarrage du poller"` dans les logs, puis refaire le test
-   synthétique §2.4.c.
+   synthétique §2 étape 4 c.
 6. Vérifier que Business Mode est toujours actif et la connexion Business
    toujours en place côté compte titulaire (README, étapes 2 et 3).
 
@@ -389,7 +390,7 @@ docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
    dans `DATABASE_URL` (les deux, sinon le bot ne se connecte plus).
 3. `sh scripts/preflight.sh` (DSN toujours distincts, variables présentes).
 4. `docker compose up -d bot`, puis vérifier l'absence d'erreur de connexion
-   dans les logs et le test synthétique §2.4.c.
+   dans les logs et le test synthétique §2 étape 4 c.
 
 Le bot en cours d'exécution garde ses connexions ouvertes jusqu'à sa
 recréation : la fenêtre d'indisponibilité se limite au redémarrage.

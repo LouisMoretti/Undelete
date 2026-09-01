@@ -115,7 +115,7 @@ Le service `backup` du compose tourne en boucle (un dump immédiat puis toutes
 les 24 h). Avant un déploiement, on force un dump frais **maintenant** :
 
 ```bash
-docker compose exec -T backup sh /scripts/backup.sh
+docker compose exec -T -e BACKUP_DIR=/backups backup sh /scripts/backup.sh
 ls -lh backups/ | tail -3
 ```
 
@@ -123,11 +123,19 @@ Le script écrit `backups/undelete-<horodatage UTC>.sql.gz`, puis purge les
 archives de plus de `BACKUP_RETENTION_DAYS` jours (fichiers uniquement). Un
 `pg_dump` en échec ne laisse pas d'archive tronquée : le `trap` la supprime.
 
+> **`-e BACKUP_DIR=/backups` n'est pas optionnel.** La boucle du service pose
+> cette variable dans son propre `entrypoint` ; une session `exec` est un
+> processus neuf qui n'en hérite pas. Sans elle, `backup.sh` retombe sur son
+> défaut `./backups`, résolu depuis le `working_dir` du conteneur (`/backups`)
+> : le dump partirait dans `./backups/backups/` et la purge de rétention
+> s'appliquerait à ce sous-répertoire, laissant les vraies archives
+> s'accumuler.
+
 Si la stack est arrêtée, démarrer d'abord Postgres seul :
 
 ```bash
 docker compose up -d postgres
-docker compose exec -T backup sh /scripts/backup.sh
+docker compose exec -T -e BACKUP_DIR=/backups backup sh /scripts/backup.sh
 ```
 
 > **Ne pas déployer sans dump frais.** L'étape 2 applique des migrations avec
@@ -330,7 +338,7 @@ Ordre imposé, quel que soit le chemin :
 1. Arrêter le bot seul, laisser Postgres debout :
    `docker compose stop bot` (jamais `down -v`).
 2. Prendre un dump de l'état **actuel**, même dégradé
-   (`docker compose exec -T backup sh /scripts/backup.sh`) : il permet de
+   (`docker compose exec -T -e BACKUP_DIR=/backups backup sh /scripts/backup.sh`) : il permet de
    revenir en arrière si la restauration se passe mal.
 3. Restaurer le dump choisi dans une base **de vérification** d'abord, jamais
    directement en production (c'est ce qu'automatise `make test-restore`).
@@ -400,7 +408,7 @@ backups.
 3. `docker compose up -d bot backup` (le service `backup` utilise aussi
    `MIGRATION_DATABASE_URL` : oublier de le recréer casserait silencieusement
    les sauvegardes du lendemain).
-4. Contrôle immédiat : `docker compose exec -T backup sh /scripts/backup.sh`
+4. Contrôle immédiat : `docker compose exec -T -e BACKUP_DIR=/backups backup sh /scripts/backup.sh`
    doit produire une nouvelle archive.
 
 > `POSTGRES_PASSWORD` dans le compose ne sert qu'à l'**initialisation** du
@@ -469,7 +477,7 @@ Sur NixOS, l'équivalent déclaratif (`services.cron.systemCronJobs` ou un
 | Besoin | Commande |
 |---|---|
 | Préflight | `sh scripts/preflight.sh` |
-| Backup immédiat | `docker compose exec -T backup sh /scripts/backup.sh` |
+| Backup immédiat | `docker compose exec -T -e BACKUP_DIR=/backups backup sh /scripts/backup.sh` |
 | Déployer / mettre à jour | `make up` (`docker compose up --build -d`) |
 | Logs | `make logs` (`docker compose logs -f bot`) |
 | État des services | `docker compose ps` |

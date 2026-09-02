@@ -1,9 +1,9 @@
-// Package users gère la table users : requêtée directement via le pool
-// applicatif, SANS passer par storage.DB.InTenant. Contrairement à
-// messages, users n'est pas protégée par RLS : c'est la table racine qui
-// établit l'identité tenant elle-même (on ne peut pas poser
-// app.current_owner_user_id avant de savoir, justement, quel est
-// l'owner_user_id correspondant à un telegram_user_id).
+// Package users manages the users table: queried directly via the
+// application pool, WITHOUT going through storage.DB.InTenant. Unlike
+// messages, users is not protected by RLS: it is the root table that
+// establishes tenant identity itself (you cannot set
+// app.current_owner_user_id before knowing, precisely, which owner_user_id
+// corresponds to a telegram_user_id).
 package users
 
 import (
@@ -13,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Repository donne accès à la table users.
+// Repository provides access to the users table.
 type Repository struct {
 	pool *pgxpool.Pool
 }
@@ -22,23 +22,23 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 	return &Repository{pool: pool}
 }
 
-// User reflète une ligne de la table users.
+// User reflects a row of the users table.
 type User struct {
 	ID             int64
 	TelegramUserID int64
 	RetentionDays  int
 }
 
-// TenantRetention est la projection minimale nécessaire à la purge de
-// rétention (messages.Repository.PurgeExpired).
+// TenantRetention is the minimal projection needed for the retention purge
+// (messages.Repository.PurgeExpired).
 type TenantRetention struct {
 	OwnerUserID   int64
 	RetentionDays int
 }
 
-// UpsertByTelegramID crée l'utilisateur s'il n'existe pas encore, ou renvoie
-// la ligne existante sinon (idempotent : une connexion Business peut être
-// notifiée plusieurs fois par Telegram pour le même titulaire).
+// UpsertByTelegramID creates the user if it does not exist yet, or returns
+// the existing row otherwise (idempotent: a Business connection may be
+// notified several times by Telegram for the same account holder).
 func (r *Repository) UpsertByTelegramID(ctx context.Context, telegramUserID int64) (*User, error) {
 	var u User
 	err := r.pool.QueryRow(ctx, `
@@ -53,13 +53,13 @@ func (r *Repository) UpsertByTelegramID(ctx context.Context, telegramUserID int6
 	return &u, nil
 }
 
-// ListTenantsForRetention renvoie tous les tenants avec leur durée de
-// rétention, utilisée par messages.Repository.PurgeExpired pour boucler
-// tenant par tenant (jamais un DELETE global, cf. contrainte n°4).
+// ListTenantsForRetention returns all tenants with their retention period,
+// used by messages.Repository.PurgeExpired to loop tenant by tenant (never a
+// global DELETE, cf. constraint #4).
 func (r *Repository) ListTenantsForRetention(ctx context.Context) ([]TenantRetention, error) {
 	rows, err := r.pool.Query(ctx, `SELECT id, retention_days FROM users`)
 	if err != nil {
-		return nil, fmt.Errorf("liste des tenants: %w", err)
+		return nil, fmt.Errorf("listing tenants: %w", err)
 	}
 	defer rows.Close()
 
@@ -67,7 +67,7 @@ func (r *Repository) ListTenantsForRetention(ctx context.Context) ([]TenantReten
 	for rows.Next() {
 		var t TenantRetention
 		if err := rows.Scan(&t.OwnerUserID, &t.RetentionDays); err != nil {
-			return nil, fmt.Errorf("lecture tenant: %w", err)
+			return nil, fmt.Errorf("reading tenant: %w", err)
 		}
 		tenants = append(tenants, t)
 	}

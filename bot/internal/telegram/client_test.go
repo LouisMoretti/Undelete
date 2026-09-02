@@ -26,12 +26,12 @@ func TestTransportErrorDoesNotLeakBotToken(t *testing.T) {
 
 	_, err := client.GetUpdates(context.Background(), 0, 50)
 	if err == nil {
-		t.Fatal("GetUpdates() devait échouer")
+		t.Fatal("GetUpdates() should have failed")
 	}
 	if strings.Contains(err.Error(), token) {
-		t.Fatalf("l'erreur expose le token du bot: %q", err)
+		t.Fatalf("error exposes the bot token: %q", err)
 	}
 	if strings.Contains(err.Error(), "example.invalid") {
-		t.Fatalf("l'erreur expose l'URL de la Bot API: %q", err)
+		t.Fatalf("error exposes the Bot API URL: %q", err)
 	}
 }

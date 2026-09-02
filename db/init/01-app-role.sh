@@ -1,23 +1,23 @@
 #!/bin/sh
-# Exécuté automatiquement par l'image postgres officielle au premier
-# démarrage (docker-entrypoint-initdb.d), avec le rôle POSTGRES_USER
-# (superuser dans l'image).
+# Automatically executed by the official postgres image on first startup
+# (docker-entrypoint-initdb.d), with the POSTGRES_USER role (superuser in the
+# image).
 #
-# Crée le rôle applicatif undelete_app, volontairement dépourvu de tout
-# privilège élevé : NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS. C'est ce
-# rôle, et UNIQUEMENT lui, que le bot utilise via DATABASE_URL en runtime.
-# Le rôle propriétaire (POSTGRES_USER) reste réservé aux migrations, via
-# MIGRATION_DATABASE_URL -- voir config.Load() qui refuse de démarrer si les
-# deux DSN sont identiques.
+# Creates the app role undelete_app, deliberately stripped of any elevated
+# privilege: NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS. It is this role,
+# and ONLY this one, that the bot uses via DATABASE_URL at runtime.
+# The owner role (POSTGRES_USER) stays reserved for migrations, via
+# MIGRATION_DATABASE_URL -- see config.Load() which refuses to start if both
+# DSNs are identical.
 set -e
 
-: "${APP_DB_USER:?APP_DB_USER doit être défini}"
-: "${APP_DB_PASSWORD:?APP_DB_PASSWORD doit être défini}"
+: "${APP_DB_USER:?APP_DB_USER must be set}"
+: "${APP_DB_PASSWORD:?APP_DB_PASSWORD must be set}"
 
-# Les variables psql sont citées selon leur nature : :"app_user" produit un
-# identifiant SQL correctement échappé, :'app_password' un littéral SQL. Une
-# interpolation shell directe casserait l'init avec une apostrophe dans le mot
-# de passe et permettrait une injection via une valeur d'environnement piégée.
+# The psql variables are quoted according to their nature: :"app_user"
+# produces a properly escaped SQL identifier, :'app_password' a SQL literal.
+# Direct shell interpolation would break init with an apostrophe in the
+# password and would allow injection via a trapped environment value.
 psql -v ON_ERROR_STOP=1 \
     -v app_user="$APP_DB_USER" \
     -v app_password="$APP_DB_PASSWORD" \
@@ -32,11 +32,11 @@ psql -v ON_ERROR_STOP=1 \
         SELECT FROM pg_catalog.pg_roles WHERE rolname = :'app_user'
     ) \gexec
 
-    -- Droits minimaux : lecture/écriture sur les tables applicatives, pas de
-    -- DDL. Les migrations (rôle propriétaire) créent les tables après ce
-    -- script au premier boot ; ALTER DEFAULT PRIVILEGES est donc indispensable
-    -- pour que ces futures tables et séquences deviennent accessibles au
-    -- runtime sans accorder la propriété du schéma au rôle applicatif.
+    -- Minimal rights: read/write on the app tables, no DDL. The migrations
+    -- (owner role) create the tables after this script at first boot; ALTER
+    -- DEFAULT PRIVILEGES is therefore essential so that these future tables
+    -- and sequences become accessible at runtime without granting schema
+    -- ownership to the app role.
     GRANT USAGE ON SCHEMA public TO :"app_user";
     GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO :"app_user";
     GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO :"app_user";

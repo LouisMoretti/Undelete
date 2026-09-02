@@ -1,6 +1,6 @@
 .PHONY: build vet fmt tidy check test-integration test-restore up down logs
 
-# Les 4 commandes de livraison, regroupées.
+# The 4 delivery commands, grouped together.
 check:
 	cd bot && go mod tidy && go build ./... && go vet ./... && gofmt -l .
 
@@ -19,8 +19,8 @@ fmt:
 test-integration:
 	./scripts/test-integration.sh
 
-# Restaure une sauvegarde dans une base jetable distincte et la vérifie.
-# Voir docs/backup-restore.md (RPO/RTO, recette périodique).
+# Restores a backup into a distinct disposable database and verifies it.
+# See docs/backup-restore.md (RPO/RTO, periodic recipe).
 test-restore:
 	./scripts/restore-test.sh
 

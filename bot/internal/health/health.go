@@ -1,11 +1,10 @@
-// Package health expose les probes de supervision du bot : /livez, /readyz
-// et /metrics, servis par un serveur HTTP dédié (HEALTH_ADDR).
+// Package health exposes the bot's supervision probes: /livez, /readyz
+// and /metrics, served by a dedicated HTTP server (HEALTH_ADDR).
 //
-// Aucune réponse de ce paquet ne contient de contenu utilisateur. En
-// particulier, /readyz ne renvoie JAMAIS le message d'erreur brut d'un ping
-// PostgreSQL : celui-ci contient le DSN (donc un mot de passe) et parfois des
-// fragments de requête. Les checks dégradés sont décrits par un jeu FIXE de
-// raisons courtes, définies ici.
+// No response from this package contains user content. In particular, /readyz
+// NEVER returns the raw error message of a PostgreSQL ping: it contains the
+// DSN (hence a password) and sometimes query fragments. Degraded checks are
+// described by a FIXED set of short reasons, defined here.
 package health
 
 import (
@@ -20,19 +19,19 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/metrics"
 )
 
-// pollerFreshnessThreshold borne l'ancienneté acceptable du dernier
-// getUpdates réussi. Le long polling utilise un timeout de 50s : un poller
-// sain rend la main au moins toutes les 50s (plus le temps de traitement).
-// 90s laisse donc la marge d'un cycle complet sans jamais signaler dégradé un
-// poller simplement en attente de la réponse Telegram.
+// pollerFreshnessThreshold bounds the acceptable age of the last successful
+// getUpdates. Long polling uses a 50s timeout: a healthy poller returns at
+// least every 50s (plus processing time). 90s therefore leaves the margin of
+// one full cycle without ever marking a poller simply waiting for the
+// Telegram response as degraded.
 const pollerFreshnessThreshold = 90 * time.Second
 
-// pingTimeout borne le check base : une base injoignable doit répondre
-// « degraded » vite, pas faire traîner la probe jusqu'au timeout de l'orchestrateur.
+// pingTimeout bounds the database check: an unreachable database must answer
+// "degraded" quickly, not drag the probe until the orchestrator's timeout.
 const pingTimeout = 2 * time.Second
 
-// Raisons possibles pour un check. Liste fermée : rien d'issu d'un update,
-// d'une erreur base ou d'une réponse Telegram ne peut s'y glisser.
+// Possible reasons for a check. Closed list: nothing from an update, a
+// database error or a Telegram response can slip in.
 const (
 	reasonOK             = "ok"
 	reasonDBUnreachable  = "unreachable"
@@ -45,22 +44,22 @@ const (
 	defaultShutdownGrace = 5 * time.Second
 )
 
-// Pinger est le check base. *pgxpool.Pool le satisfait tel quel ; les tests
-// fournissent un double qui renvoie l'erreur voulue.
+// Pinger is the database check. *pgxpool.Pool satisfies it as is; tests
+// provide a double that returns the desired error.
 type Pinger interface {
 	Ping(ctx context.Context) error
 }
 
-// FreshnessSource fournit la date du dernier getUpdates réussi. La valeur
-// zéro signifie « aucun poll réussi depuis le démarrage ». telegram.Poller
-// l'implémente via LastSuccessfulPoll.
+// FreshnessSource provides the time of the last successful getUpdates. The
+// zero value means "no successful poll since startup". telegram.Poller
+// implements it via LastSuccessfulPoll.
 type FreshnessSource interface {
 	LastSuccessfulPoll() time.Time
 }
 
-// Handler sert les trois routes. Les dépendances sont injectées par
-// interfaces : les états dégradés (base morte, poller figé) se testent sans
-// réseau ni base.
+// Handler serves the three routes. Dependencies are injected via interfaces:
+// the degraded states (dead database, frozen poller) can be tested without a
+// network or a database.
 type Handler struct {
 	db       Pinger
 	poller   FreshnessSource
@@ -68,8 +67,8 @@ type Handler struct {
 	now      func() time.Time
 }
 
-// NewHandler assemble le handler. now peut être nil : l'horloge système est
-// alors utilisée (les tests injectent une horloge figée).
+// NewHandler assembles the handler. now may be nil: the system clock is then
+// used (tests inject a frozen clock).
 func NewHandler(db Pinger, poller FreshnessSource, counters *metrics.Counters, now func() time.Time) *Handler {
 	if now == nil {
 		now = time.Now
@@ -80,7 +79,7 @@ func NewHandler(db Pinger, poller FreshnessSource, counters *metrics.Counters, n
 	return &Handler{db: db, poller: poller, counters: counters, now: now}
 }
 
-// Mux construit le routeur des probes.
+// Mux builds the probes router.
 func (h *Handler) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/livez", h.handleLive)
@@ -89,15 +88,15 @@ func (h *Handler) Mux() *http.ServeMux {
 	return mux
 }
 
-// handleLive répond 200 dès que le processus sert du HTTP : la liveness ne
-// doit dépendre d'aucune dépendance externe, sinon une base momentanément
-// indisponible ferait redémarrer en boucle un bot par ailleurs sain.
+// handleLive answers 200 as soon as the process serves HTTP: liveness must not
+// depend on any external dependency, otherwise a momentarily unavailable
+// database would make an otherwise healthy bot restart in a loop.
 func (h *Handler) handleLive(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": statusOK})
 }
 
-// handleReady répond 200 si la base répond ET si le poller a réussi un
-// getUpdates récemment ; 503 avec le détail par check sinon.
+// handleReady answers 200 if the database responds AND the poller has
+// succeeded a getUpdates recently; 503 with per-check detail otherwise.
 func (h *Handler) handleReady(w http.ResponseWriter, r *http.Request) {
 	checks := map[string]string{
 		checkNameDatabase: h.checkDatabase(r.Context()),
@@ -128,8 +127,8 @@ func (h *Handler) checkDatabase(ctx context.Context) string {
 	ctx, cancel := context.WithTimeout(ctx, pingTimeout)
 	defer cancel()
 	if err := h.db.Ping(ctx); err != nil {
-		// err est volontairement ignorée dans la réponse : elle contient le
-		// DSN applicatif, mot de passe compris.
+		// err is intentionally ignored in the response: it contains the
+		// application DSN, password included.
 		return reasonDBUnreachable
 	}
 	return reasonOK
@@ -155,18 +154,18 @@ func writeJSON(w http.ResponseWriter, code int, body map[string]any) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-// Serve démarre le serveur de probes sur addr et le coupe proprement quand
-// ctx est annulé. addr vide = serveur désactivé (retour immédiat sans
-// erreur), pour les environnements où aucun port ne doit être ouvert.
+// Serve starts the probes server on addr and shuts it down cleanly when ctx
+// is cancelled. Empty addr = server disabled (immediate return without
+// error), for environments where no port must be opened.
 func Serve(ctx context.Context, addr string, handler *Handler, logger *slog.Logger) error {
 	if addr == "" {
-		logger.Info("serveur de santé désactivé (HEALTH_ADDR vide)")
+		logger.Info("health server disabled (empty HEALTH_ADDR)")
 		return nil
 	}
 
-	// Timeouts complets : les probes répondent en millisecondes (le seul
-	// travail bloquant est un ping borné à 2 s), donc aucune raison de
-	// laisser une connexion de scrape traîner indéfiniment.
+	// Full timeouts: the probes answer in milliseconds (the only blocking work is
+	// a ping bounded at 2 s), so there is no reason to let a scrape connection
+	// linger indefinitely.
 	srv := &http.Server{
 		Handler:           handler.Mux(),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -178,9 +177,9 @@ func Serve(ctx context.Context, addr string, handler *Handler, logger *slog.Logg
 	if err != nil {
 		return err
 	}
-	// L'adresse effective est loggée (utile quand addr vaut ":0"), jamais le
-	// jeton du bot ni un DSN.
-	logger.Info("serveur de santé démarré", slog.String("addr", ln.Addr().String()))
+	// The effective address is logged (useful when addr is ":0"), never the bot
+	// token or a DSN.
+	logger.Info("health server started", slog.String("addr", ln.Addr().String()))
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
@@ -197,6 +196,6 @@ func Serve(ctx context.Context, addr string, handler *Handler, logger *slog.Logg
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), defaultShutdownGrace)
 	defer cancel()
 	err = srv.Shutdown(shutdownCtx)
-	logger.Info("serveur de santé arrêté")
+	logger.Info("health server stopped")
 	return err
 }

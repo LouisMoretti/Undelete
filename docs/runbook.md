@@ -1,83 +1,82 @@
-# Runbook — déploiement, mise à jour et rollback
+# Runbook — deployment, update and rollback
 
-Exploitation d'`undelete` sur le homelab (Proxmox → VM NixOS → Docker Compose
-lancé à la main). Pas de CI de déploiement : **chaque mise en production est
-une exécution manuelle de cette procédure**, dans l'ordre.
+Operating `undelete` on the homelab (Proxmox → NixOS VM → Docker Compose
+launched by hand). No deployment CI: **every production deployment is a manual
+execution of this procedure**, in order.
 
-Toutes les commandes se lancent depuis la racine du dépôt sur la VM.
+All commands are run from the repository root on the VM.
 
-> **Dépendances entre PR.** Ce runbook référence deux éléments livrés par
-> d'autres PR de la même pile : les sondes HTTP `/livez`, `/readyz` et
-> `/metrics` sur le port `9090` (**disponible après la PR probes, #6**) et
-> `make test-restore` + `docs/backup-restore.md` (**disponible après la PR
-> test-restore, #7**). Les étapes concernées sont marquées *(après #6)* /
-> *(après #7)* et disposent d'une alternative applicable dès aujourd'hui.
+> **Dependencies between PRs.** This runbook references two elements delivered
+> by other PRs in the same stack: the HTTP probes `/livez`, `/readyz` and
+> `/metrics` on port `9090` (**available after the probes PR, #6**) and
+> `make test-restore` + `docs/backup-restore.md` (**available after the
+> test-restore PR, #7**). The affected steps are marked *(after #6)* /
+> *(after #7)* and have an alternative applicable today.
 
 ---
 
-## 0. Actions destructives — liste fermée
+## 0. Destructive actions — closed list
 
-> ### ⛔ INTERDIT SANS CONFIRMATION EXPLICITE DE LOUIS
+> ### ⛔ FORBIDDEN WITHOUT EXPLICIT CONFIRMATION FROM LOUIS
 >
-> Les commandes ci-dessous détruisent des données que **rien ne restaure**
-> (les dumps de `./backups` couvrent la base, jamais le volume ni `./media`).
-> Aucune n'est nécessaire pour déployer, mettre à jour ou rollbacker. Elles
-> ne doivent **jamais** être lancées « pour débloquer » un incident, ni
-> proposées comme remède par un agent.
+> The commands below destroy data that **nothing restores** (the dumps in
+> `./backups` cover the database, never the volume nor `./media`).
+> None of them is required to deploy, update or roll back. They must **never**
+> be run "to unblock" an incident, nor be proposed as a remedy by an agent.
 >
-> | Commande | Effet irréversible |
+> | Command | Irreversible effect |
 > |----------|--------------------|
-> | `docker compose down -v` | supprime le volume `postgres_data` → **toute la base perdue** |
-> | `docker volume rm undelete_postgres_data` | idem, sans même arrêter proprement |
-> | `docker volume prune` / `docker system prune` | peut emporter `postgres_data` et d'autres volumes de la VM |
-> | `DROP DATABASE` / `DROP SCHEMA` / `TRUNCATE` | vide la base sous le bot en cours d'exécution |
-> | `psql < dump.sql` sur la base de production | écrase l'état courant (restauration : voir §3.3) |
-> | `rm -rf ./backups` (ou suppression de dumps hors purge de rétention) | supprime le seul filet de sécurité |
+> | `docker compose down -v` | deletes the `postgres_data` volume → **the entire database is lost** |
+> | `docker volume rm undelete_postgres_data` | same, without even a clean shutdown |
+> | `docker volume prune` / `docker system prune` | can take `postgres_data` and other VM volumes with it |
+> | `DROP DATABASE` / `DROP SCHEMA` / `TRUNCATE` | empties the database under the running bot |
+> | `psql < dump.sql` on the production database | overwrites the current state (restoration: see §3.3) |
+> | `rm -rf ./backups` (or deleting dumps outside the retention purge) | removes the only safety net |
 >
-> **Règle d'exploitation** : arrêter la stack se fait avec `make down`
-> (= `docker compose down`, **sans `-v`**), qui préserve `postgres_data`.
-> Toute purge d'espace disque se fait sur les *fichiers* de `./backups`
-> (dumps les plus anciens), jamais sur des ressources Docker.
+> **Operating rule**: stopping the stack is done with `make down`
+> (= `docker compose down`, **without `-v`**), which preserves `postgres_data`.
+> Any disk-space purge is done on the *files* in `./backups` (oldest dumps),
+> never on Docker resources.
 
 ---
 
-## 1. Préflight
+## 1. Preflight
 
-### 1.1 Automatique
+### 1.1 Automatic
 
 ```bash
 sh scripts/preflight.sh
 ```
 
-Script en **lecture seule** (aucune écriture, aucune suppression), rejouable.
-Il rapporte une ligne par vérification et sort en code 1 dès un `[ECHEC]` :
+**Read-only** script (no writes, no deletions), replayable.
+It reports one line per check and exits with code 1 at the first `[ECHEC]`:
 
-| Vérification | Détail |
+| Check | Detail |
 |---|---|
-| `.env` présent et chargé | parsé clé=valeur, jamais sourcé ; l'environnement l'emporte sur le fichier, comme docker compose |
-| permissions de `.env` | attendu `600` ou `400` (contient le jeton et les mots de passe Postgres) |
-| variables requises | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `APP_DB_PASSWORD`, `MIGRATION_DATABASE_URL`, `DATABASE_URL`, `TELEGRAM_BOT_TOKEN` (cf. `.env.example`) |
-| `OWNER_TELEGRAM_USER_ID` | garde-fou mono-tenant Phase 1 ; **échec si vide** hors dev local |
-| `BACKUP_RETENTION_DAYS` | entier ; absent ⇒ `backup.sh` applique 14 jours |
-| DSN distincts | `DATABASE_URL ≠ MIGRATION_DATABASE_URL`, même règle que `config.Load()` |
-| espace disque | seuil `PREFLIGHT_MIN_DISK_GB` (défaut 2 Go) sur le FS du dépôt |
-| `./backups` et `./media` | présents et inscriptibles (bind mounts du compose) |
-| rôles PostgreSQL | rôle propriétaire joignable ; `undelete_app` existant, `NOSUPERUSER` et `NOBYPASSRLS` |
-| jeton Telegram | `getMe` sur api.telegram.org ; **le jeton n'est jamais affiché**, toute sortie de l'API est masquée |
+| `.env` present and loaded | parsed key=value, never sourced; the environment overrides the file, like docker compose |
+| `.env` permissions | expected `600` or `400` (it contains the token and the Postgres passwords) |
+| required variables | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `APP_DB_PASSWORD`, `MIGRATION_DATABASE_URL`, `DATABASE_URL`, `TELEGRAM_BOT_TOKEN` (cf. `.env.example`) |
+| `OWNER_TELEGRAM_USER_ID` | Phase 1 mono-tenant guard; **fails if empty** outside local dev |
+| `BACKUP_RETENTION_DAYS` | integer; absent ⇒ `backup.sh` applies 14 days |
+| distinct DSNs | `DATABASE_URL ≠ MIGRATION_DATABASE_URL`, same rule as `config.Load()` |
+| disk space | threshold `PREFLIGHT_MIN_DISK_GB` (default 2 GB) on the repository FS |
+| `./backups` and `./media` | present and writable (compose bind mounts) |
+| PostgreSQL roles | owner role reachable; `undelete_app` exists, `NOSUPERUSER` and `NOBYPASSRLS` |
+| Telegram token | `getMe` on api.telegram.org; **the token is never displayed**, any API output is masked |
 
-Un `[SKIP]` n'est pas bloquant : il signale une vérification **non faite**
-(outil absent, base injoignable), à rejouer depuis un endroit qui le permet.
+A `[SKIP]` is not blocking: it signals a check **not performed** (missing
+tool, unreachable database), to be re-run from a place that allows it.
 
-Seuil disque ajustable :
+Adjustable disk threshold:
 
 ```bash
 PREFLIGHT_MIN_DISK_GB=10 sh scripts/preflight.sh
 ```
 
-**Rejouer le check des rôles depuis le réseau Docker.** Depuis la VM, les DSN
-de `.env` pointent vers l'hôte `postgres` du réseau compose et ne résolvent
-pas : le check sort en `[SKIP]`. Une fois la stack démarrée, il se rejoue
-depuis le conteneur Postgres, qui embarque `psql` :
+**Re-run the role check from the Docker network.** From the VM, the DSNs in
+`.env` point to the `postgres` host of the compose network and do not resolve:
+the check exits with `[SKIP]`. Once the stack is up, re-run it from the
+Postgres container, which embeds `psql`:
 
 ```bash
 docker compose exec -T postgres \
@@ -87,124 +86,121 @@ SELECT rolname, rolsuper, rolbypassrls FROM pg_roles
 SQL
 ```
 
-> **`$POSTGRES_USER` et `$POSTGRES_DB` sont résolus dans le conteneur**, d'où
-> le `sh -c '…'` en quotes simples. Côté VM ces variables ne sont pas
-> définies : `docker compose` lit `.env` pour lui-même et n'exporte rien dans
-> le shell de l'opérateur. Une commande qui les laisse s'expanser sur l'hôte
-> se réduit à `psql -U "" -d ""` et échoue à la connexion. Même remarque pour
-> tous les blocs `psql` de ce runbook.
+> **`$POSTGRES_USER` and `$POSTGRES_DB` are resolved inside the container**,
+> hence the `sh -c '…'` in single quotes. On the VM side these variables are
+> not defined: `docker compose` reads `.env` for itself and exports nothing to
+> the operator's shell. A command that lets them expand on the host reduces to
+> `psql -U "" -d ""` and fails to connect. Same remark applies to all the
+> `psql` blocks in this runbook.
 
-Attendu : `undelete_app|f|f`. Si `undelete_app` est absent, c'est que
-`db/init/01-app-role.sh` n'a pas tourné — il ne s'exécute qu'au **premier**
-démarrage du volume `postgres_data`, jamais sur un volume déjà initialisé.
+Expected: `undelete_app|f|f`. If `undelete_app` is missing, it means
+`db/init/01-app-role.sh` has not run — it only runs on the **first** start of
+the `postgres_data` volume, never on an already-initialized volume.
 
-### 1.2 Checklist manuelle
+### 1.2 Manual checklist
 
-- [ ] `git status` propre et branche/tag attendus (`git log --oneline -1`).
-- [ ] `.env` en `600`, propriétaire = utilisateur qui lance compose.
-- [ ] Espace disque : `df -h .` — prévoir la base **plus** la rétention de dumps.
-- [ ] `docker compose config` ne signale aucune variable non substituée.
-- [ ] `make check` vert (build + vet + gofmt) sur le commit à déployer.
-- [ ] Sauvegardes récentes présentes : `ls -lh backups/ | tail -5`.
-- [ ] Bot toujours connecté côté Telegram (Business Mode actif, cf. README).
-- [ ] Fenêtre de déploiement acceptée : pendant le rollout, les messages
-      supprimés ne sont **pas** rattrapés rétroactivement (la Bot API ne
-      rejoue pas l'historique) — les updates non consommés restent toutefois
-      en file côté Telegram jusqu'à 24 h et sont traités au redémarrage.
+- [ ] `git status` clean and expected branch/tag (`git log --oneline -1`).
+- [ ] `.env` at `600`, owner = the user who runs compose.
+- [ ] Disk space: `df -h .` — plan for the database **plus** the dump retention.
+- [ ] `docker compose config` reports no unsubstituted variable.
+- [ ] `make check` green (build + vet + gofmt) on the commit to deploy.
+- [ ] Recent backups present: `ls -lh backups/ | tail -5`.
+- [ ] Bot still connected on the Telegram side (Business Mode active, cf. README).
+- [ ] Deployment window accepted: during the rollout, deleted messages are
+      **not** caught up retroactively (the Bot API does not replay history) —
+      unconsumed updates nevertheless stay queued on the Telegram side for up
+      to 24 h and are processed at restart.
 
 ---
 
-## 2. Procédure de déploiement / mise à jour
+## 2. Deployment / update procedure
 
-**Ordre non négociable : backup → migration → rollout → vérifications.**
+**Non-negotiable order: backup → migration → rollout → verification.**
 
-### Étape 1 — Backup
+### Step 1 — Backup
 
-Le service `backup` du compose tourne en boucle (un dump immédiat puis toutes
-les 24 h). Avant un déploiement, on force un dump frais **maintenant** :
+The `backup` service of the compose runs in a loop (one immediate dump then
+every 24 h). Before a deployment, force a fresh dump **now**:
 
 ```bash
 docker compose exec -T -e BACKUP_DIR=/backups backup sh /scripts/backup.sh
 ls -lh backups/ | tail -3
 ```
 
-Le script écrit `backups/undelete-<horodatage UTC>.sql.gz`, puis purge les
-archives de plus de `BACKUP_RETENTION_DAYS` jours (fichiers uniquement). Un
-`pg_dump` en échec ne laisse pas d'archive tronquée : le `trap` la supprime.
+The script writes `backups/undelete-<UTC timestamp>.sql.gz`, then purges
+archives older than `BACKUP_RETENTION_DAYS` days (files only). A failed
+`pg_dump` does not leave a truncated archive: the `trap` removes it.
 
-> **`-e BACKUP_DIR=/backups` n'est pas optionnel.** La boucle du service pose
-> cette variable dans son propre `entrypoint` ; une session `exec` est un
-> processus neuf qui n'en hérite pas. Sans elle, `backup.sh` retombe sur son
-> défaut `./backups`, résolu depuis le `working_dir` du conteneur (`/backups`)
-> : le dump partirait dans `./backups/backups/` et la purge de rétention
-> s'appliquerait à ce sous-répertoire, laissant les vraies archives
-> s'accumuler.
+> **`-e BACKUP_DIR=/backups` is not optional.** The service loop sets this
+> variable in its own `entrypoint`; an `exec` session is a fresh process that
+> does not inherit it. Without it, `backup.sh` falls back to its default
+> `./backups`, resolved from the container's `working_dir` (`/backups`):
+> the dump would go into `./backups/backups/` and the retention purge would
+> apply to that subdirectory, letting the real archives accumulate.
 
-Si la stack est arrêtée, démarrer d'abord Postgres seul :
+If the stack is stopped, start Postgres alone first:
 
 ```bash
 docker compose up -d postgres
 docker compose exec -T -e BACKUP_DIR=/backups backup sh /scripts/backup.sh
 ```
 
-> **Ne pas déployer sans dump frais.** L'étape 2 applique des migrations avec
-> le rôle propriétaire ; c'est le seul moment où le schéma peut changer de
-> façon non réversible.
+> **Do not deploy without a fresh dump.** Step 2 applies migrations with the
+> owner role; this is the only moment where the schema can change in a
+> non-reversible way.
 
-Noter le nom du dump : c'est le point de retour de la §3.3.
+Note the dump name: it is the rollback point of §3.3.
 
-### Étape 2 — Migration
+### Step 2 — Migration
 
-Les migrations ne se lancent pas séparément : `bot/cmd/bot/main.go` appelle
-`storage.RunMigrations` avec `MIGRATION_DATABASE_URL` (rôle propriétaire)
-**avant** d'ouvrir le pool applicatif (`DATABASE_URL`, rôle `undelete_app`,
-sans droits DDL). Elles se jouent donc au boot de l'étape 3.
+Migrations are not run separately: `bot/cmd/bot/main.go` calls
+`storage.RunMigrations` with `MIGRATION_DATABASE_URL` (owner role)
+**before** opening the application pool (`DATABASE_URL`, role `undelete_app`,
+without DDL rights). They therefore run at the boot of step 3.
 
-Avant de déployer, regarder ce qui va être appliqué :
+Before deploying, look at what is going to be applied:
 
 ```bash
 ls bot/internal/storage/migrations/
-git diff --stat <commit_déployé>..HEAD -- bot/internal/storage/migrations/
+git diff --stat <deployed_commit>..HEAD -- bot/internal/storage/migrations/
 ```
 
-Une migration **destructive** (`DROP`, `ALTER ... DROP COLUMN`, `TRUNCATE`,
-changement de type avec perte) impose de relire les §3.2 et §3.3 *avant* le
-rollout : le rollback devient une restauration de dump, pas un simple retour
-d'image.
+A **destructive** migration (`DROP`, `ALTER ... DROP COLUMN`, `TRUNCATE`,
+type change with data loss) requires re-reading §3.2 and §3.3 *before* the
+rollout: the rollback becomes a dump restoration, not a simple image revert.
 
-Le contrôle d'application se fait après l'étape 3, dans les logs JSON :
+The application check is done after step 3, in the JSON logs:
 
 ```bash
-docker compose logs bot | grep '"msg":"migration appliquée"'
+docker compose logs bot | grep '"msg":"migration applied"'
 ```
 
-Chaque ligne porte `version` et `name`. Aucune ligne = aucune migration
-nouvelle à appliquer (cas normal d'un déploiement sans changement de schéma).
-Un échec de migration fait sortir le binaire en code 1 avec
-`"msg":"arrêt sur erreur fatale"` : le pool applicatif n'est jamais ouvert,
-donc le bot ne tourne **jamais** sur un schéma partiellement migré.
+Each line carries `version` and `name`. No line = no new migration to apply
+(the normal case for a deployment without schema change). A migration failure
+makes the binary exit with code 1 and
+`"msg":"stopping after fatal error"`: the application pool is never opened,
+so the bot **never** runs on a partially migrated schema.
 
-### Étape 3 — Rollout
+### Step 3 — Rollout
 
 ```bash
 git pull --ff-only
-docker compose up --build -d      # équivalent : make up
+docker compose up --build -d      # equivalent: make up
 docker compose ps
 ```
 
-`--build` reconstruit l'image du bot depuis `bot/Dockerfile` (le compose bâtit
-localement, il n'y a pas de registre : `docker compose pull` ne rapatrie que
-`postgres:16-alpine`). `up -d` recrée uniquement les services dont la
-définition ou l'image a changé ; Postgres n'est pas redémarré si rien ne le
-concerne, et son volume est conservé dans tous les cas.
+`--build` rebuilds the bot image from `bot/Dockerfile` (the compose builds
+locally, there is no registry: `docker compose pull` only fetches
+`postgres:16-alpine`). `up -d` recreates only the services whose definition or
+image changed; Postgres is not restarted if nothing concerns it, and its
+volume is preserved in all cases.
 
-`docker compose ps` doit montrer `postgres` *healthy* et `bot` *running*. Le
-bot attend `service_healthy` sur Postgres : un démarrage un peu long est
-normal.
+`docker compose ps` must show `postgres` *healthy* and `bot` *running*. The
+bot waits for `service_healthy` on Postgres: a slightly slow start is normal.
 
-### Étape 4 — Vérifications
+### Step 4 — Verification
 
-**a. Sondes HTTP** *(après #6)* — sur `:9090` :
+**a. HTTP probes** *(after #6)* — on `:9090`:
 
 ```bash
 curl -fsS http://localhost:9090/livez  && echo " livez OK"
@@ -212,61 +208,61 @@ curl -fsS http://localhost:9090/readyz && echo " readyz OK"
 curl -fsS http://localhost:9090/metrics | head -20
 ```
 
-`/livez` = processus vivant ; `/readyz` = migrations passées, pool applicatif
-ouvert et poller démarré. Un `readyz` durablement rouge alors que `livez` est
-vert ⇒ regarder la base avant de toucher au bot.
+`/livez` = process alive; `/readyz` = migrations done, application pool open
+and poller started. A persistently red `/readyz` while `/livez` is green ⇒
+look at the database before touching the bot.
 
-*Avant #6*, la vérification équivalente se lit dans les logs (ci-dessous) et
-via `docker compose ps` (état `running`, pas de boucle de redémarrage :
+*Before #6*, the equivalent check is read in the logs (below) and via
+`docker compose ps` (state `running`, no restart loop:
 `docker compose ps --format '{{.Name}} {{.Status}}'`).
 
-**b. Logs** :
+**b. Logs**:
 
 ```bash
-docker compose logs -f bot        # équivalent : make logs
+docker compose logs -f bot        # equivalent: make logs
 ```
 
-Attendus au boot, dans l'ordre :
+Expected at boot, in order:
 
-- `"msg":"migration appliquée"` (seulement s'il y en avait),
-- `"msg":"démarrage du poller"` avec `allowed_updates` contenant les quatre
+- `"msg":"migration applied"` (only if there were any),
+- `"msg":"poller starting"` with `allowed_updates` containing the four
   types `business_connection`, `business_message`, `edited_business_message`,
   `deleted_business_messages`.
 
-À surveiller : `"level":"ERROR"`, en particulier `outbox: échec traitement`
-(alertes non délivrées) et `purge rétention: échec`. Les logs ne contiennent
-jamais de contenu de message : identifiants, types et compteurs uniquement.
+To watch for: `"level":"ERROR"`, in particular `outbox: processing failed`
+(undelivered alerts) and `retention purge: failed`. Logs never contain
+message content: identifiers, types and counters only.
 
-**c. Test synthétique bout-en-bout** — le seul contrôle qui prouve que la
-chaîne complète fonctionne :
+**c. End-to-end synthetic test** — the only check that proves the whole chain
+works:
 
-Les blocs `psql` ci-dessous sont volontairement à la marge : le délimiteur de
-`heredoc` doit rester en colonne 0 pour être copiable tel quel.
+The `psql` blocks below are deliberately at the margin: the `heredoc`
+delimiter must stay in column 0 to be copy-pasteable as-is.
 
-**1.** Depuis un second compte Telegram, envoyer un message dans une
-conversation privée couverte par la connexion Business.
+**1.** From a second Telegram account, send a message in a private
+conversation covered by the Business connection.
 
-**2.** Vérifier son enregistrement (compteur, sans lire le contenu). Remplacer
-`<owner_id>` par la valeur de `OWNER_TELEGRAM_USER_ID` de `.env` — elle
-n'existe pas dans le shell de la VM (§1.1).
+**2.** Verify its recording (counter, without reading the content). Replace
+`<owner_id>` with the value of `OWNER_TELEGRAM_USER_ID` from `.env` — it does
+not exist in the VM's shell (§1.1).
 
-> **Contexte de tenant, et ce que la commande ci-dessous montre vraiment.**
-> `messages`, `notification_outbox` et `chats` sont en `FORCE ROW LEVEL
-> SECURITY`, ce qui applique la policy **même au propriétaire de la table**.
-> Mais `POSTGRES_USER` est *superuser* dans l'image `postgres` officielle, et
-> superuser comme `BYPASSRLS` contournent RLS **y compris avec `FORCE`** (cf.
-> `bot/internal/storage/migrations/0001_init.sql`). Depuis ce conteneur, le
-> `count(*)` est donc global, tous tenants confondus : en Phase 1 mono-tenant
-> c'est le résultat attendu, et un `0` veut bien dire « aucun message
-> capturé », pas « contexte non posé ».
+> **Tenant context, and what the command below really shows.**
+> `messages`, `notification_outbox` and `chats` are in `FORCE ROW LEVEL
+> SECURITY`, which applies the policy **even to the table owner**.
+> But `POSTGRES_USER` is *superuser* in the official `postgres` image, and
+> superuser like `BYPASSRLS` bypasses RLS **even with `FORCE`** (cf.
+> `bot/internal/storage/migrations/0001_init.sql`). From this container, the
+> `count(*)` is therefore global, across all tenants: in mono-tenant Phase 1
+> that is the expected result, and a `0` really means "no message
+> captured", not "context not set".
 >
-> Le `set_config` est conservé parce qu'il est correct et sans effet de bord
-> ici, et **indispensable** dès qu'on rejoue ces requêtes avec un rôle
-> non-superuser — `undelete_app`, ou un propriétaire dépourvu de `BYPASSRLS` :
-> là, un `SELECT count(*)` sans contexte renvoie `0` **sans erreur**, un zéro
-> qui ne veut rien dire. Il se pose dans la même transaction, avec `users.id`
-> (clé de substitution) et **non** le `telegram_user_id` : `owner_user_id`
-> référence `users(id)`.
+> The `set_config` is kept because it is correct and has no side effect
+> here, and is **essential** as soon as these queries are re-run with a
+> non-superuser role — `undelete_app`, or an owner without `BYPASSRLS`:
+> there, a `SELECT count(*)` without context returns `0` **without error**, a
+> zero that means nothing. It is set in the same transaction, with `users.id`
+> (surrogate key) and **not** the `telegram_user_id`: `owner_user_id`
+> references `users(id)`.
 
 ```bash
 docker compose exec -T postgres \
@@ -278,21 +274,20 @@ SELECT count(*) FROM messages WHERE saved_at > now() - interval '5 minutes';
 SQL
 ```
 
-`--single-transaction` n'est pas décoratif : `set_config` est posé en `LOCAL`
-(3ᵉ argument `true`) et ne survit pas à la transaction. Sans lui, `psql -f`
-exécute chaque instruction dans sa propre transaction et le contexte est
-perdu avant le `count(*)`. Un `set_config` renvoyant une ligne vide signifie
-que l'utilisateur n'existe pas encore en base — c'est alors ça, le vrai
-résultat du test.
+`--single-transaction` is not decorative: `set_config` is set to `LOCAL`
+(3rd argument `true`) and does not survive the transaction. Without it, `psql -f`
+executes each statement in its own transaction and the context is lost before
+the `count(*)`. A `set_config` returning an empty row means the user does not
+exist in the database yet — in that case, that is the real test result.
 
-**3.** Supprimer ce message depuis le second compte.
+**3.** Delete this message from the second account.
 
-**4.** **Attendre l'alerte du bot sur le compte titulaire** (quelques
-secondes : le worker d'outbox tourne à la seconde). L'alerte doit porter le
-chat, l'expéditeur, le type, la date UTC et le contenu restitué.
+**4.** **Wait for the bot's alert on the account holder's account** (a few
+seconds: the outbox worker runs every second). The alert must carry the chat,
+the sender, the type, the UTC date and the restored content.
 
-**5.** Vérifier qu'aucun job d'outbox ne reste bloqué (même contexte que
-ci-dessus, `notification_outbox` est également en `FORCE RLS`) :
+**5.** Verify that no outbox job stays stuck (same context as above,
+`notification_outbox` is also in `FORCE RLS`):
 
 ```bash
 docker compose exec -T postgres \
@@ -304,222 +299,220 @@ SELECT status, count(*) FROM notification_outbox GROUP BY status;
 SQL
 ```
 
-`sent` attendu ; des `failed` ou des `processing` qui persistent signalent
-un problème d'envoi côté Telegram.
+`sent` expected; persistent `failed` or `processing` rows signal a send
+problem on the Telegram side.
 
-Une alerte reçue **deux fois** n'est pas un bug : la livraison est
-at-least-once par conception (cf. README).
+An alert received **twice** is not a bug: delivery is at-least-once by design
+(cf. README).
 
-**Déploiement considéré comme réussi uniquement si a + b + c sont verts.**
+**The deployment is considered successful only if a + b + c are green.**
 
 ---
 
 ## 3. Rollback
 
-Stratégie inverse de la §2 : on revient d'abord au code, on ne touche à la
-base qu'en dernier recours.
+Reverse strategy of §2: first revert the code, touch the database only as a
+last resort.
 
-### 3.1 Retour au code précédent (cas par défaut)
+### 3.1 Return to previous code (default case)
 
 ```bash
-git log --oneline -5                    # identifier le commit stable
-git checkout <commit_stable>            # ou: git revert <commit_fautif> puis push
+git log --oneline -5                    # identify the stable commit
+git checkout <stable_commit>            # or: git revert <faulty_commit> then push
 docker compose up --build -d
 docker compose logs -f bot
 ```
 
-Rejouer ensuite les vérifications §2 étape 4.
+Then re-run the §2 step 4 verifications.
 
-- **Incident détecté après merge** : préférer `git revert <commit_fautif>`
-  (l'historique reste linéaire et poussable, aucun force-push — interdit).
-- **Incident en cours, besoin d'un retour immédiat** : `git checkout
-  <commit_stable>` sur la VM (état détaché), puis régulariser par un `revert`
-  sur `main` à froid.
-- **Image précédente encore présente** : `docker image ls | grep undelete`
-  puis relancer le tag antérieur si le rebuild est trop lent. Ne pas
-  supprimer d'images pendant un incident.
+- **Incident detected after merge**: prefer `git revert <faulty_commit>`
+  (history stays linear and pushable, no force-push — forbidden).
+- **Incident in progress, immediate return needed**: `git checkout
+  <stable_commit>` on the VM (detached state), then regularize with a `revert`
+  on `main` when things are calm.
+- **Previous image still present**: `docker image ls | grep undelete` then
+  relaunch the earlier tag if the rebuild is too slow. Do not delete images
+  during an incident.
 
-### 3.2 Quand NE PAS rollbacker la base
+### 3.2 When NOT to roll back the database
 
-Dans **la grande majorité des cas, on ne restaure pas la base**. Les
-migrations de ce projet sont additives (`CREATE TABLE`, `ADD COLUMN`,
-contraintes) : une version antérieure du bot tourne sans problème sur un
-schéma plus récent — les colonnes en trop sont simplement ignorées.
+In **the vast majority of cases, we do not restore the database**. The
+migrations in this project are additive (`CREATE TABLE`, `ADD COLUMN`,
+constraints): an earlier version of the bot runs fine on a newer schema — the
+extra columns are simply ignored.
 
-Restaurer la base ferait alors **perdre tous les messages capturés depuis le
-dump**, c'est-à-dire exactement ce que le produit est censé protéger. Ne pas
-restaurer si :
+Restoring the database would then **lose every message captured since the
+dump**, i.e. exactly what the product is supposed to protect. Do not restore
+if:
 
-- la migration était additive (aucun `DROP` / `TRUNCATE` / perte de type) ;
-- le bug est côté code, pas côté données ;
-- l'incident est une indisponibilité (bot en boucle de crash) : le §3.1 suffit.
+- the migration was additive (no `DROP` / `TRUNCATE` / type loss);
+- the bug is on the code side, not the data side;
+- the incident is an unavailability (bot in a crash loop): §3.1 is enough.
 
-### 3.3 Restauration de la base (dernier recours)
+### 3.3 Database restoration (last resort)
 
-**Uniquement si** une migration destructive a supprimé ou converti des
-données, ou si la base est corrompue.
+**Only if** a destructive migration deleted or converted data, or if the
+database is corrupted.
 
-> ⛔ **Interdit sans confirmation explicite de Louis.** Une restauration
-> écrase l'état courant et perd toute donnée postérieure au dump.
+> ⛔ **Forbidden without explicit confirmation from Louis.** A restoration
+> overwrites the current state and loses any data after the dump.
 
-Procédure détaillée : **`docs/backup-restore.md` et `make test-restore`**
-*(après #7)* — ce sont les références à suivre, y compris pour valider le
-dump **avant** de l'appliquer.
+Detailed procedure: **`docs/backup-restore.md` and `make test-restore`**
+*(after #7)* — these are the references to follow, including to validate the
+dump **before** applying it.
 
-Ordre imposé, quel que soit le chemin :
+Imposed order, whatever the path:
 
-1. Arrêter le bot seul, laisser Postgres debout :
-   `docker compose stop bot` (jamais `down -v`).
-2. Prendre un dump de l'état **actuel**, même dégradé
-   (`docker compose exec -T -e BACKUP_DIR=/backups backup sh /scripts/backup.sh`) : il permet de
-   revenir en arrière si la restauration se passe mal.
-3. Restaurer le dump choisi dans une base **de vérification** d'abord, jamais
-   directement en production (c'est ce qu'automatise `make test-restore`).
-4. Confirmation explicite de Louis, puis restauration en production.
-5. Redémarrer le bot (`docker compose up -d bot`) et rejouer les
-   vérifications §2 étape 4, test synthétique compris.
+1. Stop the bot only, keep Postgres running:
+   `docker compose stop bot` (never `down -v`).
+2. Take a dump of the **current** state, even degraded
+   (`docker compose exec -T -e BACKUP_DIR=/backups backup sh /scripts/backup.sh`): it lets you
+   go back if the restoration goes badly.
+3. Restore the chosen dump into a **verification** database first, never
+   directly into production (this is what `make test-restore` automates).
+4. Explicit confirmation from Louis, then restoration in production.
+5. Restart the bot (`docker compose up -d bot`) and re-run the
+   §2 step 4 verifications, synthetic test included.
 
 ---
 
-## 4. Rotation des secrets
+## 4. Secret rotation
 
-Aucune rotation ne nécessite de supprimer un volume. **`docker compose down -v`
-et `docker volume rm/prune` restent interdits (§0).**
+No rotation requires deleting a volume. **`docker compose down -v`
+and `docker volume rm/prune` remain forbidden (§0).**
 
-### 4.1 Jeton Telegram (`TELEGRAM_BOT_TOKEN`)
+### 4.1 Telegram token (`TELEGRAM_BOT_TOKEN`)
 
-1. **Révoquer/régénérer** via [@BotFather](https://t.me/BotFather) :
-   `/mybots` → le bot → *API Token* → *Revoke current token*. L'ancien jeton
-   cesse de fonctionner **immédiatement** : à partir de cet instant le bot ne
-   reçoit plus rien. Rotation à faire dans une fenêtre courte et assumée.
-2. Mettre à jour `.env` (`TELEGRAM_BOT_TOKEN=`), garder `chmod 600 .env`.
-3. Valider le nouveau jeton **avant** de redéployer :
-   `sh scripts/preflight.sh` (le check `getMe` doit être `[ OK ]`, et le jeton
-   n'apparaît dans aucune sortie).
-4. Propager : `docker compose up -d bot` (recréation du conteneur — une simple
-   `restart` ne relit pas `.env`).
-5. Vérifier `"msg":"démarrage du poller"` dans les logs, puis refaire le test
-   synthétique §2 étape 4 c.
-6. Vérifier que Business Mode est toujours actif et la connexion Business
-   toujours en place côté compte titulaire (README, étapes 2 et 3).
+1. **Revoke/regenerate** via [@BotFather](https://t.me/BotFather):
+   `/mybots` → the bot → *API Token* → *Revoke current token*. The old token
+   stops working **immediately**: from that moment the bot receives nothing.
+   Do the rotation in a short, accepted window.
+2. Update `.env` (`TELEGRAM_BOT_TOKEN=`), keep `chmod 600 .env`.
+3. Validate the new token **before** redeploying:
+   `sh scripts/preflight.sh` (the `getMe` check must be `[ OK ]`, and the token
+   does not appear in any output).
+4. Propagate: `docker compose up -d bot` (container recreation — a plain
+   `restart` does not re-read `.env`).
+5. Verify `"msg":"poller starting"` in the logs, then redo the synthetic
+   test §2 step 4 c.
+6. Verify that Business Mode is still active and the Business connection
+   still in place on the account holder's side (README, steps 2 and 3).
 
-### 4.2 Mot de passe du rôle applicatif (`APP_DB_PASSWORD`)
+### 4.2 Application role password (`APP_DB_PASSWORD`)
 
-Ordre conçu pour **ne jamais se verrouiller dehors** : on change le mot de
-passe côté serveur avec le rôle propriétaire (toujours joignable), puis on
-aligne le DSN.
+Order designed to **never lock ourselves out**: change the password
+server-side with the owner role (always reachable), then align the DSN.
 
 ```bash
-# 1. Rotation côté Postgres, avec le rôle propriétaire.
-#    Saisir le nouveau mot de passe via \password : il n'apparaît ni dans
-#    l'historique shell ni dans les logs Postgres (contrairement à un
-#    ALTER ROLE ... PASSWORD '...' en clair).
+# 1. Rotation on the Postgres side, with the owner role.
+#    Enter the new password via \password: it appears neither in the
+#    shell history nor in the Postgres logs (unlike a plaintext
+#    ALTER ROLE ... PASSWORD '...').
 docker compose exec postgres \
   sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "\password undelete_app"'
 ```
 
-Pas de `-T` ici : `\password` est une méta-commande `psql` qui demande la
-saisie, elle a besoin d'un TTY.
+No `-T` here: `\password` is a `psql` meta-command that prompts for input, it
+needs a TTY.
 
-2. Mettre à jour `.env` : `APP_DB_PASSWORD` **et** le mot de passe embarqué
-   dans `DATABASE_URL` (les deux, sinon le bot ne se connecte plus).
-3. `sh scripts/preflight.sh` (DSN toujours distincts, variables présentes).
-4. `docker compose up -d bot`, puis vérifier l'absence d'erreur de connexion
-   dans les logs et le test synthétique §2 étape 4 c.
+2. Update `.env`: `APP_DB_PASSWORD` **and** the password embedded in
+   `DATABASE_URL` (both, otherwise the bot no longer connects).
+3. `sh scripts/preflight.sh` (DSNs still distinct, variables present).
+4. `docker compose up -d bot`, then verify the absence of connection error
+   in the logs and the synthetic test §2 step 4 c.
 
-Le bot en cours d'exécution garde ses connexions ouvertes jusqu'à sa
-recréation : la fenêtre d'indisponibilité se limite au redémarrage.
-`db/init/01-app-role.sh` n'est **pas** rejoué (volume déjà initialisé) — la
-rotation est purement un `ALTER ROLE`, pas une réinitialisation.
+The running bot keeps its open connections until it is recreated: the
+unavailability window is limited to the restart.
+`db/init/01-app-role.sh` is **not** replayed (volume already initialized) —
+the rotation is purely an `ALTER ROLE`, not a reset.
 
-### 4.3 Mot de passe du rôle propriétaire (`POSTGRES_PASSWORD`)
+### 4.3 Owner role password (`POSTGRES_PASSWORD`)
 
-Même logique, un cran plus délicat : ce rôle joue les migrations et les
-backups.
+Same logic, one notch more delicate: this role runs migrations and backups.
 
 1. `docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d
-   "$POSTGRES_DB" -c "\password $POSTGRES_USER"'` (sans `-T`, `\password`
-   demande la saisie).
-2. Mettre à jour `.env` : `POSTGRES_PASSWORD` **et** le mot de passe dans
+   "$POSTGRES_DB" -c "\password $POSTGRES_USER"'` (without `-T`, `\password`
+   prompts for input).
+2. Update `.env`: `POSTGRES_PASSWORD` **and** the password in
    `MIGRATION_DATABASE_URL`.
-3. `docker compose up -d bot backup` (le service `backup` utilise aussi
-   `MIGRATION_DATABASE_URL` : oublier de le recréer casserait silencieusement
-   les sauvegardes du lendemain).
-4. Contrôle immédiat : `docker compose exec -T -e BACKUP_DIR=/backups backup sh /scripts/backup.sh`
-   doit produire une nouvelle archive.
+3. `docker compose up -d bot backup` (the `backup` service also uses
+   `MIGRATION_DATABASE_URL`: forgetting to recreate it would silently break
+   the next day's backups).
+4. Immediate check: `docker compose exec -T -e BACKUP_DIR=/backups backup sh /scripts/backup.sh`
+   must produce a new archive.
 
-> `POSTGRES_PASSWORD` dans le compose ne sert qu'à l'**initialisation** du
-> volume. Le modifier dans `.env` ne change rien côté serveur sur un volume
-> existant : le `ALTER ROLE` de l'étape 1 est la seule opération qui compte.
-> Ne jamais « régler » une désynchronisation en recréant le volume (§0).
+> `POSTGRES_PASSWORD` in the compose only serves the **initialization** of the
+> volume. Modifying it in `.env` changes nothing server-side on an existing
+> volume: the `ALTER ROLE` of step 1 is the only operation that matters.
+> Never "fix" a desynchronization by recreating the volume (§0).
 
-### 4.4 Après toute rotation
+### 4.4 After any rotation
 
-- [ ] `git status` : `.env` non suivi (il est dans `.gitignore`), aucun secret
-      dans le diff.
-- [ ] Ancien secret révoqué côté émetteur (BotFather), pas seulement remplacé
-      dans `.env`.
-- [ ] Sondes/logs verts et test synthétique repassé.
+- [ ] `git status`: `.env` untracked (it is in `.gitignore`), no secret in
+      the diff.
+- [ ] Old secret revoked on the issuer side (BotFather), not just replaced
+      in `.env`.
+- [ ] Probes/logs green and synthetic test passed again.
 
 ---
 
-## 5. Recette staging
+## 5. Staging recipe
 
-Il n'y a pas d'environnement de staging permanent. La recette s'appuie sur
-l'infrastructure de test déjà présente, qui crée ses propres conteneurs
-**éphémères** et ne touche à aucune ressource Docker existante.
+There is no permanent staging environment. The recipe relies on the existing
+test infrastructure, which creates its own **ephemeral** containers and does
+not touch any existing Docker resource.
 
-### 5.1 Avant chaque déploiement
+### 5.1 Before each deployment
 
 ```bash
 make check              # build + go vet + gofmt
-make test-integration   # Postgres 16 jetable : migrations, RLS, isolation, outbox
+make test-integration   # throwaway Postgres 16: migrations, RLS, isolation, outbox
 ```
 
-`scripts/test-integration.sh` démarre un conteneur PostgreSQL 16 sans volume
-et ne supprime que ce conteneur. Il refuse de travailler sur une base dont le
-nom n'est pas exactement `undelete_integration` et exige l'opt-in destructif
-littéral en mode externe (README) — deux garde-fous à ne jamais contourner
-pour « tester plus vite » sur la base de prod.
+`scripts/test-integration.sh` starts a PostgreSQL 16 container without a
+volume and deletes only that container. It refuses to work on a database whose
+name is not exactly `undelete_integration` and requires the literal
+destructive opt-in in external mode (README) — two guardrails never to bypass
+to "test faster" on the production database.
 
-### 5.2 Recette périodique
+### 5.2 Periodic recipe
 
 ```bash
-sh scripts/preflight.sh   # dérive de configuration, disque, validité du jeton
-make test-restore         # (après #7) restauration d'un dump réel vers une base jetable
+sh scripts/preflight.sh   # configuration drift, disk, token validity
+make test-restore         # (after #7) restoration of a real dump into a throwable database
 ```
 
-Un backup qui n'a jamais été restauré n'est pas un backup. `make test-restore`
-est la vérification qui transforme `./backups` en filet de sécurité réel.
+A backup that has never been restored is not a backup. `make test-restore`
+is the check that turns `./backups` into a real safety net.
 
-**Cron homelab suggéré** (utilisateur non-root propriétaire du dépôt) :
+**Suggested homelab cron** (non-root user owning the repository):
 
 ```cron
-# Préflight quotidien : dérive de config, disque, jeton toujours valide.
+# Daily preflight: config drift, disk, token still valid.
 15 6 * * *  cd /srv/undelete && sh scripts/preflight.sh >> /var/log/undelete-preflight.log 2>&1
 
-# Recette hebdomadaire : suite d'intégration + restauration d'un dump réel.
-30 3 * * 0  cd /srv/undelete && make test-integration >> /var/log/undelete-recette.log 2>&1
-45 3 * * 0  cd /srv/undelete && make test-restore     >> /var/log/undelete-recette.log 2>&1
+# Weekly recipe: integration suite + restoration of a real dump.
+30 3 * * 0  cd /srv/undelete && make test-integration >> /var/log/undelete-recipe.log 2>&1
+45 3 * * 0  cd /srv/undelete && make test-restore     >> /var/log/undelete-recipe.log 2>&1
 ```
 
-Sur NixOS, l'équivalent déclaratif (`services.cron.systemCronJobs` ou un
-`systemd.timers`) est préférable à un `crontab -e` manuel. Adapter le chemin
-`/srv/undelete` à l'emplacement réel du dépôt sur la VM.
+On NixOS, the declarative equivalent (`services.cron.systemCronJobs` or a
+`systemd.timers`) is preferable to a manual `crontab -e`. Adapt the `/srv/undelete`
+path to the actual location of the repository on the VM.
 
 ---
 
-## Aide-mémoire
+## Cheat sheet
 
-| Besoin | Commande |
+| Need | Command |
 |---|---|
-| Préflight | `sh scripts/preflight.sh` |
-| Backup immédiat | `docker compose exec -T -e BACKUP_DIR=/backups backup sh /scripts/backup.sh` |
-| Déployer / mettre à jour | `make up` (`docker compose up --build -d`) |
+| Preflight | `sh scripts/preflight.sh` |
+| Immediate backup | `docker compose exec -T -e BACKUP_DIR=/backups backup sh /scripts/backup.sh` |
+| Deploy / update | `make up` (`docker compose up --build -d`) |
 | Logs | `make logs` (`docker compose logs -f bot`) |
-| État des services | `docker compose ps` |
-| Arrêter (volume préservé) | `make down` (`docker compose down`, **sans `-v`**) |
+| Service state | `docker compose ps` |
+| Stop (volume preserved) | `make down` (`docker compose down`, **without `-v`**) |
 | Build + lint | `make check` |
-| Tests d'intégration | `make test-integration` |
-| Recette de restauration | `make test-restore` *(après #7)* |
-| Sondes | `curl -fsS localhost:9090/{livez,readyz,metrics}` *(après #6)* |
+| Integration tests | `make test-integration` |
+| Restore recipe | `make test-restore` *(after #7)* |
+| Probes | `curl -fsS localhost:9090/{livez,readyz,metrics}` *(after #6)* |

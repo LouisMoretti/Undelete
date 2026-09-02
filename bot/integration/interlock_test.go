@@ -1,12 +1,11 @@
-// Ce fichier n'est PAS sous le tag `integration` : les garde-fous qu'il
-// contient sont de la logique pure (pas de Docker, pas de PostgreSQL) et
-// doivent être exercés par un simple `go test ./...`. Ce sont eux qui
-// empêchent la suite destructive de s'exécuter sur une base de production ;
-// les laisser sous un tag revenait à ne les vérifier que dans le cas où on
-// accepte déjà de tout effacer.
+// This file is NOT under the `integration` tag: the guards it contains are
+// pure logic (no Docker, no PostgreSQL) and must be exercised by a plain
+// `go test ./...`. They are what prevents the destructive suite from running
+// against a production database; keeping them behind a tag would mean only
+// verifying them when you already accept wiping everything.
 //
-// Les helpers eux-mêmes vivent ici et sont utilisés par postgres_test.go, qui
-// reste sous le tag `integration` puisqu'il lui faut une vraie base.
+// The helpers themselves live here and are used by postgres_test.go, which
+// stays under the `integration` tag since it needs a real database.
 
 package integration_test
 
@@ -35,12 +34,12 @@ func validateDestructiveInterlock(optIn, databaseName string) error {
 	return nil
 }
 
-// replaceDSNUser rejoue un DSN avec d'autres identifiants. Le parsing passe
-// par net/url : un découpage textuel sur "@" se trompe de séparateur dès
-// qu'un mot de passe en contient un (cas légal et fréquent avec des mots de
-// passe générés), et produit alors un DSN vers un hôte inexistant — le test
-// appelant conclurait à un rejet du rôle alors qu'il n'a jamais atteint le
-// serveur.
+// replaceDSNUser replays a DSN with different credentials. Parsing goes
+// through net/url: a textual split on "@" picks the wrong separator as soon
+// as a password contains one (a legal and common case with generated
+// passwords), and would then produce a DSN pointing at a nonexistent host —
+// the calling test would conclude the role was rejected when it never
+// reached the server.
 func replaceDSNUser(dsn, user, password string) (string, error) {
 	parsed, err := url.Parse(dsn)
 	if err != nil {
@@ -90,12 +89,12 @@ func TestReplaceDSNUserRewritesCredentialsAndKeepsTarget(t *testing.T) {
 			password: "integration-only",
 		},
 		{
-			// Le cas qui cassait le découpage textuel : en scindant sur TOUS
-			// les "@", l'ancienne version recollait la fin du mot de passe
-			// d'origine ("ss") au nouveau mot de passe. Le DSN visait le bon
-			// hôte mais s'authentifiait avec "integration-only@ss" — le pool
-			// échouait sur un refus d'authentification, jamais sur le contrôle
-			// de rôle que le test prétend vérifier.
+			// The case that broke the textual split: by splitting on ALL "@"
+			// characters, the old version glued the end of the original
+			// password ("ss") onto the new password. The DSN targeted the
+			// right host but authenticated with "integration-only@ss" — the
+			// pool failed on an authentication refusal, never on the role
+			// check the test claims to verify.
 			name:     "literal at sign in the original password",
 			dsn:      "postgres://undelete_app:p@ss@127.0.0.1:5432/undelete_integration?sslmode=disable",
 			user:     "integration_bypass_role",
@@ -108,8 +107,8 @@ func TestReplaceDSNUserRewritesCredentialsAndKeepsTarget(t *testing.T) {
 			password: "integration-only",
 		},
 		{
-			// Symétrique : le nouveau mot de passe doit être ré-encodé pour
-			// que le DSN produit reste relisible tel quel par pgx.
+			// Symmetric: the new password must be re-encoded so the produced
+			// DSN stays readable as-is by pgx.
 			name:     "at sign in the replacement password",
 			dsn:      "postgres://undelete_app:runtime@db.internal:5432/undelete_integration",
 			user:     "integration_wrong_role",
@@ -122,8 +121,9 @@ func TestReplaceDSNUserRewritesCredentialsAndKeepsTarget(t *testing.T) {
 			if err != nil {
 				t.Fatalf("replaceDSNUser: %v", err)
 			}
-			// On vérifie la sémantique du DSN produit, pas sa forme : hôte,
-			// base et options inchangés, identifiants exactement ceux demandés.
+			// We verify the semantics of the produced DSN, not its shape:
+			// host, database and options unchanged, credentials exactly the
+			// requested ones.
 			parsed, err := url.Parse(got)
 			if err != nil {
 				t.Fatalf("parse rewritten DSN %q: %v", got, err)

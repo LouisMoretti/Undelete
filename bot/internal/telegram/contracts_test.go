@@ -1,8 +1,8 @@
-// Ce fichier est en package telegram_test (test externe) et non en package
-// telegram : il importe telegramtest, qui importe lui-même telegram. Le test
-// externe est ce qui rend cette dépendance légale, et il garantit au passage
-// que les contrats sont vérifiés via l'API publique du package, comme le font
-// app et business.
+// This file is in package telegram_test (external test), not in package
+// telegram: it imports telegramtest, which itself imports telegram. The
+// external test is what makes this dependency legal, and it also guarantees
+// that the contracts are verified via the package's public API, as app and
+// business do.
 package telegram_test
 
 import (
@@ -30,24 +30,24 @@ func TestGetUpdatesBotAPIContract(t *testing.T) {
 		t.Fatalf("GetUpdates(): %v", err)
 	}
 	if len(updates) != 4 {
-		t.Fatalf("nombre d'updates = %d, attendu 4", len(updates))
+		t.Fatalf("number of updates = %d, want 4", len(updates))
 	}
 
 	connection := updates[0].BusinessConnection
 	if connection == nil || connection.UserChatID != 700002 || !connection.CanReply() {
-		t.Fatalf("business_connection mal décodée: %#v", connection)
+		t.Fatalf("business_connection malformed: %#v", connection)
 	}
 	message := updates[1].BusinessMessage
-	if message == nil || message.From == nil || message.Text != "Bonjour, café ☕ — déjà vu ?" {
-		t.Fatalf("business_message mal décodé: %#v", message)
+	if message == nil || message.From == nil || message.Text != "Hello, coffee ☕ — seen before?" {
+		t.Fatalf("business_message malformed: %#v", message)
 	}
 	edited := updates[2].EditedBusinessMessage
-	if edited == nil || edited.From != nil || edited.Text != "Texte corrigé 🧪" {
-		t.Fatalf("edited_business_message sans from mal décodé: %#v", edited)
+	if edited == nil || edited.From != nil || edited.Text != "Corrected text 🧪" {
+		t.Fatalf("edited_business_message without from malformed: %#v", edited)
 	}
 	deleted := updates[3].DeletedBusinessMessages
 	if deleted == nil || !reflect.DeepEqual(deleted.MessageIDs, []int64{501, 502, 503}) {
-		t.Fatalf("suppression groupée mal décodée: %#v", deleted)
+		t.Fatalf("bulk deletion malformed: %#v", deleted)
 	}
 }
 
@@ -62,19 +62,19 @@ func TestGetBusinessConnectionBotAPIContract(t *testing.T) {
 		t.Fatalf("GetBusinessConnection(): %v", err)
 	}
 	if connection.ID != "bc_fixture_001" || connection.UserChatID != 700002 || !connection.CanReply() {
-		t.Fatalf("connexion mal décodée: %#v", connection)
+		t.Fatalf("connection malformed: %#v", connection)
 	}
 	if connection.User.LastName != "" || connection.User.Username != "" {
-		t.Fatalf("champs utilisateur optionnels inattendus: %#v", connection.User)
+		t.Fatalf("unexpected optional user fields: %#v", connection.User)
 	}
 }
 
-// TestGetBusinessConnectionLegacyCanReplyContract fige au filaire le chemin
-// legacy de BusinessConnection : `can_reply` posé directement sur la connexion,
-// sans bloc `rights`. Ce chemin n'était jusqu'ici exercé qu'en process (à
-// partir d'une structure Go construite à la main) ; la fixture prouve qu'une
-// réponse Bot API réellement formée ainsi est décodée comme « peut répondre »
-// et non silencieusement comme false.
+// TestGetBusinessConnectionLegacyCanReplyContract pins down the legacy
+// BusinessConnection wire path: `can_reply` set directly on the connection,
+// without a `rights` block. Until now this path was only exercised in-process
+// (from a hand-built Go struct); the fixture proves that a Bot API response
+// actually shaped this way is decoded as "can reply" and not silently as
+// false.
 func TestGetBusinessConnectionLegacyCanReplyContract(t *testing.T) {
 	client := telegramtest.NewClient(t, telegramtest.Call{
 		Method:          "getBusinessConnection",
@@ -86,19 +86,19 @@ func TestGetBusinessConnectionLegacyCanReplyContract(t *testing.T) {
 		t.Fatalf("GetBusinessConnection(): %v", err)
 	}
 	if connection.Rights != nil {
-		t.Fatalf("la fixture legacy ne doit porter aucun bloc rights: %#v", connection.Rights)
+		t.Fatalf("the legacy fixture must not carry any rights block: %#v", connection.Rights)
 	}
 	if !connection.CanReplyLegacy || !connection.CanReply() {
-		t.Fatalf("can_reply legacy mal décodé: %#v", connection)
+		t.Fatalf("legacy can_reply malformed: %#v", connection)
 	}
 }
 
-// TestGetUpdatesFirstPollOffsetZeroContract fige la sérialisation du TOUT
-// premier poll : `offset` est `omitempty`, donc l'offset 0 n'apparaît pas dans
-// le corps émis. C'est le comportement attendu — Telegram traite l'absence
-// d'offset comme « depuis le plus ancien update non confirmé » — mais il n'est
-// figé nulle part ailleurs, alors qu'il conditionne le premier appel de chaque
-// démarrage du bot.
+// TestGetUpdatesFirstPollOffsetZeroContract pins down the serialization of
+// the VERY first poll: `offset` is `omitempty`, so offset 0 does not appear
+// in the emitted body. This is the expected behavior — Telegram treats the
+// absence of an offset as "from the oldest unacknowledged update" — but it
+// is pinned nowhere else, even though it governs the first call of every bot
+// startup.
 func TestGetUpdatesFirstPollOffsetZeroContract(t *testing.T) {
 	client := telegramtest.NewClient(t, telegramtest.Call{
 		Method:          "getUpdates",
@@ -110,29 +110,29 @@ func TestGetUpdatesFirstPollOffsetZeroContract(t *testing.T) {
 		t.Fatalf("GetUpdates(): %v", err)
 	}
 	if len(updates) != 0 {
-		t.Fatalf("nombre d'updates = %d, attendu 0", len(updates))
+		t.Fatalf("number of updates = %d, want 0", len(updates))
 	}
 
-	// Le corps a déjà été comparé octet par octet par le serveur de test ; on
-	// vérifie ici que c'est bien l'ABSENCE de la clé qui est figée, et non un
-	// "offset":0 qui aurait été recopié dans la fixture.
+	// The body has already been compared byte by byte by the test server;
+	// here we verify that it is indeed the ABSENCE of the key that is pinned,
+	// and not an "offset":0 that would have been copied into the fixture.
 	var body map[string]any
 	if err := json.Unmarshal(telegramtest.Fixture(t, "get-updates-first-poll-request.json"), &body); err != nil {
-		t.Fatalf("décodage fixture premier poll: %v", err)
+		t.Fatalf("decoding first-poll fixture: %v", err)
 	}
 	if _, ok := body["offset"]; ok {
-		t.Fatalf("la fixture du premier poll sérialise offset: %v", body["offset"])
+		t.Fatalf("the first-poll fixture serializes offset: %v", body["offset"])
 	}
 }
 
-// TestSendMessageRetryAfterContract fige la requête RÉÉMISE après une
-// enveloppe 429 : le client doit respecter retry_after puis repartir avec des
-// octets strictement identiques. L'enveloppe elle-même n'était couverte qu'en
-// process ; le mécanisme octet par octet vérifie en plus qu'aucun paramètre
-// n'est ajouté ni perdu à la seconde tentative.
+// TestSendMessageRetryAfterContract pins the RESENT request after a 429
+// envelope: the client must respect retry_after then resend strictly
+// identical bytes. The envelope itself was only covered in-process; the
+// byte-by-byte mechanism additionally verifies that no parameter is added or
+// lost on the second attempt.
 //
-// retry_after vaut 1 seconde dans la fixture : suffisant pour exercer
-// l'attente réelle de SendMessage sans allonger la suite de tests.
+// retry_after is 1 second in the fixture: enough to exercise SendMessage's
+// real wait without lengthening the test suite.
 func TestSendMessageRetryAfterContract(t *testing.T) {
 	const fixture = "send-message-welcome-request.json"
 	client := telegramtest.NewClient(t,
@@ -153,13 +153,13 @@ func TestSendMessageRetryAfterContract(t *testing.T) {
 		t.Fatalf("SendMessage(): %v", err)
 	}
 	if elapsed := time.Since(start); elapsed < time.Second {
-		t.Fatalf("retry_after non respecté: réémission après %s, attendu >= 1s", elapsed)
+		t.Fatalf("retry_after not respected: resent after %s, want >= 1s", elapsed)
 	}
 }
 
-// TestRateLimitedEnvelopeIsDecodedAsAPIError fige la lecture de l'enveloppe 429
-// elle-même : code et retry_after doivent remonter dans *telegram.APIError,
-// seule voie par laquelle le poller et SendMessage savent combien attendre.
+// TestRateLimitedEnvelopeIsDecodedAsAPIError pins reading the 429 envelope
+// itself: code and retry_after must surface in *telegram.APIError, the only
+// way the poller and SendMessage know how long to wait.
 func TestRateLimitedEnvelopeIsDecodedAsAPIError(t *testing.T) {
 	client := telegramtest.NewClient(t, telegramtest.Call{
 		Method:          "sendMessage",
@@ -170,30 +170,30 @@ func TestRateLimitedEnvelopeIsDecodedAsAPIError(t *testing.T) {
 	err := client.SendMessageOnce(context.Background(), telegram.BuildWelcomeMessageRequest(700002, 700001))
 	var apiErr *telegram.APIError
 	if !errors.As(err, &apiErr) {
-		t.Fatalf("SendMessageOnce() = %v, attendu *telegram.APIError", err)
+		t.Fatalf("SendMessageOnce() = %v, want *telegram.APIError", err)
 	}
 	if apiErr.Code != http.StatusTooManyRequests || apiErr.RetryAfter != 1 || !apiErr.IsRateLimited() {
-		t.Fatalf("enveloppe 429 mal décodée: %#v", apiErr)
+		t.Fatalf("429 envelope malformed: %#v", apiErr)
 	}
 }
 
-// TestSendMessageRequestNeverSerializesBusinessConnectionID matérialise la
-// contrainte n°7 sans jamais nommer un champ Go : le type est inspecté par ses
-// tags JSON (récursivement, champs embarqués inclus) puis par la charge utile
-// qu'il produit réellement. Le test reste donc valide si SendMessageRequest
-// gagne, perd ou renomme des champs.
+// TestSendMessageRequestNeverSerializesBusinessConnectionID materializes
+// constraint 7 without ever naming a Go field: the type is inspected through
+// its JSON tags (recursively, embedded fields included) then through the
+// payload it actually produces. The test thus stays valid if
+// SendMessageRequest gains, loses, or renames fields.
 func TestSendMessageRequestNeverSerializesBusinessConnectionID(t *testing.T) {
 	assertNoBusinessConnectionIDTag(t, reflect.TypeOf(telegram.SendMessageRequest{}), "SendMessageRequest")
 
-	payload, err := json.Marshal(telegram.SendMessageRequest{ChatID: 700001, Text: "charge utile de contrôle"})
+	payload, err := json.Marshal(telegram.SendMessageRequest{ChatID: 700001, Text: "control payload"})
 	if err != nil {
-		t.Fatalf("sérialisation SendMessageRequest: %v", err)
+		t.Fatalf("serializing SendMessageRequest: %v", err)
 	}
 	telegramtest.AssertNoBusinessConnectionID(t, payload)
 }
 
-// fixtureSenderID matérialise un from_user_id renseigné (la colonne est
-// NULLable, d'où le pointeur).
+// fixtureSenderID materializes a populated from_user_id (the column is
+// NULLable, hence the pointer).
 func fixtureSenderID() *int64 {
 	id := int64(800001)
 	return &id
@@ -210,7 +210,7 @@ func assertNoBusinessConnectionIDTag(t *testing.T, typ reflect.Type, path string
 	for i := 0; i < typ.NumField(); i++ {
 		field := typ.Field(i)
 		if !field.IsExported() {
-			continue // non sérialisé par encoding/json
+			continue // not serialized by encoding/json
 		}
 		name := strings.Split(field.Tag.Get("json"), ",")[0]
 		if name == "-" {
@@ -220,25 +220,25 @@ func assertNoBusinessConnectionIDTag(t *testing.T, typ reflect.Type, path string
 			name = field.Name
 		}
 		if name == "business_connection_id" {
-			t.Fatalf("%s.%s sérialise business_connection_id", path, field.Name)
+			t.Fatalf("%s.%s serializes business_connection_id", path, field.Name)
 		}
-		// Un champ embarqué remonte ses propres clés au niveau parent : ses
-		// tags comptent donc autant que ceux du type lui-même.
+		// An embedded field hoists its own keys to the parent level: its tags
+		// therefore count as much as those of the type itself.
 		if field.Anonymous {
 			assertNoBusinessConnectionIDTag(t, field.Type, path+"."+field.Name)
 		}
 	}
 }
 
-// TestSendMessageAlertContracts fige les deux charges utiles d'alerte telles
-// que construites par les builders de production, octet par octet.
+// TestSendMessageAlertContracts pins both alert payloads exactly as built by
+// the production builders, byte by byte.
 //
-// Les chemins d'appel qui alimentent ces builders en production sont couverts
-// à leur propre niveau, faute de quoi ce test ne prouverait rien sur ce que le
-// bot envoie vraiment : business.TestWelcomeAlertContract (bienvenue) et, pour
-// la suppression, messages.Repository.MarkDeleted -- qui écrit ces mêmes
-// chunks en outbox -- vérifié par la suite d'intégration PostgreSQL
-// (« chat labels are tenant isolated and reach the alert »).
+// The call paths that feed these builders in production are covered at their
+// own level, otherwise this test would prove nothing about what the bot
+// really sends: business.TestWelcomeAlertContract (welcome) and, for
+// deletion, messages.Repository.MarkDeleted -- which writes these same
+// chunks to the outbox -- verified by the PostgreSQL integration suite
+// ("chat labels are tenant isolated and reach the alert").
 func TestSendMessageAlertContracts(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -253,9 +253,9 @@ func TestSendMessageAlertContracts(t *testing.T) {
 		{
 			name:    "deletion",
 			fixture: "send-message-deletion-request.json",
-			// Même scénario que l'update business_message de
-			// get-updates-response.json, vu depuis la suppression : chat privé
-			// « Anaïs » (800001), expéditeur homonyme, date d'envoi du message.
+			// Same scenario as the business_message update in
+			// get-updates-response.json, seen from the deletion side: private
+			// chat "Anaïs" (800001), namesake sender, message send date.
 			requests: telegram.BuildDeletionMessageRequests(telegram.DeletionAlert{
 				OwnerTelegramUserID: 700001,
 				ChatID:              800001,
@@ -264,7 +264,7 @@ func TestSendMessageAlertContracts(t *testing.T) {
 				FromUserID:          fixtureSenderID(),
 				MessageType:         "text",
 				TelegramDate:        1788019201,
-				Content:             "Bonjour, café ☕ — déjà vu ?",
+				Content:             "Hello, coffee ☕ — seen before?",
 			}),
 		},
 	}
@@ -272,7 +272,7 @@ func TestSendMessageAlertContracts(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if len(tt.requests) != 1 {
-				t.Fatalf("nombre de requêtes = %d, attendu 1 pour cette fixture", len(tt.requests))
+				t.Fatalf("number of requests = %d, want 1 for this fixture", len(tt.requests))
 			}
 			client := telegramtest.NewClient(t, telegramtest.Call{
 				Method:          "sendMessage",
@@ -287,18 +287,18 @@ func TestSendMessageAlertContracts(t *testing.T) {
 	}
 }
 
-// TestWelcomeMessageTextIsTheProductionText verrouille le texte de bienvenue
-// figé dans la fixture sur celui que produit le builder de production : la
-// fixture ne peut pas dériver vers un texte « de test ».
+// TestWelcomeMessageTextIsTheProductionText locks the welcome text pinned in
+// the fixture to the one produced by the production builder: the fixture
+// cannot drift toward a "test" text.
 func TestWelcomeMessageTextIsTheProductionText(t *testing.T) {
 	var fixture struct {
 		ChatID int64  `json:"chat_id"`
 		Text   string `json:"text"`
 	}
 	if err := json.Unmarshal(telegramtest.Fixture(t, "send-message-welcome-request.json"), &fixture); err != nil {
-		t.Fatalf("décodage fixture bienvenue: %v", err)
+		t.Fatalf("decoding welcome fixture: %v", err)
 	}
 	if got := telegram.BuildWelcomeMessageRequest(700002, 700001).Text; got != fixture.Text {
-		t.Fatalf("texte de bienvenue de production = %q, fixture = %q", got, fixture.Text)
+		t.Fatalf("production welcome text = %q, fixture = %q", got, fixture.Text)
 	}
 }

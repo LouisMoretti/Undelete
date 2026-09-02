@@ -10,14 +10,14 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram/telegramtest"
 )
 
-// TestWelcomeAlertContract exerce le chemin de production de l'alerte de
-// bienvenue -- pas une SendMessageRequest reconstruite par le test -- et
-// compare la requête HTTP émise à la fixture, octet par octet.
+// TestWelcomeAlertContract exercises the production path of the welcome
+// alert -- not a SendMessageRequest rebuilt by the test -- and compares the
+// HTTP request emitted against the fixture, byte by byte.
 //
-// Ce qui n'est vérifiable qu'ici, et pas depuis le package telegram : que
-// Service passe bien user_chat_id (700002) et non user.id (700001) comme
-// chat_id, et que la charge utile n'emporte aucun business_connection_id
-// alors même que la connexion en fournit un (contrainte n°7).
+// What is only verifiable here, and not from the telegram package: that
+// Service passes user_chat_id (700002) and not user.id (700001) as chat_id,
+// and that the payload carries no business_connection_id even though the
+// connection provides one (constraint #7).
 func TestWelcomeAlertContract(t *testing.T) {
 	client := telegramtest.NewClient(t, telegramtest.Call{
 		Method:          "sendMessage",
@@ -38,11 +38,11 @@ func TestWelcomeAlertContract(t *testing.T) {
 	})
 }
 
-// TestWelcomeAlertFallsBackToUserID couvre le repli défensif : sans
-// user_chat_id (anciennes réponses Telegram), le owner doit rester joignable
-// via user.id plutôt que de recevoir un sendMessage vers le chat 0.
+// TestWelcomeAlertFallsBackToUserID covers the defensive fallback: without
+// user_chat_id (older Telegram responses), the owner must remain reachable
+// via user.id rather than receiving a sendMessage to chat 0.
 func TestWelcomeAlertFallsBackToUserID(t *testing.T) {
 	if got := telegram.BuildWelcomeMessageRequest(0, 700001).ChatID; got != 700001 {
-		t.Fatalf("chat_id de repli = %d, attendu 700001", got)
+		t.Fatalf("fallback chat_id = %d, expected 700001", got)
 	}
 }

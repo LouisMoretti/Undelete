@@ -1,60 +1,60 @@
-# Fixtures Telegram Bot API
+# Telegram Bot API Fixtures
 
-Ces payloads **entièrement synthétiques** figent les contrats utilisés par le
-client HTTP minimal. Ils ne proviennent d'aucun compte, chat ou message réel et
-ne contiennent ni jeton, ni identifiant, ni contenu personnel réel.
+These **fully synthetic** payloads pin down the contracts used by the minimal
+HTTP client. They come from no real account, chat, or message and contain no
+token, identifier, or real personal content.
 
-Version vérifiée : **Telegram Bot API 10.3 (24 août 2026)**, d'après la
-[documentation officielle](https://core.telegram.org/bots/api) et son
+Verified version: **Telegram Bot API 10.3 (August 24, 2026)**, per the
+[official documentation](https://core.telegram.org/bots/api) and its
 [changelog](https://core.telegram.org/bots/api-changelog).
 
-Le répertoire versionné `bot-api-10.3` couvre les quatre types d'updates
-Business, `rights.can_reply`, `user_chat_id`, une suppression groupée, Unicode,
-les champs optionnels et l'absence autorisée de `from`. S'y ajoutent trois
-contrats de bord : le `can_reply` legacy (posé sur la connexion, sans bloc
-`rights`), l'enveloppe d'erreur `429` avec `parameters.retry_after`, et le tout
-premier `getUpdates`, dont l'`offset` 0 n'est pas sérialisé (`omitempty`).
+The versioned `bot-api-10.3` directory covers the four Business update types,
+`rights.can_reply`, `user_chat_id`, a bulk deletion, Unicode, optional fields,
+and the permitted absence of `from`. Three edge contracts are added: the
+legacy `can_reply` (set on the connection, without a `rights` block), the
+`429` error envelope with `parameters.retry_after`, and the very first
+`getUpdates`, whose `offset` 0 is not serialized (`omitempty`).
 
-## Convention de comparaison
+## Comparison convention
 
-Une seule, valable pour toutes les fixtures de requête : les octets bruts du
-corps HTTP sont comparés à ceux du fichier avec `bytes.Equal`. La **seule**
-normalisation appliquée est le retrait de l'unique `\n` terminal de stockage ;
-toute autre terminaison (absente, doublée, CRLF) fait échouer le test. Aucun
-espace ni aucune indentation n'est toléré ni nettoyé ailleurs — les fixtures de
-requête sont donc volontairement sur une seule ligne compacte, exactement comme
-`encoding/json` les produit.
+A single one, valid for all request fixtures: the raw bytes of the HTTP body
+are compared to those of the file with `bytes.Equal`. The **only**
+normalization applied is the removal of the single terminal storage `\n`; any
+other termination (absent, doubled, CRLF) fails the test. No space or
+indentation is tolerated or cleaned elsewhere — request fixtures are therefore
+deliberately on a single compact line, exactly as `encoding/json` produces
+them.
 
-Les helpers correspondants vivent dans le package
-[`telegramtest`](../telegramtest), à part du package `telegram` pour rester
-importables par les packages appelants.
+The corresponding helpers live in the
+[`telegramtest`](../telegramtest) package, apart from package `telegram` so
+they remain importable by the calling packages.
 
-## Qui exerce quoi
+## Who exercises what
 
-Les fixtures d'alerte ne sont pas comparées à des requêtes reconstruites par le
-test : ce sont les **chemins de production** qui les produisent.
+The alert fixtures are not compared to requests rebuilt by the test: it is the
+**production paths** that produce them.
 
-| Fixture | Exercée par |
+| Fixture | Exercised by |
 | --- | --- |
 | `get-updates-*.json` | `telegram.Client.GetUpdates` |
 | `get-business-connection-*.json` | `telegram.Client.GetBusinessConnection` |
-| `send-message-welcome-request.json` | `business.Service.notifyWelcome` (+ le builder, côté `telegram`) |
-| `send-message-deletion-request.json` | `telegram.BuildDeletionMessageRequests`, seul producteur du format (les chunks écrits en outbox par `messages.Repository.MarkDeleted` sortent de ce builder) |
-| `send-message-rate-limited-response.json` | `telegram.Client.SendMessage` (respect de `retry_after`) et `SendMessageOnce` |
+| `send-message-welcome-request.json` | `business.Service.notifyWelcome` (+ the builder, on the `telegram` side) |
+| `send-message-deletion-request.json` | `telegram.BuildDeletionMessageRequests`, sole producer of the format (the chunks written to the outbox by `messages.Repository.MarkDeleted` come out of this builder) |
+| `send-message-rate-limited-response.json` | `telegram.Client.SendMessage` (respect of `retry_after`) and `SendMessageOnce` |
 
-Toute évolution du format d'une alerte impose donc de **régénérer** la fixture
-correspondante depuis le builder de production (jamais de retouche à la main) :
-sérialiser la requête produite avec `encoding/json` et écrire le résultat suivi
-de l'unique newline LF de stockage. `send-message-deletion-request.json` a été
-régénérée ainsi lors du passage au format enrichi (chat, expéditeur, type,
-date). `send-message-welcome-request.json` est inchangée, le texte de bienvenue
-n'ayant pas bougé.
+Any change to an alert format therefore requires **regenerating** the
+corresponding fixture from the production builder (never hand-editing):
+serialize the produced request with `encoding/json` and write the result
+followed by the single storage LF newline. `send-message-deletion-request.json`
+was regenerated this way when moving to the enriched format (chat, sender,
+type, date). `send-message-welcome-request.json` is unchanged, the welcome
+text having not moved.
 
-## `send-message-ok-envelope.json` n'est pas un contrat
+## `send-message-ok-envelope.json` is not a contract
 
-Ce fichier est un **stub de transport**, délibérément nommé ainsi : il vérifie
-seulement que le client accepte une enveloppe Bot API `ok: true`. Son `result`
-vide ne décrit **aucun** des deux scénarios d'alerte et n'a pas à correspondre
-au chat ni au texte de la requête — `SendMessage` ignore `result`. Ne pas le
-lire comme la réponse attendue d'un `sendMessage` donné, ni l'enrichir pour
-« coller » à un scénario : ce serait une précision fictive.
+This file is a **transport stub**, deliberately named so: it only verifies
+that the client accepts a Bot API `ok: true` envelope. Its empty `result`
+describes **none** of the two alert scenarios and does not have to match the
+chat or the text of the request — `SendMessage` ignores `result`. Do not read
+it as the expected response of a given `sendMessage`, nor enrich it to "fit"
+a scenario: that would be fictitious precision.

@@ -6,8 +6,8 @@ import (
 	"unicode/utf16"
 )
 
-// baseAlert est une alerte complète, que chaque test dégrade sur le seul point
-// qu'il vérifie.
+// baseAlert is a complete alert; each test degrades it on the single point
+// it checks.
 func baseAlert() DeletionAlert {
 	senderID := int64(900123)
 	return DeletionAlert{
@@ -18,7 +18,7 @@ func baseAlert() DeletionAlert {
 		FromUserID:          &senderID,
 		MessageType:         "text",
 		TelegramDate:        1788019201,
-		Content:             "Bonjour, café ☕ — déjà vu ?",
+		Content:             "Hello, coffee ☕ — seen before?",
 	}
 }
 
@@ -26,72 +26,72 @@ func singleText(t *testing.T, alert DeletionAlert) string {
 	t.Helper()
 	requests := BuildDeletionMessageRequests(alert)
 	if len(requests) != 1 {
-		t.Fatalf("nombre de requêtes = %d, attendu 1", len(requests))
+		t.Fatalf("number of requests = %d, want 1", len(requests))
 	}
 	if requests[0].ChatID != alert.OwnerTelegramUserID {
-		t.Fatalf("alerte adressée au chat %d, attendu le owner %d", requests[0].ChatID, alert.OwnerTelegramUserID)
+		t.Fatalf("alert addressed to chat %d, want the owner %d", requests[0].ChatID, alert.OwnerTelegramUserID)
 	}
 	return requests[0].Text
 }
 
-func TestBuildDeletionMessageRequestsIdentitéComplète(t *testing.T) {
-	want := "Message supprimé récupéré\n" +
-		"Chat : Anaïs (800001)\n" +
-		"De : Anaïs (@fixture_sender) (900123)\n" +
-		"Type : text\n" +
-		"Date : 2026-08-29 16:00 UTC\n" +
+func TestBuildDeletionMessageRequestsFullIdentity(t *testing.T) {
+	want := "Recovered deleted message\n" +
+		"Chat: Anaïs (800001)\n" +
+		"From: Anaïs (@fixture_sender) (900123)\n" +
+		"Type: text\n" +
+		"Date: 2026-08-29 16:00 UTC\n" +
 		"\n" +
-		"Bonjour, café ☕ — déjà vu ?"
+		"Hello, coffee ☕ — seen before?"
 	if got := singleText(t, baseAlert()); got != want {
-		t.Fatalf("alerte =\n%s\nattendu\n%s", got, want)
+		t.Fatalf("alert =\n%s\nwant\n%s", got, want)
 	}
 }
 
-func TestBuildDeletionMessageRequestsRepliDesIdentitésInconnues(t *testing.T) {
+func TestBuildDeletionMessageRequestsFallbackForUnknownIdentity(t *testing.T) {
 	tests := []struct {
 		name    string
 		degrade func(*DeletionAlert)
 		want    string
 	}{
 		{
-			name:    "libellé de chat absent",
+			name:    "chat label missing",
 			degrade: func(a *DeletionAlert) { a.ChatTitle = "" },
-			want:    "Chat : chat 800001",
+			want:    "Chat: chat 800001",
 		},
 		{
-			name:    "chat connu par son @username seul",
+			name:    "chat known by its @username alone",
 			degrade: func(a *DeletionAlert) { a.ChatTitle = ""; a.ChatUsername = "salon_test" },
-			want:    "Chat : @salon_test (800001)",
+			want:    "Chat: @salon_test (800001)",
 		},
 		{
-			name:    "titre et @username",
+			name:    "title and @username",
 			degrade: func(a *DeletionAlert) { a.ChatUsername = "salon_test" },
-			want:    "Chat : Anaïs (@salon_test) (800001)",
+			want:    "Chat: Anaïs (@salon_test) (800001)",
 		},
 		{
-			name:    "from_display vide",
+			name:    "from_display empty",
 			degrade: func(a *DeletionAlert) { a.FromDisplay = "" },
-			want:    "De : inconnu (900123)",
+			want:    "From: unknown (900123)",
 		},
 		{
 			name:    "from_user_id NULL",
 			degrade: func(a *DeletionAlert) { a.FromUserID = nil },
-			want:    "De : Anaïs (@fixture_sender)",
+			want:    "From: Anaïs (@fixture_sender)",
 		},
 		{
-			name:    "expéditeur totalement inconnu",
+			name:    "sender entirely unknown",
 			degrade: func(a *DeletionAlert) { a.FromDisplay = ""; a.FromUserID = nil },
-			want:    "De : inconnu",
+			want:    "From: unknown",
 		},
 		{
-			name:    "date absente",
+			name:    "date missing",
 			degrade: func(a *DeletionAlert) { a.TelegramDate = 0 },
-			want:    "Date : inconnue",
+			want:    "Date: unknown",
 		},
 		{
-			name:    "type absent",
+			name:    "type missing",
 			degrade: func(a *DeletionAlert) { a.MessageType = "" },
-			want:    "Type : inconnu",
+			want:    "Type: unknown",
 		},
 	}
 
@@ -101,38 +101,37 @@ func TestBuildDeletionMessageRequestsRepliDesIdentitésInconnues(t *testing.T) {
 			tt.degrade(&alert)
 			text := singleText(t, alert)
 			if !strings.Contains(text, tt.want+"\n") {
-				t.Fatalf("alerte =\n%s\nattendu une ligne %q", text, tt.want)
+				t.Fatalf("alert =\n%s\nwant a line %q", text, tt.want)
 			}
-			// Le chat_id numérique reste visible quoi qu'il arrive : c'est le
-			// seul identifiant que Telegram garantit.
+			// The numeric chat_id stays visible no matter what: it is the
+			// only identifier Telegram guarantees.
 			if !strings.Contains(text, "800001") {
-				t.Fatalf("chat_id absent de l'alerte:\n%s", text)
+				t.Fatalf("chat_id missing from the alert:\n%s", text)
 			}
 		})
 	}
 }
 
-// TestBuildDeletionMessageRequestsSansContenu couvre les futures pièces
-// jointes (Phase 2) : un message_type non textuel n'a pas de texte à
-// restituer, l'en-tête doit alors se suffire à lui-même sans ligne vide
-// pendante ni format cassé.
-func TestBuildDeletionMessageRequestsSansContenu(t *testing.T) {
+// TestBuildDeletionMessageRequestsWithoutContent covers future attachments
+// (Phase 2): a non-text message_type has no text to restore, so the header
+// must stand on its own without a dangling empty line or broken format.
+func TestBuildDeletionMessageRequestsWithoutContent(t *testing.T) {
 	alert := baseAlert()
 	alert.MessageType = "photo"
 	alert.Content = ""
 
 	text := singleText(t, alert)
-	if !strings.HasSuffix(text, "Date : 2026-08-29 16:00 UTC") {
-		t.Fatalf("alerte sans contenu mal terminée:\n%q", text)
+	if !strings.HasSuffix(text, "Date: 2026-08-29 16:00 UTC") {
+		t.Fatalf("alert without content badly terminated:\n%q", text)
 	}
-	if !strings.Contains(text, "Type : photo\n") {
-		t.Fatalf("type manquant dans l'alerte sans contenu:\n%s", text)
+	if !strings.Contains(text, "Type: photo\n") {
+		t.Fatalf("type missing from the alert without content:\n%s", text)
 	}
 }
 
-// TestBuildDeletionMessageRequestsPreservesContentAndUTF16Limit vérifie que la
-// limite s'applique au texte FINAL (en-tête d'identité compris) : c'est
-// l'enrichissement qui décide du nombre de chunks, pas le seul contenu.
+// TestBuildDeletionMessageRequestsPreservesContentAndUTF16Limit verifies that
+// the limit applies to the FINAL text (identity header included): the
+// enrichment decides the number of chunks, not the content alone.
 func TestBuildDeletionMessageRequestsPreservesContentAndUTF16Limit(t *testing.T) {
 	content := strings.Repeat("a", 4095) + "😀" + strings.Repeat("é", 10)
 	alert := baseAlert()
@@ -140,17 +139,17 @@ func TestBuildDeletionMessageRequestsPreservesContentAndUTF16Limit(t *testing.T)
 	requests := BuildDeletionMessageRequests(alert)
 
 	if len(requests) != 2 {
-		t.Fatalf("nombre de requêtes = %d, attendu 2", len(requests))
+		t.Fatalf("number of requests = %d, want 2", len(requests))
 	}
-	header := "Message supprimé récupéré\n" +
-		"Chat : Anaïs (800001)\n" +
-		"De : Anaïs (@fixture_sender) (900123)\n" +
-		"Type : text\n" +
-		"Date : 2026-08-29 16:00 UTC\n\n"
+	header := "Recovered deleted message\n" +
+		"Chat: Anaïs (800001)\n" +
+		"From: Anaïs (@fixture_sender) (900123)\n" +
+		"Type: text\n" +
+		"Date: 2026-08-29 16:00 UTC\n\n"
 	texts := make([]string, 0, len(requests))
 	for i, request := range requests {
 		if request.ChatID != 700001 {
-			t.Fatalf("requête %d: chat_id = %d, attendu 700001", i, request.ChatID)
+			t.Fatalf("request %d: chat_id = %d, want 700001", i, request.ChatID)
 		}
 		texts = append(texts, request.Text)
 		units := 0
@@ -158,23 +157,23 @@ func TestBuildDeletionMessageRequestsPreservesContentAndUTF16Limit(t *testing.T)
 			units += utf16.RuneLen(r)
 		}
 		if units > telegramTextLimit {
-			t.Fatalf("requête %d contient %d unités UTF-16", i, units)
+			t.Fatalf("request %d contains %d UTF-16 units", i, units)
 		}
 	}
 	if strings.Join(texts, "") != header+content {
-		t.Fatal("le découpage a modifié ou tronqué la notification")
+		t.Fatal("splitting modified or truncated the notification")
 	}
-	// L'en-tête consomme des unités : le tout premier chunk se termine donc
-	// AVANT la fin du contenu qui tenait seul dans 4096 unités.
+	// The header consumes units: the very first chunk therefore ends BEFORE
+	// the end of content that alone fit within 4096 units.
 	if strings.HasSuffix(texts[0], "😀") {
-		t.Fatal("le découpage semble ignorer l'en-tête d'identité")
+		t.Fatal("splitting seems to ignore the identity header")
 	}
 }
 
-// TestBuildDeletionMessageRequestsUnicodeEnTête vérifie que le découpage tient
-// aussi quand ce sont les libellés d'identité, et non le contenu, qui portent
-// des caractères hors BMP.
-func TestBuildDeletionMessageRequestsUnicodeEnTête(t *testing.T) {
+// TestBuildDeletionMessageRequestsUnicodeInHeader verifies that splitting
+// holds even when it is the identity labels, not the content, that carry
+// non-BMP characters.
+func TestBuildDeletionMessageRequestsUnicodeInHeader(t *testing.T) {
 	alert := baseAlert()
 	alert.ChatTitle = strings.Repeat("🐈", 2000)
 	alert.FromDisplay = strings.Repeat("é", 500)
@@ -182,7 +181,7 @@ func TestBuildDeletionMessageRequestsUnicodeEnTête(t *testing.T) {
 
 	requests := BuildDeletionMessageRequests(alert)
 	if len(requests) < 2 {
-		t.Fatalf("nombre de requêtes = %d, attendu au moins 2", len(requests))
+		t.Fatalf("number of requests = %d, want at least 2", len(requests))
 	}
 	var rebuilt strings.Builder
 	for i, request := range requests {
@@ -191,20 +190,20 @@ func TestBuildDeletionMessageRequestsUnicodeEnTête(t *testing.T) {
 			units += utf16.RuneLen(r)
 		}
 		if units > telegramTextLimit {
-			t.Fatalf("requête %d contient %d unités UTF-16", i, units)
+			t.Fatalf("request %d contains %d UTF-16 units", i, units)
 		}
 		rebuilt.WriteString(request.Text)
 	}
 	if !strings.HasSuffix(rebuilt.String(), alert.Content) {
-		t.Fatal("le contenu Unicode a été tronqué par le découpage")
+		t.Fatal("the Unicode content was truncated by splitting")
 	}
 }
 
 func TestSplitTelegramTextRejectsInvalidInput(t *testing.T) {
 	if chunks := splitTelegramText("", telegramTextLimit); chunks != nil {
-		t.Fatalf("texte vide: chunks = %#v, attendu nil", chunks)
+		t.Fatalf("empty text: chunks = %#v, want nil", chunks)
 	}
 	if chunks := splitTelegramText("test", 0); chunks != nil {
-		t.Fatalf("limite invalide: chunks = %#v, attendu nil", chunks)
+		t.Fatalf("invalid limit: chunks = %#v, want nil", chunks)
 	}
 }

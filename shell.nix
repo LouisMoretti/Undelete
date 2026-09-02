@@ -1,5 +1,5 @@
-# Environnement de dev : Go pour `make check` / `make build`.
-# Utilisation : nix-shell --run 'make check'
+# Development environment: Go for `make check` / `make build`.
+# Usage: nix-shell --run 'make check'
 { pkgs ? import <nixpkgs> {} }:
 
 pkgs.mkShell {

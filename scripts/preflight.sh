@@ -1,264 +1,263 @@
 #!/bin/sh
-# Préflight de déploiement : vérifie, SANS RIEN MODIFIER, que la machine et la
-# configuration sont prêtes avant un `docker compose up`. Aucune écriture,
-# aucune suppression, aucune commande destructive -- ce script est en lecture
-# seule par construction et peut être relancé autant de fois que voulu.
+# Deployment preflight: checks, WITHOUT MODIFYING ANYTHING, that the machine
+# and configuration are ready before a `docker compose up`. No writes, no
+# deletions, no destructive commands -- this script is read-only by design
+# and can be re-run as many times as desired.
 #
-# Usage :
+# Usage:
 #   sh scripts/preflight.sh
 #
-# Sortie : une ligne par vérification, préfixée [ OK ] / [ECHEC] / [SKIP].
-# Code de retour 0 si aucun ECHEC, 1 sinon. Un [SKIP] (outil manquant, base
-# injoignable depuis l'hôte) n'est jamais bloquant : il signale une
-# vérification NON FAITE, à refaire depuis un endroit qui le permet.
+# Output: one line per check, prefixed [ OK ] / [FAIL] / [SKIP].
+# Exit code 0 if no FAIL, 1 otherwise. A [SKIP] (missing tool, database
+# unreachable from the host) is never blocking: it signals a check that
+# was NOT RUN, to be redone from a place that allows it.
 #
-# NOTE : le jeton Telegram n'est jamais affiché. Toute sortie externe
-# (réponse de l'API) passe par masquer_jeton() avant impression.
+# NOTE: the Telegram token is never displayed. Any external output
+# (API response) passes through mask_token() before being printed.
 set -eu
 
-# Seuil d'espace disque libre, en gigaoctets (surchargeable).
+# Free disk space threshold, in gigabytes (overridable).
 PREFLIGHT_MIN_DISK_GB="${PREFLIGHT_MIN_DISK_GB:-2}"
 
-# Racine du dépôt : le script est appelable depuis n'importe quel répertoire.
-racine_depot="$(cd "$(dirname "$0")/.." && pwd)"
+# Repository root: the script can be invoked from any directory.
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 
-nb_echecs=0
-nb_skips=0
+failure_count=0
+skip_count=0
 
 ok() { echo "[ OK ] $1"; }
-echec() { echo "[ECHEC] $1"; nb_echecs=$((nb_echecs + 1)); }
-skip() { echo "[SKIP] $1"; nb_skips=$((nb_skips + 1)); }
+fail() { echo "[FAIL] $1"; failure_count=$((failure_count + 1)); }
+skip() { echo "[SKIP] $1"; skip_count=$((skip_count + 1)); }
 
-# Remplace le jeton Telegram par une forme masquée dans un texte arbitraire.
-# Appelé sur TOUT ce qui provient de l'API : un message d'erreur curl ou une
-# réponse Telegram peuvent renvoyer l'URL appelée, jeton compris.
-masquer_jeton() {
+# Replaces the Telegram token with a masked form in arbitrary text.
+# Called on EVERYTHING that comes from the API: a curl error message or a
+# Telegram response may echo back the called URL, token included.
+mask_token() {
     if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
-        sed "s|${TELEGRAM_BOT_TOKEN}|<TELEGRAM_BOT_TOKEN masqué>|g"
+        sed "s|${TELEGRAM_BOT_TOKEN}|<TELEGRAM_BOT_TOKEN masked>|g"
     else
         cat
     fi
 }
 
-echo "=== Préflight undelete ==="
-echo "dépôt : ${racine_depot}"
+echo "=== undelete preflight ==="
+echo "repository: ${repo_root}"
 echo
 
-# --- 1. Chargement de .env -------------------------------------------------
-# Le fichier .env n'est PAS un script shell (docker compose le lit comme une
-# liste clé=valeur). On le parse ligne à ligne plutôt que de le sourcer : un
-# `.` sur un fichier de secrets exécuterait tout ce qu'il contient.
+# --- 1. Loading .env -------------------------------------------------------
+# The .env file is NOT a shell script (docker compose reads it as a list of
+# key=value lines). It is parsed line by line rather than sourced: a `.` on
+# a secrets file would execute whatever it contains.
 #
-# Précédence identique à docker compose : une variable déjà présente dans
-# l'environnement l'emporte sur la valeur du fichier.
-fichier_env="${racine_depot}/.env"
-if [ -f "$fichier_env" ]; then
-    while IFS= read -r ligne || [ -n "$ligne" ]; do
-        case "$ligne" in
+# Precedence identical to docker compose: a variable already present in the
+# environment wins over the value in the file.
+env_file="${repo_root}/.env"
+if [ -f "$env_file" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
             ''|'#'*) continue ;;
             *=*) ;;
             *) continue ;;
         esac
-        cle="${ligne%%=*}"
-        valeur="${ligne#*=}"
-        cle="${cle#"${cle%%[![:space:]]*}"}"
-        cle="${cle%"${cle##*[![:space:]]}"}"
-        case "$cle" in
+        key="${line%%=*}"
+        value="${line#*=}"
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        case "$key" in
             ''|*[!A-Za-z0-9_]*) continue ;;
         esac
-        # Retire une éventuelle paire de guillemets englobants.
-        case "$valeur" in
-            \"*\") valeur="${valeur#\"}"; valeur="${valeur%\"}" ;;
-            \'*\') valeur="${valeur#\'}"; valeur="${valeur%\'}" ;;
+        # Removes an optional pair of surrounding quotes.
+        case "$value" in
+            \"*\") value="${value#\"}"; value="${value%\"}" ;;
+            \'*\') value="${value#\'}"; value="${value%\'}" ;;
         esac
-        # eval nécessaire pour lire la valeur courante d'un nom dynamique en
-        # POSIX pur ; le nom est validé ci-dessus ([A-Za-z0-9_] uniquement).
-        eval "actuelle=\${${cle}:-}"
-        if [ -z "$actuelle" ]; then
-            export "${cle}=${valeur}"
+        # eval is required to read the current value of a dynamic name in pure
+        # POSIX; the name is validated above ([A-Za-z0-9_] only).
+        eval "current_value=\${${key}:-}"
+        if [ -z "$current_value" ]; then
+            export "${key}=${value}"
         fi
-    done < "$fichier_env"
-    ok ".env présent et chargé (${fichier_env})"
+    done < "$env_file"
+    ok ".env present and loaded (${env_file})"
 
-    # Permissions : .env contient le jeton du bot et les mots de passe
-    # Postgres. Lisible par le groupe ou par tous = fuite silencieuse.
+    # Permissions: .env contains the bot token and the Postgres
+    # passwords. Readable by group or by all = silent leak.
     mode=""
     if command -v stat >/dev/null 2>&1; then
-        mode="$(stat -c '%a' "$fichier_env" 2>/dev/null || stat -f '%Lp' "$fichier_env" 2>/dev/null || echo '')"
+        mode="$(stat -c '%a' "$env_file" 2>/dev/null || stat -f '%Lp' "$env_file" 2>/dev/null || echo '')"
     fi
     if [ -z "$mode" ]; then
-        skip "permissions de .env : commande stat indisponible, à vérifier à la main (attendu 600)"
+        skip ".env permissions: stat command unavailable, check manually (expected 600)"
     else
         case "$mode" in
-            600|400) ok "permissions de .env correctes (${mode})" ;;
-            *) echec "permissions de .env trop larges (${mode}) : attendu 600 -- \`chmod 600 .env\`" ;;
+            600|400) ok ".env permissions correct (${mode})" ;;
+            *) fail ".env permissions too open (${mode}): expected 600 -- run \`chmod 600 .env\`" ;;
         esac
     fi
 else
-    skip ".env absent : les variables sont lues depuis l'environnement courant"
+    skip ".env absent: variables are read from the current environment"
 fi
 
-# --- 2. Variables requises -------------------------------------------------
-# Calquées sur .env.example. Une variable vide compte comme absente.
+# --- 2. Required variables -------------------------------------------------
+# Modeled on .env.example. An empty variable counts as missing.
 for var in POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB APP_DB_PASSWORD \
            MIGRATION_DATABASE_URL DATABASE_URL TELEGRAM_BOT_TOKEN; do
-    eval "valeur=\${${var}:-}"
-    if [ -n "$valeur" ]; then
-        ok "variable ${var} définie"
+    eval "value=\${${var}:-}"
+    if [ -n "$value" ]; then
+        ok "variable ${var} set"
     else
-        echec "variable ${var} manquante ou vide (cf. .env.example)"
+        fail "variable ${var} missing or empty (see .env.example)"
     fi
 done
 
-# OWNER_TELEGRAM_USER_ID : facultatif au sens de config.Load(), mais c'est le
-# garde-fou mono-tenant de la Phase 1. Vide = n'importe quel compte Telegram
-# peut connecter le bot en Business. Bloquant hors développement local.
+# OWNER_TELEGRAM_USER_ID: optional from config.Load()'s point of view, but
+# it is the Phase 1 mono-tenant guardrail. Empty = any Telegram account can
+# connect the bot in Business mode. Blocking outside local development.
 if [ -n "${OWNER_TELEGRAM_USER_ID:-}" ]; then
     case "$OWNER_TELEGRAM_USER_ID" in
-        ''|*[!0-9]*) echec "OWNER_TELEGRAM_USER_ID doit être un entier (valeur non numérique)" ;;
-        *) ok "OWNER_TELEGRAM_USER_ID défini (garde-fou mono-tenant actif)" ;;
+        ''|*[!0-9]*) fail "OWNER_TELEGRAM_USER_ID must be an integer (non-numeric value)" ;;
+        *) ok "OWNER_TELEGRAM_USER_ID set (mono-tenant guardrail active)" ;;
     esac
 else
-    echec "OWNER_TELEGRAM_USER_ID vide : aucun garde-fou mono-tenant, toute connexion Business serait acceptée (acceptable en dev local UNIQUEMENT)"
+    fail "OWNER_TELEGRAM_USER_ID empty: no mono-tenant guardrail, any Business connection would be accepted (acceptable in local dev ONLY)"
 fi
 
-# BACKUP_RETENTION_DAYS a une valeur par défaut dans backup.sh (14) : absent
-# n'est pas une erreur, mais une valeur non numérique casserait le `find -mtime`.
+# BACKUP_RETENTION_DAYS has a default value in backup.sh (14): being absent
+# is not an error, but a non-numeric value would break the `find -mtime`.
 if [ -n "${BACKUP_RETENTION_DAYS:-}" ]; then
     case "$BACKUP_RETENTION_DAYS" in
-        ''|*[!0-9]*) echec "BACKUP_RETENTION_DAYS doit être un entier (valeur non numérique)" ;;
-        *) ok "BACKUP_RETENTION_DAYS=${BACKUP_RETENTION_DAYS} jours" ;;
+        ''|*[!0-9]*) fail "BACKUP_RETENTION_DAYS must be an integer (non-numeric value)" ;;
+        *) ok "BACKUP_RETENTION_DAYS=${BACKUP_RETENTION_DAYS} days" ;;
     esac
 else
-    ok "BACKUP_RETENTION_DAYS non défini : backup.sh appliquera 14 jours"
+    ok "BACKUP_RETENTION_DAYS not set: backup.sh will apply 14 days"
 fi
 
-# --- 3. DSN applicatif != DSN propriétaire ---------------------------------
-# Même règle que config.Load() : DSN identiques => le bot tournerait avec le
-# rôle propriétaire et FORCE ROW LEVEL SECURITY deviendrait décoratif.
+# --- 3. App DSN != owner DSN -----------------------------------------------
+# Same rule as config.Load(): identical DSNs => the bot would run with the
+# owner role and FORCE ROW LEVEL SECURITY would become decorative.
 if [ -n "${DATABASE_URL:-}" ] && [ -n "${MIGRATION_DATABASE_URL:-}" ]; then
     if [ "$DATABASE_URL" = "$MIGRATION_DATABASE_URL" ]; then
-        echec "DATABASE_URL et MIGRATION_DATABASE_URL sont identiques : le bot refusera de démarrer (RLS serait décoratif)"
+        fail "DATABASE_URL and MIGRATION_DATABASE_URL are identical: the bot will refuse to start (RLS would be decorative)"
     else
-        ok "DATABASE_URL et MIGRATION_DATABASE_URL sont distincts"
+        ok "DATABASE_URL and MIGRATION_DATABASE_URL are distinct"
     fi
 else
-    skip "comparaison des DSN impossible : au moins un des deux est manquant"
+    skip "DSN comparison impossible: at least one of the two is missing"
 fi
 
-# --- 4. Espace disque libre ------------------------------------------------
-# Vérifié sur le système de fichiers du dépôt : c'est lui qui porte ./backups
-# (dumps gzip) et, sauf configuration contraire, le volume postgres_data.
-libre_ko="$(df -Pk "$racine_depot" 2>/dev/null | awk 'NR==2 {print $4}')"
-if [ -z "$libre_ko" ]; then
-    skip "espace disque : df n'a rien renvoyé pour ${racine_depot}"
+# --- 4. Free disk space ----------------------------------------------------
+# Checked on the repository's filesystem: it is what hosts ./backups
+# (gzip dumps) and, unless configured otherwise, the postgres_data volume.
+free_kb="$(df -Pk "$repo_root" 2>/dev/null | awk 'NR==2 {print $4}')"
+if [ -z "$free_kb" ]; then
+    skip "disk space: df returned nothing for ${repo_root}"
 else
-    libre_go=$((libre_ko / 1024 / 1024))
-    if [ "$libre_go" -ge "$PREFLIGHT_MIN_DISK_GB" ]; then
-        ok "espace disque libre ${libre_go} Go (seuil ${PREFLIGHT_MIN_DISK_GB} Go)"
+    free_gb=$((free_kb / 1024 / 1024))
+    if [ "$free_gb" -ge "$PREFLIGHT_MIN_DISK_GB" ]; then
+        ok "free disk space ${free_gb} GB (threshold ${PREFLIGHT_MIN_DISK_GB} GB)"
     else
-        echec "espace disque libre ${libre_go} Go < seuil ${PREFLIGHT_MIN_DISK_GB} Go -- purger d'anciens dumps de ./backups, JAMAIS de volume Docker"
+        fail "free disk space ${free_gb} GB < threshold ${PREFLIGHT_MIN_DISK_GB} GB -- purge old dumps from ./backups, NEVER a Docker volume"
     fi
 fi
 
-# --- 5. Permissions des répertoires de données -----------------------------
-# ./backups est un bind mount écrit par le service backup ; ./media est écrit
-# par le bot, qui tourne en uid 10001 avec un rootfs en lecture seule.
-for repertoire in backups media; do
-    chemin="${racine_depot}/${repertoire}"
-    if [ ! -d "$chemin" ]; then
-        echec "répertoire ./${repertoire} absent : \`mkdir -p ${chemin}\`"
-    elif [ -w "$chemin" ]; then
-        ok "répertoire ./${repertoire} présent et inscriptible"
+# --- 5. Permissions of data directories ------------------------------------
+# ./backups is a bind mount written by the backup service; ./media is written
+# by the bot, which runs as uid 10001 with a read-only rootfs.
+for directory in backups media; do
+    path="${repo_root}/${directory}"
+    if [ ! -d "$path" ]; then
+        fail "directory ./${directory} missing: run \`mkdir -p ${path}\`"
+    elif [ -w "$path" ]; then
+        ok "directory ./${directory} present and writable"
     else
-        echec "répertoire ./${repertoire} présent mais non inscriptible"
+        fail "directory ./${directory} present but not writable"
     fi
 done
 
-# --- 6. Rôles PostgreSQL ---------------------------------------------------
-# Vérifie que le rôle propriétaire répond et que le rôle applicatif existe
-# sans privilège de contournement de RLS -- exactement ce que storage.NewPool
-# revérifie au boot, mais AVANT de déployer.
+# --- 6. PostgreSQL roles ---------------------------------------------------
+# Checks that the owner role answers and that the app role exists without
+# an RLS bypass privilege -- exactly what storage.NewPool re-checks at boot,
+# but BEFORE deploying.
 #
-# Depuis l'hôte, les DSN de .env pointent vers l'hôte `postgres` du réseau
-# Docker et ne résolvent pas : l'échec de connexion est un SKIP explicite,
-# pas un ECHEC. Rejouer alors le check depuis le réseau compose (voir
+# From the host, the .env DSNs point to the `postgres` host of the Docker
+# network and do not resolve: a connection failure is an explicit SKIP, not
+# a FAIL. Re-run the check from the compose network then (see
 # docs/runbook.md).
 if ! command -v psql >/dev/null 2>&1; then
-    skip "rôles PostgreSQL : psql indisponible sur cette machine (voir docs/runbook.md pour le rejouer via docker compose)"
+    skip "PostgreSQL roles: psql unavailable on this machine (see docs/runbook.md to re-run it via docker compose)"
 elif [ -z "${MIGRATION_DATABASE_URL:-}" ]; then
-    skip "rôles PostgreSQL : MIGRATION_DATABASE_URL manquant"
+    skip "PostgreSQL roles: MIGRATION_DATABASE_URL missing"
 else
-    # Timeout court : un préflight ne doit jamais rester bloqué sur un hôte
-    # injoignable.
+    # Short timeout: a preflight must never stay stuck on an unreachable host.
     export PGCONNECT_TIMEOUT=5
-    sortie_psql=""
-    if sortie_psql="$(psql "$MIGRATION_DATABASE_URL" -tAX -c 'SELECT current_user' 2>&1)"; then
-        ok "rôle propriétaire joignable (current_user=${sortie_psql})"
+    psql_out=""
+    if psql_out="$(psql "$MIGRATION_DATABASE_URL" -tAX -c 'SELECT current_user' 2>&1)"; then
+        ok "owner role reachable (current_user=${psql_out})"
 
-        attributs=""
-        if attributs="$(psql "$MIGRATION_DATABASE_URL" -tAX \
+        attributes=""
+        if attributes="$(psql "$MIGRATION_DATABASE_URL" -tAX \
             -c "SELECT rolsuper::text || ',' || rolbypassrls::text FROM pg_catalog.pg_roles WHERE rolname = 'undelete_app'" 2>&1)"; then
-            case "$attributs" in
+            case "$attributes" in
                 "")
-                    echec "rôle undelete_app absent : db/init/01-app-role.sh n'a pas tourné (il ne s'exécute qu'au PREMIER démarrage du volume postgres_data)"
+                    fail "role undelete_app missing: db/init/01-app-role.sh did not run (it only runs on the FIRST start of the postgres_data volume)"
                     ;;
                 "false,false")
-                    ok "rôle undelete_app présent, NOSUPERUSER et NOBYPASSRLS"
+                    ok "role undelete_app present, NOSUPERUSER and NOBYPASSRLS"
                     ;;
                 *)
-                    echec "rôle undelete_app présent mais privilégié (rolsuper,rolbypassrls = ${attributs}) : RLS contournable, le bot refusera de démarrer"
+                    fail "role undelete_app present but privileged (rolsuper,rolbypassrls = ${attributes}): RLS bypassable, the bot will refuse to start"
                     ;;
             esac
         else
-            skip "attributs de undelete_app illisibles : ${attributs}"
+            skip "undelete_app attributes unreadable: ${attributes}"
         fi
     else
-        skip "base injoignable depuis cette machine, rôles NON vérifiés : ${sortie_psql}"
+        skip "database unreachable from this machine, roles NOT checked: ${psql_out}"
     fi
 fi
 
-# --- 7. Jeton Telegram (getMe) ---------------------------------------------
-# getMe est en lecture seule et ne consomme aucun update. Le jeton transite
-# dans l'URL : ni l'URL ni la réponse brute ne sont imprimées telles quelles.
+# --- 7. Telegram token (getMe) ---------------------------------------------
+# getMe is read-only and consumes no updates. The token travels in the URL:
+# neither the URL nor the raw response is printed as-is.
 #
-# L'URL est passée à curl par --config - (entrée standard) et JAMAIS en
-# argument : la ligne de commande d'un processus est lisible par tout
-# utilisateur local via ps et /proc/<pid>/cmdline, ce qui exposerait le jeton
-# pendant la durée de l'appel -- hors du canal que masquer_jeton() protège.
+# The URL is passed to curl via --config - (standard input) and NEVER as an
+# argument: a process's command line is readable by any local user via ps and
+# /proc/<pid>/cmdline, which would expose the token for the duration of the
+# call -- outside the channel that mask_token() protects.
 if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
-    skip "jeton Telegram : TELEGRAM_BOT_TOKEN manquant, appel getMe non effectué"
+    skip "Telegram token: TELEGRAM_BOT_TOKEN missing, getMe call not performed"
 elif ! command -v curl >/dev/null 2>&1; then
-    skip "jeton Telegram : curl indisponible sur cette machine"
+    skip "Telegram token: curl unavailable on this machine"
 else
-    reponse=""
-    if reponse="$(printf 'url = "https://api.telegram.org/bot%s/getMe"\n' \
+    response=""
+    if response="$(printf 'url = "https://api.telegram.org/bot%s/getMe"\n' \
         "$TELEGRAM_BOT_TOKEN" | curl -sS --max-time 10 --config - 2>&1)"; then
-        case "$reponse" in
+        case "$response" in
             *'"ok":true'*)
-                # Extraction du username sans jq (absent de l'image alpine).
-                nom="$(printf '%s' "$reponse" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')"
-                ok "jeton Telegram valide (getMe -> @${nom:-inconnu})"
+                # Username extraction without jq (absent from the alpine image).
+                username="$(printf '%s' "$response" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')"
+                ok "Telegram token valid (getMe -> @${username:-unknown})"
                 ;;
             *)
-                detail="$(printf '%s' "$reponse" | masquer_jeton | head -c 200)"
-                echec "jeton Telegram refusé par l'API : ${detail}"
+                detail="$(printf '%s' "$response" | mask_token | head -c 200)"
+                fail "Telegram token rejected by the API: ${detail}"
                 ;;
         esac
     else
-        detail="$(printf '%s' "$reponse" | masquer_jeton | head -c 200)"
-        skip "appel getMe impossible (réseau ?) : ${detail}"
+        detail="$(printf '%s' "$response" | mask_token | head -c 200)"
+        skip "getMe call impossible (network?): ${detail}"
     fi
 fi
 
-# --- Bilan -----------------------------------------------------------------
+# --- Summary ---------------------------------------------------------------
 echo
-echo "=== Bilan : ${nb_echecs} échec(s), ${nb_skips} vérification(s) non faite(s) ==="
-if [ "$nb_echecs" -gt 0 ]; then
-    echo "Préflight EN ÉCHEC : corriger les points ci-dessus avant tout déploiement."
+echo "=== Summary: ${failure_count} failure(s), ${skip_count} check(s) not run ==="
+if [ "$failure_count" -gt 0 ]; then
+    echo "Preflight FAILED: fix the points above before any deployment."
     exit 1
 fi
-if [ "$nb_skips" -gt 0 ]; then
-    echo "Préflight OK, mais certaines vérifications n'ont pas pu être faites (voir [SKIP])."
+if [ "$skip_count" -gt 0 ]; then
+    echo "Preflight OK, but some checks could not be run (see [SKIP])."
 fi
-echo "Préflight OK."
+echo "Preflight OK."

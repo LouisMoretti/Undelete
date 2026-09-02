@@ -13,10 +13,10 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./db/init:/docker-entrypoint-initdb.d:ro
-    # Pas de "ports" : Postgres n'est joignable que depuis le réseau Docker
-    # interne (bot, backup). Aucune exposition sur l'hôte, même en local --
-    # réduit la surface d'attaque et évite les fuites de contenu de messages
-    # en cas de mauvaise configuration de pare-feu.
+    # No "ports": Postgres is only reachable from the internal Docker
+    # network (bot, backup). No exposure on the host, even locally --
+    # reduces the attack surface and avoids leaks of message content in
+    # case of a misconfigured firewall.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
@@ -35,19 +35,18 @@ services:
       MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       OWNER_TELEGRAM_USER_ID: ${OWNER_TELEGRAM_USER_ID}
-      # Probes /livez, /readyz et /metrics. Pas de "ports" ici non plus : le
-      # port reste interne au réseau Docker, comme Postgres.
-      # Forme ${VAR-défaut} et non ${VAR:-défaut} : une HEALTH_ADDR posée à
-      # vide dans .env doit garder son sens (« serveur désactivé »), pas
-      # retomber sur le défaut. Le healthcheck ci-dessous suppose le port
-      # 9090 : le changer ici impose de le changer là aussi.
+      # Probes /livez, /readyz and /metrics. No "ports" here either: the port
+      # stays internal to the Docker network, like Postgres.
+      # Form ${VAR-default} and not ${VAR:-default}: a HEALTH_ADDR set to an
+      # empty value in .env must keep its meaning ("health server disabled"),
+      # not fall back to the default. The healthcheck below assumes port
+      # 9090: changing it here requires changing it there too.
       HEALTH_ADDR: ${HEALTH_ADDR-:9090}
     volumes:
       - ./media:/app/media
-    # Conteneur durci : utilisateur non-root fixe, système de fichiers en
-    # lecture seule (seuls /tmp en tmpfs et le bind mount ./media sont
-    # inscriptibles), toutes les capabilities Linux retirées, pas
-    # d'escalade de privilèges possible.
+    # Hardened container: fixed non-root user, read-only filesystem (only
+    # /tmp as tmpfs and the ./media bind mount are writable), all Linux
+    # capabilities dropped, no privilege escalation possible.
     user: "10001:10001"
     read_only: true
     cap_drop:
@@ -56,10 +55,10 @@ services:
       - no-new-privileges:true
     tmpfs:
       - /tmp
-    # /livez et non /readyz : la liveness ne dépend que du processus. Un
-    # readyz sur Docker ferait redémarrer en boucle un bot sain dès que
-    # Postgres ou Telegram hoquette, ce qui ne répare rien.
-    # wget vient de busybox (image alpine), aucun paquet supplémentaire.
+    # /livez and not /readyz: liveness depends only on the process. A
+    # readyz on Docker would restart a healthy bot in a loop as soon as
+    # Postgres or Telegram hiccups, which fixes nothing.
+    # wget comes from busybox (alpine image), no extra package.
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9090/livez || exit 1"]
       interval: 30s
@@ -84,9 +83,9 @@ services:
       - sh
       - -c
       - |
-        # Backup quotidien : un pg_dump immédiat, puis une boucle qui
-        # attend 24h entre chaque passage. Pas de cron pour rester simple
-        # et éviter une dépendance supplémentaire dans l'image.
+        # Daily backup: an immediate pg_dump, then a loop that waits 24h
+        # between each pass. No cron to keep things simple and avoid an
+        # extra dependency in the image.
         export BACKUP_DIR=/backups
         while true; do
           sh /scripts/backup.sh

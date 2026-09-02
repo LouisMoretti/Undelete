@@ -1,7 +1,7 @@
-// Package app assemble les dépendances et route chaque Update Telegram vers
-// le traitement métier adéquat. C'est le seul endroit du code qui connaît la
-// totalité du flux entrant (résolution de connexion -> sauvegarde -> mise en
-// outbox). Le flux sortant, lui, appartient à outbox.Worker.
+// Package app wires up dependencies and routes each Telegram Update to the
+// appropriate business handling. It is the only place in the code that knows
+// the full incoming flow (connection resolution -> save -> outbox enqueue).
+// The outgoing flow belongs to outbox.Worker.
 package app
 
 import (
@@ -16,10 +16,10 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
 )
 
-// Handler route les updates Telegram Business vers le traitement métier.
-// Ses méthodes sont appelées de façon strictement séquentielle par
-// telegram.Poller (contrainte n°5) : aucune protection par mutex n'est
-// nécessaire ici, l'ordre d'appel EST la garantie de cohérence.
+// Handler routes Telegram Business updates to business handling. Its
+// methods are called strictly sequentially by telegram.Poller (constraint
+// #5): no mutex protection is needed here, the call order IS the
+// consistency guarantee.
 type Handler struct {
 	business *business.Service
 	messages *messages.Repository
@@ -34,7 +34,7 @@ func NewHandler(businessSvc *business.Service, messagesRepo *messages.Repository
 	}
 }
 
-// HandleUpdate implémente telegram.Handler.
+// HandleUpdate implements telegram.Handler.
 func (h *Handler) HandleUpdate(ctx context.Context, u telegram.Update) error {
 	switch {
 	case u.BusinessConnection != nil:
@@ -50,33 +50,33 @@ func (h *Handler) HandleUpdate(ctx context.Context, u telegram.Update) error {
 		return h.handleDeleted(ctx, u.DeletedBusinessMessages)
 
 	default:
-		// allowed_updates ne demande que les 4 types business_* : un update
-		// d'un autre type ne devrait jamais arriver ici. On logue et on
-		// continue plutôt que de faire échouer le traitement.
-		h.logger.Debug("update ignoré : aucun champ business_* peuplé", slog.Int64("update_id", u.UpdateID))
+		// allowed_updates only requests the 4 business_* types: an update
+		// of another type should never arrive here. We log and continue
+		// rather than failing the processing.
+		h.logger.Debug("update ignored: no business_* field populated", slog.Int64("update_id", u.UpdateID))
 		return nil
 	}
 }
 
-// saveMessage sauvegarde systématiquement le message reçu.
+// saveMessage always saves the received message.
 //
-// Contrainte n°8 : AUCUNE condition ici sur chat_id, ni consultation d'une
-// quelconque table de préférence -- une connexion Business active couvre
-// automatiquement tous les chats que Telegram lui rend accessibles. Le seul
-// filtre appliqué est celui de business.Service.Resolve (la connexion
-// existe-t-elle et est-elle is_enabled), jamais un filtre par conversation.
+// Constraint #8: NO chat_id condition here, and no consultation of any
+// preference table -- an active Business connection automatically covers
+// all chats Telegram exposes to it. The only filter applied is
+// business.Service.Resolve (does the connection exist and is_enabled),
+// never a per-conversation filter.
 func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited bool) error {
 	conn, err := h.business.Resolve(ctx, msg.BusinessConnectionID)
 	if err != nil {
 		if errors.Is(err, business.ErrOwnerMismatch) {
-			h.logger.Debug("message ignoré : connexion refusée par le garde-fou mono-tenant",
+			h.logger.Debug("message ignored: connection refused by the mono-tenant guard",
 				slog.String("business_connection_id", msg.BusinessConnectionID))
 			return nil
 		}
-		return fmt.Errorf("résolution connexion pour sauvegarde: %w", err)
+		return fmt.Errorf("connection resolution for save: %w", err)
 	}
 	if !conn.IsEnabled {
-		h.logger.Debug("message ignoré : connexion désactivée",
+		h.logger.Debug("message ignored: connection disabled",
 			slog.String("business_connection_id", conn.ID))
 		return nil
 	}
@@ -95,7 +95,7 @@ func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited
 		MessageID:            msg.MessageID,
 		FromUserID:           fromUserID,
 		FromDisplay:          fromDisplay,
-		MessageType:          "text", // Phase 1 : texte uniquement
+		MessageType:          "text", // Phase 1: text only
 		TextContent:          msg.Text,
 		TelegramDate:         msg.Date,
 		ChatTitle:            chatTitle(msg.Chat),
@@ -104,14 +104,14 @@ func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited
 	}
 
 	if err := h.messages.Save(ctx, conn.OwnerUserID, record, edited); err != nil {
-		return fmt.Errorf("sauvegarde message: %w", err)
+		return fmt.Errorf("message save: %w", err)
 	}
 
-	// Logs : ids, types, compteurs uniquement. JAMAIS msg.Text ni aucun
-	// contenu utilisateur -- contrainte produit, pas une préférence de
-	// style : logger le contenu répliquerait toutes les conversations
-	// surveillées dans les logs applicatifs.
-	h.logger.Info("message sauvegardé",
+	// Logs: ids, types, counters only. NEVER msg.Text nor any user
+	// content -- a product constraint, not a style preference: logging the
+	// content would replicate every monitored conversation into the
+	// application logs.
+	h.logger.Info("message saved",
 		slog.String("business_connection_id", conn.ID),
 		slog.Int64("chat_id", msg.Chat.ID),
 		slog.Int64("message_id", msg.MessageID),
@@ -120,26 +120,25 @@ func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited
 	return nil
 }
 
-// handleDeleted résout la connexion, boucle sur message_ids (contrainte
-// n°6) et délègue à messages.MarkDeleted, qui marque deleted_at ET écrit les
-// chunks d'alerte dans notification_outbox au sein d'une même transaction.
+// handleDeleted resolves the connection, loops over message_ids (constraint
+// #6) and delegates to messages.MarkDeleted, which sets deleted_at AND writes
+// the alert chunks into notification_outbox within a single transaction.
 //
-// Aucun appel Telegram n'est fait ici depuis #27 : la livraison est
-// asynchrone, assurée par outbox.Worker. Un retour nil signifie donc « la
-// suppression est enregistrée et l'alerte est garantie de partir », pas
-// « l'alerte est partie ».
+// No Telegram call is made here since #27: delivery is asynchronous,
+// handled by outbox.Worker. A nil return therefore means "the deletion is
+// recorded and the alert is guaranteed to go out", not "the alert is out".
 func (h *Handler) handleDeleted(ctx context.Context, del *telegram.BusinessMessagesDeleted) error {
 	conn, err := h.business.Resolve(ctx, del.BusinessConnectionID)
 	if err != nil {
 		if errors.Is(err, business.ErrOwnerMismatch) {
 			return nil
 		}
-		return fmt.Errorf("résolution connexion pour suppression: %w", err)
+		return fmt.Errorf("connection resolution for deletion: %w", err)
 	}
 
 	found, err := h.messages.MarkDeleted(ctx, conn.OwnerUserID, conn.OwnerTelegramUserID, del.BusinessConnectionID, del.Chat.ID, del.MessageIDs)
 	if err != nil {
-		return fmt.Errorf("marquage suppression: %w", err)
+		return fmt.Errorf("deletion marking: %w", err)
 	}
 
 	foundIDs := make(map[int64]bool, len(found))
@@ -147,23 +146,23 @@ func (h *Handler) handleDeleted(ctx context.Context, del *telegram.BusinessMessa
 		foundIDs[d.MessageID] = true
 	}
 
-	// message_id absent de `found` : antérieur à la connexion Business, ou
-	// déjà purgé par la rétention. Pas une erreur -- log debug et on
-	// continue, exactement comme demandé.
+	// message_id missing from `found`: predates the Business connection, or
+	// already purged by retention. Not an error -- log debug and keep going,
+	// exactly as requested.
 	for _, id := range del.MessageIDs {
 		if !foundIDs[id] {
-			h.logger.Debug("message supprimé introuvable en base (antérieur à la connexion, ou déjà purgé)",
+			h.logger.Debug("deleted message not found in database (predates the connection, or already purged)",
 				slog.String("business_connection_id", del.BusinessConnectionID),
 				slog.Int64("chat_id", del.Chat.ID),
 				slog.Int64("message_id", id))
 		}
 	}
 
-	// Compteur agrégé : le nombre de messages effectivement retrouvés et
-	// marqués supprimés. Aucun id ni texte ne sort d'ici (cf. metrics).
+	// Aggregated counter: the number of messages actually recovered and
+	// marked deleted. No id or text leaves here (cf. metrics).
 	metrics.AddDeletions(int64(len(found)))
 
-	h.logger.Info("suppression traitée",
+	h.logger.Info("deletion handled",
 		slog.String("business_connection_id", del.BusinessConnectionID),
 		slog.Int64("chat_id", del.Chat.ID),
 		slog.Int("requested", len(del.MessageIDs)),
@@ -172,11 +171,11 @@ func (h *Handler) handleDeleted(ctx context.Context, del *telegram.BusinessMessa
 	return nil
 }
 
-// chatTitle calcule le libellé d'affichage d'un chat. Telegram ne renseigne
-// title que pour les chats qui en ont un (groupes, canaux) : un chat privé
-// n'est décrit que par first_name/last_name, qui deviennent alors le libellé.
-// Un chat sans aucun de ces champs reste sans libellé -- l'alerte affiche son
-// id, jamais une valeur inventée.
+// chatTitle computes the display label of a chat. Telegram only fills title
+// for chats that have one (groups, channels): a private chat is only
+// described by first_name/last_name, which then become the label. A chat
+// without any of these fields keeps no label -- the alert shows its id,
+// never an invented value.
 func chatTitle(c telegram.Chat) string {
 	if c.Title != "" {
 		return c.Title

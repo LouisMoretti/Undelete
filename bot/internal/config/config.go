@@ -1,5 +1,5 @@
-// Package config charge et valide la configuration du bot depuis les
-// variables d'environnement.
+// Package config loads and validates the bot configuration from
+// environment variables.
 package config
 
 import (
@@ -9,48 +9,49 @@ import (
 	"strconv"
 )
 
-// Config regroupe la configuration runtime du bot.
+// Config holds the bot's runtime configuration.
 type Config struct {
-	// DatabaseURL est le DSN applicatif, connecté avec le rôle undelete_app
-	// (NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS). C'est le SEUL DSN
-	// utilisé après le boot, une fois les migrations appliquées.
+	// DatabaseURL is the application DSN, connected with the undelete_app
+	// role (NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS). It is the ONLY
+	// DSN used after boot, once migrations are applied.
 	DatabaseURL string
 
-	// MigrationDatabaseURL est le DSN propriétaire (POSTGRES_USER,
-	// superuser dans l'image Postgres officielle). Utilisé UNIQUEMENT au
-	// boot, pour appliquer les migrations, jamais pour du trafic runtime.
+	// MigrationDatabaseURL is the owner DSN (POSTGRES_USER, superuser in the
+	// official Postgres image). Used ONLY at boot, to apply migrations, never
+	// for runtime traffic.
 	MigrationDatabaseURL string
 
-	// TelegramBotToken est le jeton du bot, tel que fourni par BotFather.
+	// TelegramBotToken is the bot token, as provided by BotFather.
 	TelegramBotToken string
 
-	// OwnerTelegramUserID, si non nul, restreint le bot à un unique
-	// titulaire Telegram Business (garde-fou mono-tenant Phase 1). Une
-	// connexion Business provenant d'un autre telegram_user_id est
-	// refusée. 0 = pas de restriction (déconseillé en dehors du dev local).
+	// OwnerTelegramUserID, if non-zero, restricts the bot to a single
+	// Telegram Business owner (mono-tenant guard Phase 1). A Business
+	// connection from a different telegram_user_id is refused.
+	// 0 = no restriction (not recommended outside local dev).
 	OwnerTelegramUserID int64
 
-	// HealthAddr est l'adresse d'écoute des probes /livez, /readyz et
-	// /metrics. Vaut defaultHealthAddr si HEALTH_ADDR n'est pas définie ;
-	// une valeur explicitement VIDE désactive le serveur (aucun port
-	// ouvert). Ces endpoints n'exposent aucun contenu utilisateur, mais ils
-	// restent destinés au réseau interne : ne pas les publier tels quels.
+	// HealthAddr is the listen address for the /livez, /readyz and
+	// /metrics probes. Defaults to defaultHealthAddr if HEALTH_ADDR is not
+	// set; an explicitly EMPTY value disables the server (no port opened).
+	// These endpoints expose no user content, but they remain intended for
+	// the internal network: do not publish them as-is.
 	HealthAddr string
 }
 
-// defaultHealthAddr : port dédié à la supervision, distinct de tout trafic
-// applicatif (le bot n'écoute rien d'autre, il est en long polling sortant).
+// defaultHealthAddr: dedicated monitoring port, distinct from any
+// application traffic (the bot listens on nothing else, it is in outgoing
+// long polling).
 const defaultHealthAddr = ":9090"
 
-// Load lit la configuration depuis l'environnement et la valide.
+// Load reads the configuration from the environment and validates it.
 //
-// Refuse de démarrer si DatabaseURL == MigrationDatabaseURL : si les deux
-// DSN pointent vers le même rôle, l'application tournerait avec les
-// privilèges superuser du rôle de migration, et FORCE ROW LEVEL SECURITY
-// sur messages deviendrait purement décoratif (un superuser contourne RLS
-// de fait via BYPASSRLS implicite / propriété de table). C'est la
-// contrainte de sécurité la plus silencieuse du projet : rien ne plante en
-// apparence, la table est juste totalement ouverte.
+// Refuses to start if DatabaseURL == MigrationDatabaseURL: if the two DSNs
+// point to the same role, the application would run with the superuser
+// privileges of the migration role, and FORCE ROW LEVEL SECURITY on
+// messages would become purely decorative (a superuser bypasses RLS in
+// practice via implicit BYPASSRLS / table ownership). This is the project's
+// most silent security constraint: nothing visibly breaks, the table is
+// just completely open.
 func Load() (*Config, error) {
 	cfg := &Config{
 		DatabaseURL:          os.Getenv("DATABASE_URL"),
@@ -59,44 +60,44 @@ func Load() (*Config, error) {
 		HealthAddr:           defaultHealthAddr,
 	}
 
-	// LookupEnv et non Getenv : "variable absente" (on veut le défaut) et
-	// "variable posée à vide" (on veut désactiver le serveur) sont deux
-	// intentions différentes.
+	// LookupEnv rather than Getenv: "variable absent" (we want the default)
+	// and "variable set empty" (we want to disable the server) are two
+	// different intentions.
 	if raw, ok := os.LookupEnv("HEALTH_ADDR"); ok {
 		cfg.HealthAddr = raw
 	}
 
-	// Validée ici, et pas seulement au net.Listen : une valeur mal formée
-	// (« 9090 » sans deux-points) laisserait le bot démarrer normalement puis
-	// perdre TOUTES ses probes et ses métriques sur un unique log Error, sans
-	// que rien d'autre ne bouge. Une supervision muette est exactement ce que
-	// l'issue #6 cherche à éliminer : on échoue au démarrage, franchement.
+	// Validated here, not just at net.Listen: a malformed value ("9090"
+	// without a colon) would let the bot start normally and then lose ALL of
+	// its probes and metrics on a single Error log, with nothing else moving.
+	// A silent monitoring is exactly what issue #6 seeks to eliminate: we
+	// fail at startup, plainly.
 	if cfg.HealthAddr != "" {
 		if _, _, err := net.SplitHostPort(cfg.HealthAddr); err != nil {
-			return nil, fmt.Errorf("HEALTH_ADDR invalide (attendu « hôte:port », par exemple %q ; vide pour désactiver le serveur de santé): %w", defaultHealthAddr, err)
+			return nil, fmt.Errorf("invalid HEALTH_ADDR (expected \"host:port\", e.g. %q; empty to disable the health server): %w", defaultHealthAddr, err)
 		}
 	}
 
 	if cfg.DatabaseURL == "" {
-		return nil, fmt.Errorf("DATABASE_URL est requis")
+		return nil, fmt.Errorf("DATABASE_URL is required")
 	}
 	if cfg.MigrationDatabaseURL == "" {
-		return nil, fmt.Errorf("MIGRATION_DATABASE_URL est requis")
+		return nil, fmt.Errorf("MIGRATION_DATABASE_URL is required")
 	}
 	if cfg.TelegramBotToken == "" {
-		return nil, fmt.Errorf("TELEGRAM_BOT_TOKEN est requis")
+		return nil, fmt.Errorf("TELEGRAM_BOT_TOKEN is required")
 	}
 
 	if cfg.DatabaseURL == cfg.MigrationDatabaseURL {
-		return nil, fmt.Errorf("DATABASE_URL et MIGRATION_DATABASE_URL sont identiques : " +
-			"l'application tournerait avec le rôle propriétaire (superuser) et FORCE ROW LEVEL SECURITY " +
-			"sur messages serait décoratif ; utilisez le rôle restreint undelete_app pour DATABASE_URL")
+		return nil, fmt.Errorf("DATABASE_URL and MIGRATION_DATABASE_URL are identical: " +
+			"the application would run with the owner role (superuser) and FORCE ROW LEVEL SECURITY " +
+			"on messages would be decorative; use the restricted undelete_app role for DATABASE_URL")
 	}
 
 	if raw := os.Getenv("OWNER_TELEGRAM_USER_ID"); raw != "" {
 		id, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("OWNER_TELEGRAM_USER_ID invalide: %w", err)
+			return nil, fmt.Errorf("invalid OWNER_TELEGRAM_USER_ID: %w", err)
 		}
 		cfg.OwnerTelegramUserID = id
 	}

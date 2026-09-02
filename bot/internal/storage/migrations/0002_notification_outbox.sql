@@ -1,5 +1,5 @@
--- Outbox durable des alertes de suppression. Le payload est du contenu
--- utilisateur et reçoit donc la même isolation FORCE RLS que messages.
+-- Durable outbox for deletion alerts. The payload is user content and
+-- therefore receives the same FORCE RLS isolation as messages.
 CREATE TABLE notification_outbox (
     id                      BIGSERIAL PRIMARY KEY,
     owner_user_id           BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -33,7 +33,7 @@ CREATE POLICY notification_outbox_tenant_isolation ON notification_outbox
     USING (owner_user_id = NULLIF(current_setting('app.current_owner_user_id', true), '')::bigint)
     WITH CHECK (owner_user_id = NULLIF(current_setting('app.current_owner_user_id', true), '')::bigint);
 
--- Grants explicites : cette migration peut être exécutée dans une base où les
--- default privileges n'ont pas été configurés par le rôle propriétaire.
+-- Explicit grants: this migration may run in a database where default
+-- privileges were not configured by the owner role.
 GRANT SELECT, INSERT, UPDATE, DELETE ON notification_outbox TO undelete_app;
 GRANT USAGE, SELECT ON SEQUENCE notification_outbox_id_seq TO undelete_app;

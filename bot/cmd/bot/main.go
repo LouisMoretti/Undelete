@@ -1,4 +1,4 @@
-// Commande bot : point d'entrée du service undelete.
+// Bot command: entry point of the undelete service.
 package main
 
 import (
@@ -22,20 +22,20 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/users"
 )
 
-// httpClientTimeout doit rester strictement supérieur au timeout de
-// long-polling (50s, voir telegram/poller.go) : sinon le client HTTP
-// couperait la requête avant que Telegram n'ait eu la chance de répondre.
+// httpClientTimeout must stay strictly above the long-polling timeout
+// (50s, see telegram/poller.go): otherwise the HTTP client would cut the
+// request before Telegram gets a chance to respond.
 const httpClientTimeout = 60 * time.Second
 
-// retentionInterval fixe la fréquence de la purge de rétention. Une purge
-// quotidienne suffit largement (retention_days minimum = 1 jour).
+// retentionInterval sets the frequency of the retention purge. A daily
+// purge is more than enough (retention_days minimum = 1 day).
 const retentionInterval = 24 * time.Hour
 const outboxInterval = time.Second
 
-// backlogInterval fixe le rafraîchissement de la jauge de backlog outbox.
-// Volontairement bien plus lent que outboxInterval : la jauge sert à repérer
-// une livraison qui décroche, pas à suivre chaque job à la seconde, et un
-// COUNT(*) par tenant chaque seconde coûterait plus cher que le travail utile.
+// backlogInterval sets the refresh rate of the outbox backlog gauge.
+// Deliberately much slower than outboxInterval: the gauge is meant to spot
+// a delivery that is falling behind, not to track every job to the second,
+// and a COUNT(*) per tenant every second would cost more than the useful work.
 const backlogInterval = 15 * time.Second
 
 func main() {
@@ -43,7 +43,7 @@ func main() {
 	slog.SetDefault(logger)
 
 	if err := run(logger); err != nil {
-		logger.Error("arrêt sur erreur fatale", slog.String("error", err.Error()))
+		logger.Error("stopping after fatal error", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 }
@@ -57,8 +57,8 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Migrations appliquées avec le DSN propriétaire, AVANT l'ouverture du
-	// pool applicatif : le rôle undelete_app n'a pas les droits DDL.
+	// Migrations applied with the owner DSN, BEFORE the application pool
+	// opens: the undelete_app role has no DDL rights.
 	if err := storage.RunMigrations(ctx, cfg.MigrationDatabaseURL, logger); err != nil {
 		return err
 	}
@@ -94,26 +94,26 @@ func run(logger *slog.Logger) error {
 	}()
 	go func() {
 		defer wg.Done()
-		// Readiness = base joignable ET poller frais. Le serveur ne reçoit
-		// que le pool et le poller : ni le jeton, ni la config, rien qui
-		// puisse se retrouver dans une réponse HTTP.
+		// Readiness = reachable database AND fresh poller. The server only
+		// receives the pool and the poller: neither the token nor the config,
+		// nothing that could end up in an HTTP response.
 		healthHandler := health.NewHandler(db.Pool, poller, metrics.Default(), nil)
 		if err := health.Serve(ctx, cfg.HealthAddr, healthHandler, logger); err != nil {
-			logger.Error("serveur de santé arrêté sur erreur", slog.String("error", err.Error()))
+			logger.Error("health server stopped on error", slog.String("error", err.Error()))
 		}
 	}()
 
-	logger.Info("démarrage du poller", slog.Any("allowed_updates", telegram.AllowedUpdates))
+	logger.Info("poller starting", slog.Any("allowed_updates", telegram.AllowedUpdates))
 
 	err = poller.Run(ctx, handler.HandleUpdate)
-	// L'arrêt sur signal annule ctx : on attend que la rétention et l'outbox
-	// terminent leur itération en cours avant de fermer le pool, sinon une
-	// alerte réservée resterait 'processing' jusqu'à expiration du lease et
-	// pourrait être redoublée au redémarrage.
+	// Signal-driven shutdown cancels ctx: we wait for retention and the outbox
+	// to finish their current iteration before closing the pool, otherwise a
+	// leased alert would stay 'processing' until the lease expires and could
+	// be redelivered on restart.
 	stop()
 	wg.Wait()
 	if ctx.Err() != nil {
-		logger.Info("arrêt demandé, extinction propre")
+		logger.Info("shutdown requested, clean stop")
 		return nil
 	}
 	return err
@@ -126,13 +126,13 @@ func runOutboxLoop(ctx context.Context, usersRepo *users.Repository, worker *out
 	for {
 		tenants, err := usersRepo.ListTenantsForRetention(ctx)
 		if err != nil {
-			logger.Error("outbox: échec listage tenants", slog.String("error", err.Error()))
+			logger.Error("outbox: failed to list tenants", slog.String("error", err.Error()))
 		} else {
 			for _, tenant := range tenants {
 				for processed := 0; processed < 100; processed++ {
 					didProcess, err := worker.ProcessOne(ctx, tenant.OwnerUserID)
 					if err != nil {
-						logger.Error("outbox: échec traitement", slog.Int64("owner_user_id", tenant.OwnerUserID), slog.String("error", err.Error()))
+						logger.Error("outbox: processing failed", slog.Int64("owner_user_id", tenant.OwnerUserID), slog.String("error", err.Error()))
 						break
 					}
 					if !didProcess {
@@ -150,10 +150,9 @@ func runOutboxLoop(ctx context.Context, usersRepo *users.Repository, worker *out
 	}
 }
 
-// runBacklogLoop rafraîchit la jauge undelete_outbox_backlog. Boucle séparée
-// de l'outbox : un COUNT(*) lent ou en erreur ne doit pas ralentir la
-// livraison des alertes, et une jauge périmée est moins grave qu'une alerte
-// en retard.
+// runBacklogLoop refreshes the undelete_outbox_backlog gauge. A separate
+// loop from the outbox: a slow or failing COUNT(*) must not slow down alert
+// delivery, and a stale gauge is less serious than a late alert.
 func runBacklogLoop(ctx context.Context, usersRepo *users.Repository, outboxRepo *outbox.Repository, logger *slog.Logger) {
 	ticker := time.NewTicker(backlogInterval)
 	defer ticker.Stop()
@@ -168,7 +167,7 @@ func runBacklogLoop(ctx context.Context, usersRepo *users.Repository, outboxRepo
 			}
 		}
 		if err != nil && ctx.Err() == nil {
-			logger.Error("backlog outbox: échec du comptage", slog.String("error", err.Error()))
+			logger.Error("outbox backlog: count failed", slog.String("error", err.Error()))
 		}
 
 		select {
@@ -179,12 +178,12 @@ func runBacklogLoop(ctx context.Context, usersRepo *users.Repository, outboxRepo
 	}
 }
 
-// runRetentionLoop exécute PurgeExpired à intervalle régulier, pour messages
-// ET pour notification_outbox : cette dernière contient payload_text (du
-// contenu utilisateur) et, sans purge, ses lignes 'sent'/'failed' croîtraient
-// indéfiniment en échappant à retention_days. Boucle indépendante du poller :
-// une purge lente ou en erreur ne doit jamais retarder le traitement des
-// updates Telegram (contrainte de réactivité du long-polling).
+// runRetentionLoop runs PurgeExpired at regular intervals, for messages AND
+// for notification_outbox: the latter holds payload_text (user content) and,
+// without purging, its 'sent'/'failed' rows would grow indefinitely while
+// escaping retention_days. Independent of the poller loop: a slow or failing
+// purge must never delay the processing of Telegram updates (long-polling
+// responsiveness constraint).
 func runRetentionLoop(ctx context.Context, usersRepo *users.Repository, messagesRepo *messages.Repository, outboxRepo *outbox.Repository, logger *slog.Logger) {
 	ticker := time.NewTicker(retentionInterval)
 	defer ticker.Stop()
@@ -196,20 +195,20 @@ func runRetentionLoop(ctx context.Context, usersRepo *users.Repository, messages
 		case <-ticker.C:
 			tenants, err := usersRepo.ListTenantsForRetention(ctx)
 			if err != nil {
-				logger.Error("purge rétention: échec listage tenants", slog.String("error", err.Error()))
+				logger.Error("retention purge: failed to list tenants", slog.String("error", err.Error()))
 				continue
 			}
 			purged, err := messagesRepo.PurgeExpired(ctx, tenants)
 			if err != nil {
-				logger.Error("purge rétention: échec", slog.String("error", err.Error()), slog.Int64("purged_before_error", purged))
+				logger.Error("retention purge: failed", slog.String("error", err.Error()), slog.Int64("purged_before_error", purged))
 				continue
 			}
 			purgedOutbox, err := outboxRepo.PurgeExpired(ctx, tenants)
 			if err != nil {
-				logger.Error("purge rétention outbox: échec", slog.String("error", err.Error()), slog.Int64("purged_before_error", purgedOutbox))
+				logger.Error("outbox retention purge: failed", slog.String("error", err.Error()), slog.Int64("purged_before_error", purgedOutbox))
 				continue
 			}
-			logger.Info("purge rétention terminée",
+			logger.Info("retention purge complete",
 				slog.Int64("purged", purged),
 				slog.Int64("purged_outbox", purgedOutbox),
 				slog.Int("tenants", len(tenants)))

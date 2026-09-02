@@ -19,7 +19,7 @@ func openRuntimeDB(t *testing.T) (context.Context, *storage.DB) {
 	t.Helper()
 	dsn := os.Getenv("OUTBOX_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("OUTBOX_TEST_DATABASE_URL absent")
+		t.Skip("OUTBOX_TEST_DATABASE_URL not set")
 	}
 	ctx := context.Background()
 	db, err := storage.NewPool(ctx, dsn)
@@ -43,7 +43,7 @@ func createTestOwner(t *testing.T, ctx context.Context, db *storage.DB, telegram
 func TestPostgresOutboxIsAtomicTenantAwareAndIdempotent(t *testing.T) {
 	dsn := os.Getenv("OUTBOX_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("OUTBOX_TEST_DATABASE_URL absent")
+		t.Skip("OUTBOX_TEST_DATABASE_URL not set")
 	}
 	ctx := context.Background()
 	db, err := storage.NewPool(ctx, dsn)
@@ -67,7 +67,7 @@ func TestPostgresOutboxIsAtomicTenantAwareAndIdempotent(t *testing.T) {
 	for delivery := 0; delivery < 2; delivery++ {
 		found, err := repo.MarkDeleted(ctx, ownerID, 900001, record.BusinessConnectionID, record.ChatID, []int64{record.MessageID})
 		if err != nil || len(found) != 1 {
-			t.Fatalf("redélivrance %d: found=%d err=%v", delivery, len(found), err)
+			t.Fatalf("redelivery %d: found=%d err=%v", delivery, len(found), err)
 		}
 	}
 
@@ -78,42 +78,40 @@ func TestPostgresOutboxIsAtomicTenantAwareAndIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if count != 1 {
-		t.Fatalf("l'outbox contient %d lignes après redélivrance, attendu 1", count)
+		t.Fatalf("outbox contains %d rows after redelivery, expected 1", count)
 	}
 
 	outboxRepo := outbox.NewRepository(db)
-	// Le lease et next_attempt_at sont évalués ET écrits sur l'horloge
-	// PostgreSQL (clock_timestamp) : aucune date Go n'entre dans le
-	// scénario, on pilote les transitions via des leases réels, des
-	// délais de retry explicites et le fencing token.
-	// Le lease de 1 s (et non « le plus court possible ») est un choix
-	// délibéré : en CI, deux Claim consécutifs peuvent être espacés de
-	// plusieurs dizaines de ms (scheduling + aller-retour BD) ; un lease
-	// de 30 ms pouvait expirer AVANT le claim dupliqué, et le sleep de
-	// 60 ms n'était que 2× le lease. Les marges 1 s / 1,2 s absorbent
-	// cette latence dans les deux sens, au prix d'une seconde de test.
+	// The lease and next_attempt_at are evaluated AND written on the PostgreSQL
+	// clock (clock_timestamp): no Go timestamp enters the scenario, transitions
+	// are driven via real leases, explicit retry delays and the fencing token.
+	// The 1 s lease (not "the shortest possible") is a deliberate choice: in CI,
+	// two consecutive Claims can be tens of ms apart (scheduling + DB round
+	// trip); a 30 ms lease could expire BEFORE the duplicated claim, and the
+	// 60 ms sleep was only 2x the lease. The 1 s / 1.2 s margins absorb this
+	// latency in both directions, at the cost of one second of test time.
 	job, err := outboxRepo.Claim(ctx, ownerID, time.Second)
 	if err != nil || job == nil || job.LeaseToken == "" {
-		t.Fatalf("claim PostgreSQL: job=%+v err=%v", job, err)
+		t.Fatalf("PostgreSQL claim: job=%+v err=%v", job, err)
 	}
 	if duplicate, err := outboxRepo.Claim(ctx, ownerID, time.Minute); err != nil || duplicate != nil {
-		t.Fatalf("claim avant expiration du lease: job=%v err=%v", duplicate, err)
+		t.Fatalf("claim before lease expiry: job=%v err=%v", duplicate, err)
 	}
 	time.Sleep(1200 * time.Millisecond)
 	recovered, err := outboxRepo.Claim(ctx, ownerID, time.Minute)
 	if err != nil || recovered == nil || recovered.ID != job.ID {
-		t.Fatalf("reprise après expiration du lease: job=%v err=%v", recovered, err)
+		t.Fatalf("recovery after lease expiry: job=%v err=%v", recovered, err)
 	}
-	// L'ancien lease ne doit plus pouvoir acquitter la ligne reprise.
+	// The old lease must no longer be able to acknowledge the reclaimed row.
 	if err := outboxRepo.MarkSent(ctx, ownerID, job.ID, job.LeaseToken); !errors.Is(err, outbox.ErrLeaseLost) {
-		t.Fatalf("MarkSent avec lease périmé = %v, attendu ErrLeaseLost", err)
+		t.Fatalf("MarkSent with stale lease = %v, expected ErrLeaseLost", err)
 	}
-	// Un retry planifié loin dans le futur bloque toute reprise immédiate.
+	// A retry scheduled far in the future blocks any immediate reclamation.
 	if err := outboxRepo.MarkRetry(ctx, ownerID, recovered.ID, recovered.LeaseToken, time.Hour, "timeout"); err != nil {
 		t.Fatal(err)
 	}
 	if early, err := outboxRepo.Claim(ctx, ownerID, time.Minute); err != nil || early != nil {
-		t.Fatalf("claim avant next_attempt_at: job=%v err=%v", early, err)
+		t.Fatalf("claim before next_attempt_at: job=%v err=%v", early, err)
 	}
 
 	permanent := record
@@ -126,13 +124,13 @@ func TestPostgresOutboxIsAtomicTenantAwareAndIdempotent(t *testing.T) {
 	}
 	failedJob, err := outboxRepo.Claim(ctx, ownerID, time.Minute)
 	if err != nil || failedJob == nil {
-		t.Fatalf("claim avant échec définitif: job=%v err=%v", failedJob, err)
+		t.Fatalf("claim before permanent failure: job=%v err=%v", failedJob, err)
 	}
 	if err := outboxRepo.MarkFailed(ctx, ownerID, failedJob.ID, failedJob.LeaseToken, "telegram_400"); err != nil {
 		t.Fatal(err)
 	}
 	if failedAgain, err := outboxRepo.Claim(ctx, ownerID, time.Minute); err != nil || failedAgain != nil {
-		t.Fatalf("un job failed a été repris: job=%v err=%v", failedAgain, err)
+		t.Fatalf("a failed job was reclaimed: job=%v err=%v", failedAgain, err)
 	}
 
 	if err := db.InTenant(ctx, ownerID+1, func(tx pgx.Tx) error {
@@ -141,12 +139,12 @@ func TestPostgresOutboxIsAtomicTenantAwareAndIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if count != 0 {
-		t.Fatalf("RLS expose %d lignes à un autre tenant", count)
+		t.Fatalf("RLS exposes %d rows to another tenant", count)
 	}
 
 	ownerDSN := os.Getenv("OUTBOX_TEST_MIGRATION_DATABASE_URL")
 	if ownerDSN == "" {
-		t.Skip("OUTBOX_TEST_MIGRATION_DATABASE_URL absent pour la preuve de rollback atomique")
+		t.Skip("OUTBOX_TEST_MIGRATION_DATABASE_URL not set for the atomic rollback proof")
 	}
 	owner, err := pgx.Connect(ctx, ownerDSN)
 	if err != nil {
@@ -172,7 +170,7 @@ func TestPostgresOutboxIsAtomicTenantAwareAndIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := repo.MarkDeleted(ctx, ownerID, 900001, failing.BusinessConnectionID, failing.ChatID, []int64{failing.MessageID}); err == nil {
-		t.Fatal("le marquage devait échouer avec l'insertion outbox")
+		t.Fatal("the marking should have failed with the outbox insert")
 	}
 	var deleted bool
 	if err := db.InTenant(ctx, ownerID, func(tx pgx.Tx) error {
@@ -181,7 +179,7 @@ func TestPostgresOutboxIsAtomicTenantAwareAndIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if deleted {
-		t.Fatal("deleted_at a été committé malgré l'échec outbox")
+		t.Fatal("deleted_at was committed despite the outbox failure")
 	}
 }
 
@@ -198,7 +196,7 @@ func TestPostgresRuntimeRoleCanUseOutboxTableAndSequence(t *testing.T) {
 			RETURNING id
 		`, ownerID).Scan(&id)
 	}); err != nil {
-		t.Fatalf("le rôle runtime ne peut pas insérer via la table/séquence outbox: %v", err)
+		t.Fatalf("the runtime role cannot insert via the outbox table/sequence: %v", err)
 	}
 }
 
@@ -229,10 +227,10 @@ func TestPostgresClaimPreservesChunkOrderAcrossRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	if blocked != nil {
-		t.Fatalf("chunk suivant réclamé avant le retry du premier: %+v", blocked)
+		t.Fatalf("next chunk claimed before the first one's retry: %+v", blocked)
 	}
-	// Le retry est réel : on ramène next_attempt_at dans le passé côté
-	// serveur plutôt que d'avancer une horloge Go, qui n'a plus aucun effet.
+	// The retry is real: next_attempt_at is pulled into the past on the server
+	// side rather than advancing a Go clock, which no longer has any effect.
 	if err := db.InTenant(ctx, ownerID, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `UPDATE notification_outbox SET next_attempt_at = clock_timestamp() WHERE id = $1`, first.ID)
 		return err
@@ -248,7 +246,7 @@ func TestPostgresClaimPreservesChunkOrderAcrossRetry(t *testing.T) {
 	}
 	next, err := repo.Claim(ctx, ownerID, time.Minute)
 	if err != nil || next == nil || next.ID == first.ID {
-		t.Fatalf("claim chunk 1 après chunk 0 sent: job=%v err=%v", next, err)
+		t.Fatalf("claim chunk 1 after chunk 0 sent: job=%v err=%v", next, err)
 	}
 }
 
@@ -279,7 +277,7 @@ func TestPostgresPurgeExpiredIsTenantScopedAndKeepsActiveJobs(t *testing.T) {
 	repo := outbox.NewRepository(db)
 	purged, err := repo.PurgeExpired(ctx, []users.TenantRetention{{OwnerUserID: ownerA, RetentionDays: 7}})
 	if err != nil || purged != 2 {
-		t.Fatalf("PurgeExpired = (%d, %v), attendu (2, nil)", purged, err)
+		t.Fatalf("PurgeExpired = (%d, %v), expected (2, nil)", purged, err)
 	}
 	for ownerID, want := range map[int64]int{ownerA: 2, ownerB: 1} {
 		var count int
@@ -289,7 +287,7 @@ func TestPostgresPurgeExpiredIsTenantScopedAndKeepsActiveJobs(t *testing.T) {
 			t.Fatal(err)
 		}
 		if count != want {
-			t.Fatalf("tenant %d: %d jobs restants, attendu %d", ownerID, count, want)
+			t.Fatalf("tenant %d: %d jobs remaining, expected %d", ownerID, count, want)
 		}
 	}
 }
@@ -314,10 +312,10 @@ func TestPostgresStaleWorkerCannotAcknowledgeReclaimedLease(t *testing.T) {
 		t.Fatalf("reclaim B: A=%+v B=%+v err=%v", workerA, workerB, err)
 	}
 	if err := repo.MarkSent(ctx, ownerID, workerA.ID, workerA.LeaseToken); !errors.Is(err, outbox.ErrLeaseLost) {
-		t.Fatalf("ack stale A = %v, attendu ErrLeaseLost", err)
+		t.Fatalf("stale A ack = %v, expected ErrLeaseLost", err)
 	}
 	if err := repo.MarkRetry(ctx, ownerID, workerA.ID, workerA.LeaseToken, 0, "timeout"); !errors.Is(err, outbox.ErrLeaseLost) {
-		t.Fatalf("retry stale A = %v, attendu ErrLeaseLost", err)
+		t.Fatalf("stale A retry = %v, expected ErrLeaseLost", err)
 	}
 	var status, leaseToken string
 	if err := db.InTenant(ctx, ownerID, func(tx pgx.Tx) error {
@@ -326,16 +324,16 @@ func TestPostgresStaleWorkerCannotAcknowledgeReclaimedLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	if status != "processing" || leaseToken != workerB.LeaseToken {
-		t.Fatalf("état de B écrasé par A: status=%s token=%s", status, leaseToken)
+		t.Fatalf("B's state overwritten by A: status=%s token=%s", status, leaseToken)
 	}
 }
 
-// TestPostgresCountBacklogAgregeTousLesTenantsMalgreRLS couvre la jauge
-// undelete_outbox_backlog, et surtout la raison d'être de sa boucle
-// tenant-par-tenant : le même COUNT(*) lancé sur le pool applicatif SANS
-// contexte tenant renvoie 0 sans erreur (RLS), donc une jauge écrite
-// naïvement afficherait « aucun retard » quel que soit l'état réel.
-func TestPostgresCountBacklogAgregeTousLesTenantsMalgreRLS(t *testing.T) {
+// TestPostgresCountBacklogAggregatesAllTenantsDespiteRLS covers the
+// undelete_outbox_backlog gauge, and above all the rationale for its
+// tenant-by-tenant loop: the same COUNT(*) run on the application pool WITHOUT
+// tenant context returns 0 without error (RLS), so a naively written gauge
+// would report "no backlog" whatever the real state.
+func TestPostgresCountBacklogAggregatesAllTenantsDespiteRLS(t *testing.T) {
 	ctx, db := openRuntimeDB(t)
 	ownerA := createTestOwner(t, ctx, db, 900015)
 	ownerB := createTestOwner(t, ctx, db, 900016)
@@ -355,8 +353,8 @@ func TestPostgresCountBacklogAgregeTousLesTenantsMalgreRLS(t *testing.T) {
 	}
 	insert(ownerA, 900015, "pending", 1)
 	insert(ownerA, 900015, "processing", 2)
-	insert(ownerA, 900015, "sent", 3)   // livrée : hors backlog
-	insert(ownerA, 900015, "failed", 4) // abandonnée : hors backlog
+	insert(ownerA, 900015, "sent", 3)   // delivered: outside backlog
+	insert(ownerA, 900015, "failed", 4) // abandoned: outside backlog
 	insert(ownerB, 900016, "pending", 5)
 
 	repo := outbox.NewRepository(db)
@@ -366,12 +364,12 @@ func TestPostgresCountBacklogAgregeTousLesTenantsMalgreRLS(t *testing.T) {
 		t.Fatal(err)
 	}
 	if backlog != 3 {
-		t.Fatalf("CountBacklog = %d, attendu 3 (2 pour A, 1 pour B)", backlog)
+		t.Fatalf("CountBacklog = %d, expected 3 (2 for A, 1 for B)", backlog)
 	}
 
-	// Un seul tenant demandé : la jauge n'agrège que ce qu'on lui donne.
+	// Only one tenant requested: the gauge only aggregates what it is given.
 	if backlog, err := repo.CountBacklog(ctx, tenants[1:]); err != nil || backlog != 1 {
-		t.Fatalf("CountBacklog(B seul) = (%d, %v), attendu (1, nil)", backlog, err)
+		t.Fatalf("CountBacklog(B alone) = (%d, %v), expected (1, nil)", backlog, err)
 	}
 
 	var naive int64
@@ -381,6 +379,6 @@ func TestPostgresCountBacklogAgregeTousLesTenantsMalgreRLS(t *testing.T) {
 		t.Fatal(err)
 	}
 	if naive != 0 {
-		t.Fatalf("COUNT(*) hors InTenant = %d, attendu 0 : RLS ne masque plus les lignes, la boucle tenant-par-tenant de CountBacklog perdrait sa justification", naive)
+		t.Fatalf("COUNT(*) outside InTenant = %d, expected 0: RLS no longer hides rows, CountBacklog's tenant-by-tenant loop would lose its justification", naive)
 	}
 }

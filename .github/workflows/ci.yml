@@ -5,18 +5,18 @@ on:
   push:
     branches: [main]
 
-# Jeton en lecture seule : la CI ne publie rien, ne commente rien.
+# Read-only token: CI publishes nothing, comments on nothing.
 permissions:
   contents: read
 
-# Une seule exécution par ref : un nouveau push annule la précédente.
+# One run per ref: a new push cancels the previous one.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   lint-unit:
-    name: lint + tests unitaires
+    name: lint + unit tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -29,14 +29,14 @@ jobs:
           go-version-file: bot/go.mod
           cache-dependency-path: bot/go.sum
 
-      # gofmt ne sort rien quand tout est formaté et ne renvoie pas d’erreur
-      # sinon : c’est la présence de sortie qui doit faire échouer le job.
+      # gofmt outputs nothing when everything is formatted and returns no
+      # error otherwise: it is the presence of output that must fail the job.
       - name: gofmt
         working-directory: bot
         run: |
           unformatted=$(gofmt -l .)
           if [ -n "$unformatted" ]; then
-            echo "Fichiers non formatés (lancer gofmt -w) :" >&2
+            echo "Unformatted files (run gofmt -w):" >&2
             echo "$unformatted" >&2
             exit 1
           fi
@@ -45,14 +45,14 @@ jobs:
         working-directory: bot
         run: go vet ./...
 
-      # Les suites gates par env (integration, outbox) se skippent ici faute de
-      # DSN : elles tournent dans le job integration.
+      # The suites gated by env (integration, outbox) skip themselves here for
+      # lack of DSNs: they run in the integration job.
       - name: go test
         working-directory: bot
         run: go test ./...
 
   integration:
-    name: intégration PostgreSQL 16
+    name: PostgreSQL 16 integration
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -65,10 +65,10 @@ jobs:
           go-version-file: bot/go.mod
           cache-dependency-path: bot/go.sum
 
-      # Le script démarre lui-même son conteneur postgres:16-alpine jetable
-      # (port publié aléatoire sur 127.0.0.1, aucun volume, suppression en
-      # trap EXIT) et exporte les DSN admin/runtime/outbox. Aucun service
-      # container n’est déclaré ici : ce serait un second Postgres inutile,
-      # sans le rôle restreint créé par db/init/01-app-role.sh.
+      # The script starts its own disposable postgres:16-alpine container
+      # (random published port on 127.0.0.1, no volume, removed in a trap on
+      # EXIT) and exports the admin/runtime/outbox DSNs. No container service
+      # is declared here: that would be a useless second Postgres, without the
+      # restricted role created by db/init/01-app-role.sh.
       - name: make test-integration
         run: make test-integration

@@ -15,16 +15,16 @@ func TestBusinessConnectionCanReplyFromRights(t *testing.T) {
 		"is_enabled":true,
 		"rights":{"can_reply":true}
 	}`), &connection); err != nil {
-		t.Fatalf("json.Unmarshal() erreur: %v", err)
+		t.Fatalf("json.Unmarshal() error: %v", err)
 	}
 	if !connection.CanReply() {
-		t.Fatal("CanReply() = false malgré rights.can_reply=true")
+		t.Fatal("CanReply() = false despite rights.can_reply=true")
 	}
 }
 
 func TestBusinessConnectionCanReplyLegacy(t *testing.T) {
 	connection := BusinessConnection{CanReplyLegacy: true}
 	if !connection.CanReply() {
-		t.Fatal("CanReply() = false pour l'ancien champ can_reply")
+		t.Fatal("CanReply() = false for the legacy can_reply field")
 	}
 }

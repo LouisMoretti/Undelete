@@ -21,9 +21,9 @@ func TestLoadHealthAddr(t *testing.T) {
 		unset bool
 		want  string
 	}{
-		"valeur explicite":                 {env: "127.0.0.1:9999", want: "127.0.0.1:9999"},
-		"vide désactive le serveur":        {env: "", want: ""},
-		"valeur par défaut si non définie": {unset: true, want: defaultHealthAddr},
+		"explicit value":            {env: "127.0.0.1:9999", want: "127.0.0.1:9999"},
+		"empty disables the server": {env: "", want: ""},
+		"default value if unset":    {unset: true, want: defaultHealthAddr},
 	}
 
 	for name, tc := range cases {
@@ -31,26 +31,26 @@ func TestLoadHealthAddr(t *testing.T) {
 			validEnv(t)
 			t.Setenv("HEALTH_ADDR", tc.env)
 			if tc.unset {
-				// validEnv/t.Setenv a déjà enregistré la restauration : on
-				// peut retirer la variable pour tester le cas « absente »,
-				// distinct du cas « posée à vide ».
+				// validEnv/t.Setenv has already registered the restoration: we
+				// can unset the variable to test the "absent" case, distinct
+				// from the "set empty" case.
 				os.Unsetenv("HEALTH_ADDR")
 			}
 
 			cfg, err := Load()
 			if err != nil {
-				t.Fatalf("Load() erreur inattendue: %v", err)
+				t.Fatalf("Load() unexpected error: %v", err)
 			}
 			if cfg.HealthAddr != tc.want {
-				t.Fatalf("HealthAddr = %q, attendu %q", cfg.HealthAddr, tc.want)
+				t.Fatalf("HealthAddr = %q, want %q", cfg.HealthAddr, tc.want)
 			}
 		})
 	}
 }
 
-// Une adresse mal formée doit tomber au démarrage : sinon le bot tourne
-// normalement, net.Listen échoue dans sa goroutine et la supervision est
-// perdue en silence, sur un seul log.
+// A malformed address must fail at startup: otherwise the bot keeps running
+// normally, net.Listen fails in its goroutine and monitoring is silently
+// lost, on a single log line.
 func TestLoadRejectsMalformedHealthAddr(t *testing.T) {
 	for _, addr := range []string{"9090", "127.0.0.1", ":"} {
 		t.Run(addr, func(t *testing.T) {
@@ -59,19 +59,19 @@ func TestLoadRejectsMalformedHealthAddr(t *testing.T) {
 
 			cfg, err := Load()
 			if addr == ":" {
-				// « :port » vide reste un port valide au sens de
-				// SplitHostPort (écoute sur un port libre) : on n'invente
-				// pas une règle plus stricte que net.Listen.
+				// An empty ":port" is still a valid port per SplitHostPort
+				// (listens on an ephemeral port): we do not invent a rule
+				// stricter than net.Listen.
 				if err != nil {
-					t.Fatalf("HEALTH_ADDR=%q rejetée à tort: %v", addr, err)
+					t.Fatalf("HEALTH_ADDR=%q wrongly rejected: %v", addr, err)
 				}
 				return
 			}
 			if err == nil {
-				t.Fatalf("HEALTH_ADDR=%q acceptée, attendu une erreur (HealthAddr=%q)", addr, cfg.HealthAddr)
+				t.Fatalf("HEALTH_ADDR=%q accepted, expected an error (HealthAddr=%q)", addr, cfg.HealthAddr)
 			}
 			if !strings.Contains(err.Error(), "HEALTH_ADDR") {
-				t.Fatalf("erreur peu explicite: %v", err)
+				t.Fatalf("uninformative error: %v", err)
 			}
 		})
 	}
@@ -82,8 +82,8 @@ func TestLoadRejectsIdenticalDatabaseURLs(t *testing.T) {
 	t.Setenv("MIGRATION_DATABASE_URL", "postgres://undelete_app:app@postgres/undelete")
 
 	_, err := Load()
-	if err == nil || !strings.Contains(err.Error(), "identiques") {
-		t.Fatalf("Load() erreur = %v, attendu refus des DSN identiques", err)
+	if err == nil || !strings.Contains(err.Error(), "identical") {
+		t.Fatalf("Load() error = %v, expected rejection of identical DSNs", err)
 	}
 }
 
@@ -93,7 +93,7 @@ func TestLoadParsesOwnerGuard(t *testing.T) {
 
 	cfg, err := Load()
 	if err != nil {
-		t.Fatalf("Load() erreur inattendue: %v", err)
+		t.Fatalf("Load() unexpected error: %v", err)
 	}
 	if cfg.OwnerTelegramUserID != 123456789 {
 		t.Fatalf("OwnerTelegramUserID = %d", cfg.OwnerTelegramUserID)

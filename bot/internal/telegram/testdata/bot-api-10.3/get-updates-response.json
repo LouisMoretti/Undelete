@@ -36,7 +36,7 @@
           "first_name": "Anaïs"
         },
         "date": 1788019201,
-        "text": "Bonjour, café ☕ — déjà vu ?",
+        "text": "Hello, coffee ☕ — seen before?",
         "business_connection_id": "bc_fixture_001"
       }
     },
@@ -50,7 +50,7 @@
           "first_name": "Anaïs"
         },
         "date": 1788019202,
-        "text": "Texte corrigé 🧪",
+        "text": "Corrected text 🧪",
         "business_connection_id": "bc_fixture_001"
       }
     },

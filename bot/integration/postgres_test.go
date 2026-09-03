@@ -27,14 +27,13 @@ func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 	if err := validateExplicitDestructiveOptIn(optIn); err != nil {
 		t.Fatal(err)
 	}
-	// Un unique fusible de 30 s couvrait auparavant la connexion, les deux
-	// passes de migration, le TRUNCATE ET tous les sous-tests : sur une
-	// machine chargée (CI partagée, conteneur qui démarre à froid) il sautait
-	// au milieu et faisait échouer en cascade des sous-tests sans rapport,
-	// avec un message trompeur. On sépare donc les budgets — un plafond
-	// global généreux pour la préparation, puis une échéance propre à chaque
-	// sous-test via phaseContext — ce qui borne toujours une opération
-	// réellement bloquée sans transformer la lenteur en échec.
+	// A single 30 s fuse used to cover the connection, both migration passes,
+	// the TRUNCATE AND all subtests: on a loaded machine (shared CI,
+	// cold-start container) it blew up mid-way and cascaded unrelated subtests
+	// into failure, with a misleading message. We therefore split the budgets
+	// — a generous global ceiling for the setup, then a deadline of its own
+	// for each subtest via phaseContext — which still bounds a genuinely
+	// blocked operation without turning slowness into failure.
 	ctx, cancel := context.WithTimeout(context.Background(), setupTimeout)
 	defer cancel()
 
@@ -229,15 +228,15 @@ func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 			t.Fatalf("owner 1 read %d owner 2 chat labels", raw)
 		}
 
-		// L'alerte figée en outbox par MarkDeleted doit porter le libellé lu
-		// dans chats, pas le seul chat_id numérique.
+		// The alert pinned to the outbox by MarkDeleted must carry the label
+		// read from chats, not just the numeric chat_id.
 		var payload string
 		if err := db.InTenant(ctx, owner1.ID, func(tx pgx.Tx) error {
 			return tx.QueryRow(ctx, `SELECT payload_text FROM notification_outbox WHERE chat_id = 77 AND message_id = 1 ORDER BY chunk_index LIMIT 1`).Scan(&payload)
 		}); err != nil {
 			t.Fatalf("read outbox payload: %v", err)
 		}
-		if !strings.Contains(payload, "Chat : chat owner-1 (77)") || !strings.Contains(payload, "Date : 2026-08-29 16:00 UTC") {
+		if !strings.Contains(payload, "Chat: chat owner-1 (77)") || !strings.Contains(payload, "Date: 2026-08-29 16:00 UTC") {
 			t.Fatalf("deletion alert lacks chat identity or date: %q", payload)
 		}
 	})
@@ -282,17 +281,18 @@ func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 }
 
 const (
-	// Budget de la préparation partagée : connexion admin, deux passes de
-	// migration et remise à zéro des fixtures.
+	// Budget for the shared setup: admin connection, two migration passes and
+	// resetting the fixtures.
 	setupTimeout = 3 * time.Minute
-	// Budget d'un sous-test. Chacun ne fait que quelques requêtes ; 60 s
-	// laissent une marge confortable même sur une machine saturée tout en
-	// gardant une borne en cas de blocage réel (verrou, connexion morte).
+	// Budget for one subtest. Each only runs a few queries; 60 s leaves a
+	// comfortable margin even on a saturated machine while keeping a bound in
+	// case of a real stall (lock, dead connection).
 	phaseTimeout = time.Minute
 )
 
-// phaseContext donne à chaque sous-test son propre budget, indépendant des
-// précédents : la lenteur d'un sous-test ne consomme plus celui des suivants.
+// phaseContext gives each subtest its own budget, independent of the
+// previous ones: one subtest's slowness no longer consumes the following
+// ones'.
 func phaseContext(t *testing.T) context.Context {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), phaseTimeout)
@@ -309,9 +309,9 @@ func requireEnv(t *testing.T, name string) string {
 	return value
 }
 
-// assertPoolRejected s'appuie sur le sentinel exporté par storage, jamais sur
-// le libellé du message : reformuler l'erreur ne doit pas transformer ce
-// garde-fou en test qui passe pour la mauvaise raison.
+// assertPoolRejected relies on the sentinel exported by storage, never on
+// the message wording: rewording the error must not turn this guard into a
+// test that passes for the wrong reason.
 func assertPoolRejected(t *testing.T, ctx context.Context, dsn string) {
 	t.Helper()
 	db, err := storage.NewPool(ctx, dsn)

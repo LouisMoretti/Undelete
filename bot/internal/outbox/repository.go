@@ -14,16 +14,16 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/users"
 )
 
-var ErrLeaseLost = errors.New("lease outbox perdu")
+var ErrLeaseLost = errors.New("outbox lease lost")
 
-// Repository accède à notification_outbox exclusivement via InTenant/RLS.
+// Repository accesses notification_outbox exclusively via InTenant/RLS.
 type Repository struct {
 	db *storage.DB
 }
 
 func NewRepository(db *storage.DB) *Repository { return &Repository{db: db} }
 
-// InsertTx ajoute un chunk dans la transaction qui marque deleted_at.
+// InsertTx adds a chunk in the transaction that marks deleted_at.
 func InsertTx(ctx context.Context, tx pgx.Tx, ownerUserID, ownerTelegramUserID int64, businessConnectionID string, chatID, messageID int64, eventType string, chunkIndex int, text string) error {
 	_, err := tx.Exec(ctx, `
 		INSERT INTO notification_outbox (
@@ -34,16 +34,15 @@ func InsertTx(ctx context.Context, tx pgx.Tx, ownerUserID, ownerTelegramUserID i
 		DO NOTHING
 	`, ownerUserID, ownerTelegramUserID, businessConnectionID, chatID, messageID, eventType, chunkIndex, text)
 	if err != nil {
-		return fmt.Errorf("insertion outbox: %w", err)
+		return fmt.Errorf("outbox insert: %w", err)
 	}
 	return nil
 }
 
-// Claim réserve au plus un job du tenant. Toutes les dates (échéance de
-// retry, expiration de lease) sont évaluées sur l'horloge du serveur
-// PostgreSQL : aucun `now` Go n'entre dans la décision, une dérive entre
-// l'horloge du bot et celle de la base ne peut donc ni masquer un job ni le
-// rendre réclamable trop tôt.
+// Claim reserves at most one job for the tenant. All timestamps (retry
+// deadline, lease expiry) are evaluated on the PostgreSQL server clock: no Go
+// `now` enters the decision, so a drift between the bot clock and the
+// database clock can neither hide a job nor make it claimable too early.
 func (r *Repository) Claim(ctx context.Context, ownerUserID int64, lease time.Duration) (*Job, error) {
 	leaseToken, err := newLeaseToken()
 	if err != nil {
@@ -89,7 +88,7 @@ func (r *Repository) Claim(ctx context.Context, ownerUserID int64, lease time.Du
 			if err == pgx.ErrNoRows {
 				return nil
 			}
-			return fmt.Errorf("claim outbox: %w", err)
+			return fmt.Errorf("outbox claim: %w", err)
 		}
 		job = &claimed
 		return nil
@@ -97,8 +96,8 @@ func (r *Repository) Claim(ctx context.Context, ownerUserID int64, lease time.Du
 	return job, err
 }
 
-// MarkSent acquitte le job. sent_at et updated_at sont datés par PostgreSQL,
-// comme les comparaisons faites par Claim.
+// MarkSent acknowledges the job. sent_at and updated_at are stamped by
+// PostgreSQL, as are the comparisons made by Claim.
 func (r *Repository) MarkSent(ctx context.Context, ownerUserID, id int64, leaseToken string) error {
 	return r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
@@ -111,9 +110,9 @@ func (r *Repository) MarkSent(ctx context.Context, ownerUserID, id int64, leaseT
 	})
 }
 
-// MarkRetry replanifie le job dans `wait` : le délai est calculé côté Go
-// (backoff, retry_after de Telegram) mais l'échéance absolue est dérivée de
-// l'horloge PostgreSQL, celle-là même que Claim compare.
+// MarkRetry reschedules the job within `wait`: the delay is computed on the
+// Go side (backoff, Telegram retry_after) but the absolute deadline is derived
+// from the PostgreSQL clock, the very one Claim compares against.
 func (r *Repository) MarkRetry(ctx context.Context, ownerUserID, id int64, leaseToken string, wait time.Duration, errorClass string) error {
 	return r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
@@ -141,19 +140,19 @@ func (r *Repository) MarkFailed(ctx context.Context, ownerUserID, id int64, leas
 	})
 }
 
-// CountBacklog somme, tenant par tenant, les alertes restant à livrer
-// (status pending ou processing). C'est la source de la jauge
-// undelete_outbox_backlog : un compteur agrégé, sans aucune ventilation par
-// tenant, chat ou message -- exposer le backlog PAR tenant reviendrait à
-// publier l'activité de chaque titulaire sur /metrics.
+// CountBacklog sums, tenant by tenant, the alerts still waiting to be
+// delivered (status pending or processing). It is the source of the
+// undelete_outbox_backlog gauge: an aggregated counter with no breakdown by
+// tenant, chat or message -- exposing the backlog PER tenant would publish
+// each owner's activity on /metrics.
 //
-// La boucle InTenant n'est pas un détail de style : notification_outbox est
-// en FORCE ROW LEVEL SECURITY et le rôle applicatif n'a pas BYPASSRLS. Un
-// unique `SELECT count(*) FROM notification_outbox` exécuté sur le pool
-// applicatif sans app.current_owner_user_id posé ne verrait AUCUNE ligne et
-// renverrait 0 en permanence, sans la moindre erreur -- exactement le genre
-// de métrique faussement rassurante que cette issue cherche à éviter. On
-// reprend donc le motif de PurgeExpired, avec le contexte tenant posé.
+// The InTenant loop is not a stylistic detail: notification_outbox has FORCE
+// ROW LEVEL SECURITY and the application role does not have BYPASSRLS. A
+// single `SELECT count(*) FROM notification_outbox` run on the application
+// pool without app.current_owner_user_id set would see NO rows and always
+// return 0, without the slightest error -- exactly the kind of falsely
+// reassuring metric this issue aims to avoid. So we reuse the PurgeExpired
+// pattern, with the tenant context set.
 func (r *Repository) CountBacklog(ctx context.Context, tenants []users.TenantRetention) (int64, error) {
 	var total int64
 	for _, tenant := range tenants {
@@ -163,7 +162,7 @@ func (r *Repository) CountBacklog(ctx context.Context, tenants []users.TenantRet
 				SELECT count(*) FROM notification_outbox
 				WHERE owner_user_id = $1 AND status IN ('pending', 'processing')
 			`, tenant.OwnerUserID).Scan(&count); err != nil {
-				return fmt.Errorf("comptage backlog outbox tenant %d: %w", tenant.OwnerUserID, err)
+				return fmt.Errorf("outbox backlog count for tenant %d: %w", tenant.OwnerUserID, err)
 			}
 			total += count
 			return nil
@@ -186,7 +185,7 @@ func (r *Repository) PurgeExpired(ctx context.Context, tenants []users.TenantRet
 				  AND created_at < clock_timestamp() - make_interval(days => $2)
 			`, tenant.OwnerUserID, tenant.RetentionDays)
 			if err != nil {
-				return fmt.Errorf("purge outbox tenant %d: %w", tenant.OwnerUserID, err)
+				return fmt.Errorf("outbox purge for tenant %d: %w", tenant.OwnerUserID, err)
 			}
 			total += tag.RowsAffected()
 			return nil
@@ -201,14 +200,14 @@ func (r *Repository) PurgeExpired(ctx context.Context, tenants []users.TenantRet
 func newLeaseToken() (string, error) {
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err != nil {
-		return "", fmt.Errorf("génération token de lease: %w", err)
+		return "", fmt.Errorf("lease token generation: %w", err)
 	}
 	return hex.EncodeToString(raw[:]), nil
 }
 
 func verifyLeaseUpdate(rowsAffected, id int64, err error) error {
 	if err != nil {
-		return fmt.Errorf("mise à jour outbox: %w", err)
+		return fmt.Errorf("outbox update: %w", err)
 	}
 	if rowsAffected != 1 {
 		return fmt.Errorf("%w: id %d", ErrLeaseLost, id)

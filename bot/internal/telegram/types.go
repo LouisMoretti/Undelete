@@ -1,19 +1,18 @@
-// Package telegram implémente un client minimal pour la Bot API Telegram,
-// en net/http direct (pas de wrapper communautaire) : les champs business_*
-// (Telegram Business / Automatisation d'échange) arrivent en retard, voire
-// jamais, dans les libs tierces, et ils sont le cœur de ce produit.
+// Package telegram implements a minimal client for the Telegram Bot API,
+// using net/http directly (no community wrapper): the business_* fields
+// (Telegram Business / commerce automation) arrive late, or never, in
+// third-party libraries, and they are the core of this product.
 package telegram
 
 import "encoding/json"
 
-// AllowedUpdates est la liste EXPLICITE à passer à getUpdates.
+// AllowedUpdates is the EXPLICIT list to pass to getUpdates.
 //
-// Contrainte non négociable n°1 : sans allowed_updates explicite, Telegram
-// n'envoie AUCUN des événements business_* par défaut (ils ne font pas
-// partie du set d'updates envoyé par défaut aux bots existants) -- et ce
-// silencieusement, sans erreur. Un bot qui omettrait ce paramètre semblerait
-// fonctionner (connexion à l'API OK, getUpdates répond 200) tout en ne
-// recevant jamais aucun message.
+// Non-negotiable constraint 1: without an explicit allowed_updates, Telegram
+// sends NONE of the business_* events by default (they are not part of the
+// update set sent by default to existing bots) -- and this silently, without
+// any error. A bot that omitted this parameter would seem to work (API
+// connection OK, getUpdates answers 200) while never receiving any message.
 var AllowedUpdates = []string{
 	"business_connection",
 	"business_message",
@@ -21,7 +20,7 @@ var AllowedUpdates = []string{
 	"deleted_business_messages",
 }
 
-// apiResponse est l'enveloppe standard de toute réponse de la Bot API.
+// apiResponse is the standard envelope of any Bot API response.
 type apiResponse[T any] struct {
 	OK          bool            `json:"ok"`
 	Result      T               `json:"result"`
@@ -31,16 +30,15 @@ type apiResponse[T any] struct {
 }
 
 type responseParams struct {
-	// RetryAfter est présent sur les erreurs 429 (rate limit) : nombre de
-	// secondes à attendre avant de réessayer. Les deux boucles qui appellent
-	// l'API — telegram.Poller sur getUpdates et outbox.Worker sur sendMessage
-	// — doivent le respecter strictement plutôt que d'appliquer leur propre
-	// backoff.
+	// RetryAfter is present on 429 errors (rate limit): the number of
+	// seconds to wait before retrying. The two loops that call the API —
+	// telegram.Poller on getUpdates and outbox.Worker on sendMessage — must
+	// respect it strictly rather than applying their own backoff.
 	RetryAfter int `json:"retry_after,omitempty"`
 }
 
-// Update est une entrée renvoyée par getUpdates. Seuls les champs business_*
-// sont peuplés côté Phase 1 : allowed_updates ne demande que ceux-là.
+// Update is an entry returned by getUpdates. Only the business_* fields are
+// populated in Phase 1: allowed_updates only asks for those.
 type Update struct {
 	UpdateID                int64                    `json:"update_id"`
 	BusinessConnection      *BusinessConnection      `json:"business_connection,omitempty"`
@@ -49,8 +47,8 @@ type Update struct {
 	DeletedBusinessMessages *BusinessMessagesDeleted `json:"deleted_business_messages,omitempty"`
 }
 
-// BusinessConnection décrit une connexion Telegram Business établie ou mise
-// à jour par le titulaire du compte, depuis Réglages -> Telegram Business ->
+// BusinessConnection describes a Telegram Business connection established or
+// updated by the account holder, from Settings -> Telegram Business ->
 // Chatbots.
 type BusinessConnection struct {
 	ID         string `json:"id"`
@@ -58,16 +56,16 @@ type BusinessConnection struct {
 	UserChatID int64  `json:"user_chat_id"`
 	Date       int64  `json:"date"`
 	IsEnabled  bool   `json:"is_enabled"`
-	// Rights est la représentation Bot API actuelle. CanReplyLegacy garde
-	// seulement la compatibilité avec d'anciennes réponses où can_reply
-	// figurait directement sur BusinessConnection.
+	// Rights is the current Bot API representation. CanReplyLegacy only keeps
+	// compatibility with legacy responses where can_reply sat directly on
+	// BusinessConnection.
 	Rights         *BusinessBotRights `json:"rights,omitempty"`
 	CanReplyLegacy bool               `json:"can_reply,omitempty"`
 }
 
-// BusinessBotRights représente les droits accordés au bot par la connexion.
-// Phase 1 n'utilise que can_reply, mais le niveau d'imbrication doit être
-// fidèle à la Bot API actuelle pour ne pas persister false silencieusement.
+// BusinessBotRights represents the rights granted to the bot by the
+// connection. Phase 1 only uses can_reply, but the nesting level must match
+// the current Bot API so as not to silently persist false.
 type BusinessBotRights struct {
 	CanReply bool `json:"can_reply,omitempty"`
 }
@@ -79,7 +77,7 @@ func (c BusinessConnection) CanReply() bool {
 	return c.CanReplyLegacy
 }
 
-// User est un utilisateur ou bot Telegram minimal.
+// User is a minimal Telegram user or bot.
 type User struct {
 	ID        int64  `json:"id"`
 	IsBot     bool   `json:"is_bot"`
@@ -88,8 +86,8 @@ type User struct {
 	Username  string `json:"username,omitempty"`
 }
 
-// Chat est un chat Telegram minimal (Phase 1 : uniquement des chats privés
-// exposés par la connexion Business).
+// Chat is a minimal Telegram chat (Phase 1: only private chats exposed by
+// the Business connection).
 type Chat struct {
 	ID        int64  `json:"id"`
 	Type      string `json:"type"`
@@ -99,9 +97,10 @@ type Chat struct {
 	Title     string `json:"title,omitempty"`
 }
 
-// Message est un message Telegram, tel que reçu via business_message /
-// edited_business_message. Phase 1 : texte uniquement (message_type dérivé
-// en aval, médias hors périmètre -- cf. TODO Phase 2 dans messages/repository.go).
+// Message is a Telegram message, as received via business_message /
+// edited_business_message. Phase 1: text only (message_type derived
+// downstream, media out of scope -- cf. TODO Phase 2 in
+// messages/repository.go).
 type Message struct {
 	MessageID            int64  `json:"message_id"`
 	From                 *User  `json:"from,omitempty"`
@@ -111,44 +110,45 @@ type Message struct {
 	BusinessConnectionID string `json:"business_connection_id,omitempty"`
 }
 
-// BusinessMessagesDeleted correspond à l'update deleted_business_messages.
+// BusinessMessagesDeleted corresponds to the deleted_business_messages update.
 //
-// Contrainte non négociable n°6 : MessageIDs est un TABLEAU. Une suppression
-// groupée (l'utilisateur sélectionne plusieurs messages puis "Supprimer")
-// arrive en un seul update Telegram avec plusieurs IDs, jamais en N
-// updates séparés. Ne jamais supposer 1 update = 1 message supprimé.
+// Non-negotiable constraint 6: MessageIDs is an ARRAY. A bulk deletion (the
+// user selects several messages then "Delete") arrives in a single Telegram
+// update with multiple IDs, never as N separate updates. Never assume
+// 1 update = 1 deleted message.
 //
-// Note produit : cet update NE transporte PAS le contenu des messages
-// supprimés, seulement leurs identifiants -- d'où la nécessité de
-// bufferiser chaque message dès sa réception (business_message /
-// edited_business_message) pour pouvoir le restituer ici.
+// Product note: this update does NOT carry the content of the deleted
+// messages, only their identifiers -- hence the need to buffer every message
+// as soon as it is received (business_message / edited_business_message) so
+// it can be restored here.
 type BusinessMessagesDeleted struct {
 	BusinessConnectionID string  `json:"business_connection_id"`
 	Chat                 Chat    `json:"chat"`
 	MessageIDs           []int64 `json:"message_ids"`
 }
 
-// getUpdatesRequest sérialise les paramètres de l'appel long-polling.
+// getUpdatesRequest serializes the parameters of the long-polling call.
 type getUpdatesRequest struct {
 	Offset         int64    `json:"offset,omitempty"`
 	Timeout        int      `json:"timeout"`
 	AllowedUpdates []string `json:"allowed_updates"`
 }
 
-// SendMessageRequest sérialise les alertes sendMessage du bot.
+// SendMessageRequest serializes the bot's sendMessage alerts.
 //
-// Contrainte non négociable n°7 : ce type ne doit pas exposer
-// business_connection_id. Les seuls sendMessage de ce client sont les alertes
-// au owner — bienvenue émise par business.Service, notification de suppression
-// relayée par outbox.Worker depuis notification_outbox ; ce paramètre les
-// enverrait EN TANT QUE le titulaire, DANS la conversation surveillée. Son
-// absence du type rend ce scénario impossible par construction.
+// Non-negotiable constraint 7: this type must not expose
+// business_connection_id. The only sendMessage calls of this client are the
+// alerts to the owner — welcome sent by business.Service, deletion
+// notification relayed by outbox.Worker from notification_outbox; this
+// parameter would send them AS the account holder, INSIDE the monitored
+// conversation. Its absence from the type makes that scenario impossible by
+// construction.
 type SendMessageRequest struct {
 	ChatID int64  `json:"chat_id"`
 	Text   string `json:"text"`
 }
 
-// marshal est un raccourci utilisé par client.go.
+// marshal is a shortcut used by client.go.
 func marshal(v any) ([]byte, error) {
 	return json.Marshal(v)
 }

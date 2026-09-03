@@ -1,16 +1,16 @@
-// Package metrics expose des compteurs agrégés au format texte Prometheus.
+// Package metrics exposes aggregated counters in the Prometheus text format.
 //
-// Règle non négociable : AUCUN contenu utilisateur n'entre ici. Ni
-// telegram_user_id, ni chat_id, ni message_id, ni nom d'affichage, ni texte
-// de message, ni jeton de bot ne doivent apparaître -- ni en valeur, ni en
-// nom de série, ni surtout en LABEL. Une métrique labellisée par chat_id
-// reconstituerait la liste des conversations surveillées dans n'importe quel
-// scrape, et un endpoint /metrics est par nature moins protégé que la base.
+// Non-negotiable rule: NO user content enters here. Neither
+// telegram_user_id, nor chat_id, nor message_id, nor display name, nor
+// message text, nor bot token may appear -- neither as a value, nor as a
+// series name, nor above all as a LABEL. A metric labeled by chat_id would
+// reconstruct the list of monitored conversations in any scrape, and a
+// /metrics endpoint is by nature less protected than the database.
 //
-// Corollaire volontaire : les séries exposées n'ont AUCUN label, la liste des
-// noms est fixe et écrite en dur dans RenderPrometheus. La cardinalité est
-// donc bornée par construction (une série par nom, cinq au total), sans
-// qu'aucun garde-fou runtime ne soit nécessaire.
+// Deliberate corollary: the exposed series have NO labels, the list of names
+// is fixed and hardcoded in RenderPrometheus. Cardinality is therefore
+// bounded by construction (one series per name, five in total), without any
+// runtime guardrail being necessary.
 package metrics
 
 import (
@@ -19,9 +19,9 @@ import (
 	"sync/atomic"
 )
 
-// Counters porte l'état des compteurs. Le type est exporté pour que les
-// tests puissent instancier un jeu de compteurs isolé ; le code applicatif
-// utilise l'instance par défaut via les fonctions de paquet.
+// Counters holds the state of the counters. The type is exported so tests can
+// instantiate an isolated set of counters; application code uses the default
+// instance through the package functions.
 type Counters struct {
 	updates       atomic.Int64
 	updateErrors  atomic.Int64
@@ -31,12 +31,12 @@ type Counters struct {
 	outboxBacklog atomic.Int64
 }
 
-// std est l'instance utilisée par le binaire. Les compteurs sont atomiques :
-// le poller est séquentiel, mais l'outbox et la boucle de backlog tournent
-// dans leurs propres goroutines et écrivent en concurrence.
+// std is the instance used by the binary. The counters are atomic: the poller
+// is sequential, but the outbox and the backlog loop run in their own
+// goroutines and write concurrently.
 var std = &Counters{}
 
-// Default renvoie l'instance de paquet, à passer au serveur de santé.
+// Default returns the package instance, to pass to the health server.
 func Default() *Counters { return std }
 
 func (c *Counters) AddUpdates(n int64)       { c.updates.Add(n) }
@@ -44,17 +44,17 @@ func (c *Counters) AddUpdateErrors(n int64)  { c.updateErrors.Add(n) }
 func (c *Counters) AddOutboxRetries(n int64) { c.outboxRetries.Add(n) }
 func (c *Counters) AddDeletions(n int64)     { c.deletions.Add(n) }
 
-// AddOutboxFailed compte les alertes ABANDONNÉES définitivement. Sans cette
-// série, une alerte en échec définitif ne laisse aucune trace métrique : elle
-// quitte undelete_outbox_backlog (qui ne compte que pending/processing) sans
-// être livrée, et un pic de 4xx se lirait comme une simple décrue du backlog.
+// AddOutboxFailed counts alerts PERMANENTLY ABANDONED. Without this series, an
+// alert in permanent failure leaves no metric trace: it leaves
+// undelete_outbox_backlog (which only counts pending/processing) without
+// being delivered, and a spike of 4xx would read as a simple backlog decline.
 func (c *Counters) AddOutboxFailed(n int64) { c.outboxFailed.Add(n) }
 
-// SetOutboxBacklog publie le nombre de lignes d'outbox restant à livrer.
-// C'est une jauge : elle monte et descend, contrairement aux compteurs.
+// SetOutboxBacklog publishes the number of outbox rows still to be delivered.
+// It is a gauge: it goes up and down, unlike counters.
 func (c *Counters) SetOutboxBacklog(n int64) { c.outboxBacklog.Store(n) }
 
-// AddUpdates et consorts, version instance par défaut.
+// AddUpdates and friends, default instance versions.
 func AddUpdates(n int64)       { std.AddUpdates(n) }
 func AddUpdateErrors(n int64)  { std.AddUpdateErrors(n) }
 func AddOutboxRetries(n int64) { std.AddOutboxRetries(n) }
@@ -62,61 +62,61 @@ func AddOutboxFailed(n int64)  { std.AddOutboxFailed(n) }
 func AddDeletions(n int64)     { std.AddDeletions(n) }
 func SetOutboxBacklog(n int64) { std.SetOutboxBacklog(n) }
 
-// ContentType est le type MIME de l'exposition texte Prometheus.
+// ContentType is the MIME type of the Prometheus text exposition.
 const ContentType = "text/plain; version=0.0.4; charset=utf-8"
 
-// series décrit une série exposée. Le tableau est la liste EXHAUSTIVE des
-// noms possibles : ajouter une série se fait ici, jamais dynamiquement à
-// partir d'une donnée d'update.
+// series describes an exposed series. The array is the EXHAUSTIVE list of
+// possible names: adding a series happens here, never dynamically from an
+// update's data.
 type series struct {
 	name  string
 	help  string
-	kind  string // "counter" ou "gauge"
+	kind  string // "counter" or "gauge"
 	value func(*Counters) int64
 }
 
 var allSeries = []series{
 	{
 		name:  "undelete_updates_total",
-		help:  "Nombre total d'updates Telegram reçus et remis au handler.",
+		help:  "Total number of Telegram updates received and delivered to the handler.",
 		kind:  "counter",
 		value: func(c *Counters) int64 { return c.updates.Load() },
 	},
 	{
 		name:  "undelete_update_errors_total",
-		help:  "Nombre total d'erreurs de récupération ou de traitement d'update.",
+		help:  "Total number of update fetch or processing errors.",
 		kind:  "counter",
 		value: func(c *Counters) int64 { return c.updateErrors.Load() },
 	},
 	{
 		name:  "undelete_outbox_retries_total",
-		help:  "Nombre total de replanifications d'alertes de l'outbox.",
+		help:  "Total number of outbox alert reschedules.",
 		kind:  "counter",
 		value: func(c *Counters) int64 { return c.outboxRetries.Load() },
 	},
 	{
 		name:  "undelete_outbox_failed_total",
-		help:  "Nombre total d'alertes de l'outbox abandonnées définitivement (jamais livrées).",
+		help:  "Total number of outbox alerts permanently abandoned (never delivered).",
 		kind:  "counter",
 		value: func(c *Counters) int64 { return c.outboxFailed.Load() },
 	},
 	{
 		name:  "undelete_deletions_total",
-		help:  "Nombre total de messages supprimés retrouvés et marqués en base.",
+		help:  "Total number of deleted messages recovered and marked in the database.",
 		kind:  "counter",
 		value: func(c *Counters) int64 { return c.deletions.Load() },
 	},
 	{
 		name:  "undelete_outbox_backlog",
-		help:  "Nombre d'alertes de l'outbox restant à livrer (pending ou processing).",
+		help:  "Number of outbox alerts still to be delivered (pending or processing).",
 		kind:  "gauge",
 		value: func(c *Counters) int64 { return c.outboxBacklog.Load() },
 	},
 }
 
-// RenderPrometheus rend l'exposition texte : un bloc HELP/TYPE puis la valeur
-// pour chaque série. Aucun label n'est émis, donc aucune valeur issue d'un
-// update ne peut se retrouver dans la sortie.
+// RenderPrometheus renders the text exposition: a HELP/TYPE block then the
+// value for each series. No label is emitted, so no value coming from an
+// update can end up in the output.
 func (c *Counters) RenderPrometheus() string {
 	var b strings.Builder
 	for _, s := range allSeries {

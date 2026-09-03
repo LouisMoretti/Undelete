@@ -1,6 +1,6 @@
-// Package storage gère la connexion PostgreSQL, le runner de migrations et
-// le helper InTenant qui pose le contexte RLS avant toute requête sur une
-// table protégée.
+// Package storage manages the PostgreSQL connection, the migration runner,
+// and the InTenant helper that sets the RLS context before any query against
+// a protected table.
 package storage
 
 import (
@@ -22,34 +22,35 @@ import (
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
-// DB encapsule le pool de connexions applicatif (rôle undelete_app,
-// contraint par RLS). Toute requête sur une table RLS doit impérativement
-// passer par InTenant : le pool nu n'a pas de contexte "owner" posé.
+// DB wraps the application connection pool (undelete_app role, constrained
+// by RLS). Any query against an RLS table must go through InTenant: the bare
+// pool has no "owner" context set.
 type DB struct {
 	Pool *pgxpool.Pool
 }
 
 const runtimeRole = "undelete_app"
 
-// ErrUnsafeRuntimeRole est renvoyé (enveloppé) par NewPool quand le rôle
-// réellement authentifié n'est pas le rôle applicatif restreint. Sentinel
-// exporté pour que les tests puissent l'identifier par errors.Is plutôt que
-// par le libellé du message, qui reste libre d'évoluer.
-var ErrUnsafeRuntimeRole = errors.New("rôle runtime PostgreSQL dangereux")
+// ErrUnsafeRuntimeRole is returned (wrapped) by NewPool when the actually
+// authenticated role is not the restricted application role. Exported sentinel
+// so tests can identify it via errors.Is rather than by the message text,
+// which is free to evolve.
+var ErrUnsafeRuntimeRole = errors.New("unsafe PostgreSQL runtime role")
 
-// NewPool ouvre le pool applicatif. dsn doit être DATABASE_URL (rôle
-// undelete_app), jamais MIGRATION_DATABASE_URL. La comparaison textuelle des
-// DSN dans config.Load reste le garde-fou demandé, mais elle ne suffit pas :
-// deux chaînes différentes peuvent désigner le même superuser. On vérifie donc
-// aussi l'identité et les attributs du rôle réellement authentifié.
+// NewPool opens the application pool. dsn must be DATABASE_URL (the
+// undelete_app role), never MIGRATION_DATABASE_URL. The textual DSN
+// comparison in config.Load remains the required safeguard, but it is not
+// sufficient: two different strings can designate the same superuser. We
+// therefore also verify the identity and attributes of the actually
+// authenticated role.
 func NewPool(ctx context.Context, dsn string) (*DB, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		return nil, fmt.Errorf("ouverture du pool applicatif: %w", err)
+		return nil, fmt.Errorf("opening application pool: %w", err)
 	}
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("ping du pool applicatif: %w", err)
+		return nil, fmt.Errorf("pinging application pool: %w", err)
 	}
 
 	var role string
@@ -60,11 +61,11 @@ func NewPool(ctx context.Context, dsn string) (*DB, error) {
 		WHERE rolname = current_user
 	`).Scan(&role, &isSuperuser, &bypassRLS); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("vérification du rôle applicatif: %w", err)
+		return nil, fmt.Errorf("checking application role: %w", err)
 	}
 	if role != runtimeRole || isSuperuser || bypassRLS {
 		pool.Close()
-		return nil, fmt.Errorf("%w: rôle=%q superuser=%t bypassrls=%t; attendu %q sans privilèges de contournement RLS",
+		return nil, fmt.Errorf("%w: role=%q superuser=%t bypassrls=%t; expected %q without RLS bypass privileges",
 			ErrUnsafeRuntimeRole, role, isSuperuser, bypassRLS, runtimeRole)
 	}
 
@@ -75,28 +76,28 @@ func (db *DB) Close() {
 	db.Pool.Close()
 }
 
-// InTenant ouvre une transaction, y pose app.current_owner_user_id via
-// set_config(..., true), puis exécute fn dans cette transaction.
+// InTenant opens a transaction, sets app.current_owner_user_id on it via
+// set_config(..., true), then runs fn within that transaction.
 //
-// Le troisième argument de set_config à true = LOCAL : la variable ne vit
-// que le temps de la transaction courante. C'est indispensable avec un
-// pooler de connexions (pgxpool réutilise les connexions physiques entre
-// transactions) : sans LOCAL, un réglage SESSION resterait posé sur la
-// connexion et "fuiterait" vers la prochaine transaction d'un autre tenant
-// qui récupérerait la même connexion physique.
+// The third set_config argument set to true = LOCAL: the variable lives only
+// for the current transaction. This is essential with a connection pooler
+// (pgxpool reuses physical connections between transactions): without LOCAL,
+// a SESSION setting would remain on the connection and leak into the next
+// transaction of another tenant that happens to grab the same physical
+// connection.
 //
-// C'est le SEUL point d'entrée légitime pour toute requête sur la table
-// messages (protégée par FORCE ROW LEVEL SECURITY). Ne jamais requêter
-// messages directement via db.Pool.
+// This is the ONLY legitimate entry point for any query against the messages
+// table (protected by FORCE ROW LEVEL SECURITY). Never query messages
+// directly through db.Pool.
 func (db *DB) InTenant(ctx context.Context, ownerID int64, fn func(pgx.Tx) error) error {
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("ouverture transaction InTenant: %w", err)
+		return fmt.Errorf("opening InTenant transaction: %w", err)
 	}
-	defer tx.Rollback(ctx) // no-op si Commit a déjà eu lieu
+	defer tx.Rollback(ctx) // no-op if Commit already happened
 
 	if _, err := tx.Exec(ctx, `SELECT set_config('app.current_owner_user_id', $1, true)`, strconv.FormatInt(ownerID, 10)); err != nil {
-		return fmt.Errorf("pose du contexte RLS: %w", err)
+		return fmt.Errorf("setting RLS context: %w", err)
 	}
 
 	if err := fn(tx); err != nil {
@@ -104,30 +105,30 @@ func (db *DB) InTenant(ctx context.Context, ownerID int64, fn func(pgx.Tx) error
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit InTenant: %w", err)
+		return fmt.Errorf("committing InTenant transaction: %w", err)
 	}
 	return nil
 }
 
-// RunMigrations applique les migrations embarquées avec le DSN propriétaire
-// (superuser). Doit être appelée au boot du binaire, avant l'ouverture du
-// pool applicatif : le rôle undelete_app n'a pas les droits DDL
-// (NOCREATEDB NOCREATEROLE et pas de droits d'écriture sur le schéma avant
-// que db/init/01-app-role.sh ait posé les GRANT nécessaires).
+// RunMigrations applies the embedded migrations with the owner DSN
+// (superuser). Must be called at binary boot, before the application pool is
+// opened: the undelete_app role has no DDL privileges (NOCREATEDB NOCREATEROLE
+// and no schema write rights until db/init/01-app-role.sh has issued the
+// necessary GRANTs).
 func RunMigrations(ctx context.Context, migrationDSN string, logger *slog.Logger) error {
 	conn, err := pgx.Connect(ctx, migrationDSN)
 	if err != nil {
-		return fmt.Errorf("connexion migration: %w", err)
+		return fmt.Errorf("connecting for migrations: %w", err)
 	}
 	defer conn.Close(ctx)
 
-	// Verrou de session couvrant tout le runner : deux réplicas qui démarrent
-	// ensemble ne doivent pas lire simultanément "migration absente" puis
-	// exécuter le même DDL. La fermeture de conn libère toujours ce verrou,
-	// y compris sur un retour d'erreur.
+	// Session lock covering the whole runner: two replicas starting at the same
+	// time must not simultaneously read "migration missing" and then execute
+	// the same DDL. Closing conn always releases this lock, including on error
+	// return.
 	const migrationLockID int64 = 74617309141001
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLockID); err != nil {
-		return fmt.Errorf("verrouillage du runner de migrations: %w", err)
+		return fmt.Errorf("locking the migration runner: %w", err)
 	}
 
 	if _, err := conn.Exec(ctx, `
@@ -136,12 +137,12 @@ func RunMigrations(ctx context.Context, migrationDSN string, logger *slog.Logger
 			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)
 	`); err != nil {
-		return fmt.Errorf("création schema_migrations: %w", err)
+		return fmt.Errorf("creating schema_migrations: %w", err)
 	}
 
 	entries, err := fs.ReadDir(migrationsFS, "migrations")
 	if err != nil {
-		return fmt.Errorf("lecture des migrations embarquées: %w", err)
+		return fmt.Errorf("reading embedded migrations: %w", err)
 	}
 
 	names := make([]string, 0, len(entries))
@@ -150,22 +151,22 @@ func RunMigrations(ctx context.Context, migrationDSN string, logger *slog.Logger
 			names = append(names, e.Name())
 		}
 	}
-	sort.Strings(names) // tri par nom : le préfixe numérique fixe l'ordre d'application
+	sort.Strings(names) // sort by name: the numeric prefix fixes the application order
 
-	// Valider toutes les versions avant d'exécuter le moindre DDL évite qu'un
-	// second fichier avec le même préfixe soit silencieusement considéré comme
-	// déjà appliqué à cause de la clé primaire schema_migrations(version).
+	// Validating all versions before executing any DDL prevents a second file
+	// with the same prefix from being silently considered already applied
+	// because of the schema_migrations(version) primary key.
 	seenVersions := make(map[int]string, len(names))
 	for _, name := range names {
 		version, err := parseVersion(name)
 		if err != nil {
-			return fmt.Errorf("nom de migration invalide %q: %w", name, err)
+			return fmt.Errorf("invalid migration name %q: %w", name, err)
 		}
 		if version <= 0 {
-			return fmt.Errorf("version de migration non positive %d dans %q", version, name)
+			return fmt.Errorf("non-positive migration version %d in %q", version, name)
 		}
 		if previous, exists := seenVersions[version]; exists {
-			return fmt.Errorf("version de migration %d dupliquée dans %q et %q", version, previous, name)
+			return fmt.Errorf("duplicate migration version %d in %q and %q", version, previous, name)
 		}
 		seenVersions[version] = name
 	}
@@ -173,12 +174,12 @@ func RunMigrations(ctx context.Context, migrationDSN string, logger *slog.Logger
 	for _, name := range names {
 		version, err := parseVersion(name)
 		if err != nil {
-			return fmt.Errorf("nom de migration invalide %q: %w", name, err)
+			return fmt.Errorf("invalid migration name %q: %w", name, err)
 		}
 
 		var alreadyApplied bool
 		if err := conn.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)`, version).Scan(&alreadyApplied); err != nil {
-			return fmt.Errorf("vérification migration %d: %w", version, err)
+			return fmt.Errorf("checking migration %d: %w", version, err)
 		}
 		if alreadyApplied {
 			continue
@@ -186,45 +187,45 @@ func RunMigrations(ctx context.Context, migrationDSN string, logger *slog.Logger
 
 		sqlBytes, err := migrationsFS.ReadFile(path.Join("migrations", name))
 		if err != nil {
-			return fmt.Errorf("lecture migration %s: %w", name, err)
+			return fmt.Errorf("reading migration %s: %w", name, err)
 		}
 
-		// Chaque migration dans sa propre transaction : une migration qui
-		// échoue à mi-chemin ne doit pas laisser le schéma dans un état
-		// partiel silencieusement marqué comme appliqué.
+		// Each migration in its own transaction: a migration that fails partway
+		// must not leave the schema in a partial state silently marked as
+		// applied.
 		tx, err := conn.Begin(ctx)
 		if err != nil {
-			return fmt.Errorf("ouverture transaction migration %d: %w", version, err)
+			return fmt.Errorf("opening migration %d transaction: %w", version, err)
 		}
 
 		if _, err := tx.Exec(ctx, string(sqlBytes)); err != nil {
 			tx.Rollback(ctx)
-			return fmt.Errorf("application migration %d (%s): %w", version, name, err)
+			return fmt.Errorf("applying migration %d (%s): %w", version, name, err)
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1)`, version); err != nil {
 			tx.Rollback(ctx)
-			return fmt.Errorf("enregistrement migration %d: %w", version, err)
+			return fmt.Errorf("recording migration %d: %w", version, err)
 		}
 		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit migration %d: %w", version, err)
+			return fmt.Errorf("committing migration %d: %w", version, err)
 		}
 
-		logger.Info("migration appliquée", slog.Int("version", version), slog.String("name", name))
+		logger.Info("migration applied", slog.Int("version", version), slog.String("name", name))
 	}
 
 	return nil
 }
 
-// parseVersion extrait le préfixe numérique d'un nom de fichier de
-// migration, ex: "0001_init.sql" -> 1.
+// parseVersion extracts the numeric prefix of a migration filename,
+// e.g. "0001_init.sql" -> 1.
 func parseVersion(name string) (int, error) {
 	prefix, _, found := strings.Cut(name, "_")
 	if !found {
-		return 0, fmt.Errorf("format attendu <version>_<nom>.sql")
+		return 0, fmt.Errorf("expected format <version>_<name>.sql")
 	}
 	version, err := strconv.Atoi(prefix)
 	if err != nil {
-		return 0, fmt.Errorf("préfixe numérique invalide: %w", err)
+		return 0, fmt.Errorf("invalid numeric prefix: %w", err)
 	}
 	return version, nil
 }

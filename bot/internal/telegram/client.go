@@ -14,32 +14,31 @@ import (
 
 const apiBaseURL = "https://api.telegram.org/bot"
 
-// Client est un client HTTP minimal pour la Bot API. Volontairement sans
-// dépendance à une lib Telegram tierce (cf. commentaire de package) : ce
-// client n'expose que les méthodes utilisées par le bot.
+// Client is a minimal HTTP client for the Bot API. Deliberately free of any
+// third-party Telegram library dependency (cf. package comment): this client
+// only exposes the methods used by the bot.
 type Client struct {
 	token      string
 	httpClient *http.Client
 	baseURL    string
 }
 
-// Option ajuste un Client à la construction.
+// Option tweaks a Client at construction time.
 type Option func(*Client)
 
-// WithBaseURL remplace l'URL de base de la Bot API (préfixe, jeton exclu).
+// WithBaseURL replaces the Bot API base URL (prefix, token excluded).
 //
-// Unique raison d'être : permettre aux tests de contrat de pointer un vrai
-// Client vers un serveur httptest, y compris depuis les packages appelants
-// (app, business) qui exercent les chemins de production réels. La production
-// n'utilise jamais cette option.
+// Its only purpose: let contract tests point a real Client at an httptest
+// server, including from the calling packages (app, business) that exercise
+// the real production paths. Production never uses this option.
 func WithBaseURL(baseURL string) Option {
 	return func(c *Client) { c.baseURL = baseURL }
 }
 
-// NewClient construit un client. httpTimeout doit rester strictement
-// supérieur au timeout de long-polling passé à GetUpdates (50s) : sinon le
-// client HTTP coupe la requête avant que Telegram n'ait eu la chance de
-// répondre "pas d'update" au bout des 50s.
+// NewClient builds a client. httpTimeout must stay strictly greater than the
+// long-polling timeout passed to GetUpdates (50s): otherwise the HTTP client
+// cuts the request before Telegram has had a chance to answer "no update"
+// after 50s.
 func NewClient(token string, httpTimeout time.Duration, opts ...Option) *Client {
 	c := &Client{
 		token:      token,
@@ -55,39 +54,39 @@ func NewClient(token string, httpTimeout time.Duration, opts ...Option) *Client 
 func (c *Client) call(ctx context.Context, method string, params any, out any) error {
 	body, err := marshal(params)
 	if err != nil {
-		return fmt.Errorf("sérialisation requête %s: %w", method, err)
+		return fmt.Errorf("serializing request %s: %w", method, err)
 	}
 
 	endpoint := c.baseURL + c.token + "/" + method
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("construction requête %s: %w", method, err)
+		return fmt.Errorf("building request %s: %w", method, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		// net/http encapsule les erreurs de transport dans *url.Error, dont
-		// Error() contient l'URL complète. L'URL Bot API inclut le token dans
-		// son chemin ; propager ce wrapper jusque dans slog ferait fuiter le
-		// secret à la première erreur DNS/TLS/timeout. On ne conserve que la
-		// cause réseau, qui ne contient pas l'URL.
+		// net/http wraps transport errors in *url.Error, whose Error()
+		// contains the full URL. The Bot API URL includes the token in its
+		// path; propagating this wrapper up into slog would leak the secret
+		// at the first DNS/TLS/timeout error. We only keep the network
+		// cause, which does not contain the URL.
 		var urlErr *url.Error
 		if errors.As(err, &urlErr) {
-			return fmt.Errorf("appel %s: %w", method, urlErr.Err)
+			return fmt.Errorf("calling %s: %w", method, urlErr.Err)
 		}
-		return fmt.Errorf("appel %s: erreur de transport", method)
+		return fmt.Errorf("calling %s: transport error", method)
 	}
 	defer resp.Body.Close()
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("lecture réponse %s: %w", method, err)
+		return fmt.Errorf("reading response %s: %w", method, err)
 	}
 
 	var env apiResponse[json.RawMessage]
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return fmt.Errorf("décodage enveloppe %s (status %d): %w", method, resp.StatusCode, err)
+		return fmt.Errorf("decoding envelope %s (status %d): %w", method, resp.StatusCode, err)
 	}
 
 	if !env.OK {
@@ -104,20 +103,20 @@ func (c *Client) call(ctx context.Context, method string, params any, out any) e
 
 	if out != nil {
 		if err := json.Unmarshal(env.Result, out); err != nil {
-			return fmt.Errorf("décodage résultat %s: %w", method, err)
+			return fmt.Errorf("decoding result %s: %w", method, err)
 		}
 	}
 	return nil
 }
 
-// APIError représente une réponse {"ok": false, ...} de la Bot API.
+// APIError represents a {"ok": false, ...} response from the Bot API.
 type APIError struct {
 	Method      string
 	Code        int
 	Description string
-	// RetryAfter (secondes) n'est renseigné que sur les erreurs 429 : le
-	// poller doit dormir exactement ce temps-là avant de réessayer, cf.
-	// contrainte "respect de retry_after sur 429".
+	// RetryAfter (seconds) is only populated on 429 errors: the poller must
+	// sleep exactly that long before retrying, cf. constraint "respect
+	// retry_after on 429".
 	RetryAfter int
 }
 
@@ -125,13 +124,13 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("telegram %s: %d %s", e.Method, e.Code, e.Description)
 }
 
-// IsRateLimited signale une erreur 429 avec un retry_after exploitable.
+// IsRateLimited reports a 429 error with a usable retry_after.
 func (e *APIError) IsRateLimited() bool {
 	return e.Code == http.StatusTooManyRequests && e.RetryAfter > 0
 }
 
-// GetUpdates effectue un appel long-polling. timeoutSeconds doit être <
-// c.httpClient.Timeout (voir NewClient).
+// GetUpdates performs a long-polling call. timeoutSeconds must be <
+// c.httpClient.Timeout (see NewClient).
 func (c *Client) GetUpdates(ctx context.Context, offset int64, timeoutSeconds int) ([]Update, error) {
 	req := getUpdatesRequest{
 		Offset:         offset,
@@ -147,9 +146,9 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeoutSeconds in
 
 const sendMessageAttempts = 3
 
-// SendMessage conserve les retries bornés pour les envois non persistés
-// (par exemple le message de bienvenue). Les alertes outbox appellent
-// SendMessageOnce afin que leur backoff soit persisté en PostgreSQL.
+// SendMessage keeps the bounded retries for non-persisted sends (for
+// example the welcome message). The outbox alerts call SendMessageOnce so
+// that their backoff is persisted in PostgreSQL.
 func (c *Client) SendMessage(ctx context.Context, req SendMessageRequest) error {
 	backoff := time.Second
 	var lastErr error
@@ -180,19 +179,19 @@ func (c *Client) SendMessage(ctx context.Context, req SendMessageRequest) error 
 		}
 		backoff *= 2
 	}
-	return fmt.Errorf("sendMessage après %d tentatives: %w", sendMessageAttempts, lastErr)
+	return fmt.Errorf("sendMessage after %d attempts: %w", sendMessageAttempts, lastErr)
 }
 
-// SendMessageOnce effectue une seule tentative. Le worker outbox est seul
-// responsable de la replanification durable des alertes de suppression.
+// SendMessageOnce performs a single attempt. The outbox worker is solely
+// responsible for durably rescheduling deletion alerts.
 func (c *Client) SendMessageOnce(ctx context.Context, req SendMessageRequest) error {
 	return c.call(ctx, "sendMessage", req, nil)
 }
 
-// GetBusinessConnection interroge l'API pour une connexion Business par son
-// id. Utilisé comme dernier niveau de résolution (cache -> base -> API) :
-// après un redémarrage du bot, une connexion établie pendant l'indisponibilité
-// n'est ni en cache ni en base, seul cet appel permet de la récupérer.
+// GetBusinessConnection queries the API for a Business connection by its id.
+// Used as the last resolution level (cache -> database -> API): after a bot
+// restart, a connection established during the outage is neither in cache nor
+// in the database, only this call can recover it.
 func (c *Client) GetBusinessConnection(ctx context.Context, connectionID string) (*BusinessConnection, error) {
 	var conn BusinessConnection
 	if err := c.call(ctx, "getBusinessConnection", map[string]string{"business_connection_id": connectionID}, &conn); err != nil {

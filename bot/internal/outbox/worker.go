@@ -1,4 +1,4 @@
-// Package outbox livre durablement les alertes Telegram persistées en base.
+// Package outbox durably delivers the Telegram alerts persisted in the database.
 package outbox
 
 import (
@@ -16,16 +16,16 @@ import (
 
 const (
 	EventDeletedMessage = "deleted_message"
-	// Strictement supérieur au timeout HTTP de 60s configuré par cmd/bot.
+	// Strictly greater than the 60s HTTP timeout configured by cmd/bot.
 	defaultLease        = 2 * time.Minute
 	maxBackoff          = 15 * time.Minute
 	maxDeliveryAttempts = 5
-	// 2^10 s = 1024s dépasse déjà maxBackoff : au-delà, l'exponentiation est
-	// inutile et finirait par déborder time.Duration (durée négative).
+	// 2^10 s = 1024s already exceeds maxBackoff: beyond that, the exponentiation
+	// is useless and would eventually overflow time.Duration (negative duration).
 	maxBackoffAttempts = 10
 )
 
-// Job est une alerte réservée par un worker.
+// Job is an alert reserved by a worker.
 type Job struct {
 	ID                   int64
 	OwnerUserID          int64
@@ -39,8 +39,8 @@ type Job struct {
 	LeaseToken           string
 }
 
-// Store porte l'horloge : toutes les dates écrites ou comparées le sont côté
-// PostgreSQL. Le worker ne fournit que des durées (lease, délai de retry).
+// Store owns the clock: all timestamps written or compared are on the
+// PostgreSQL side. The worker only supplies durations (lease, retry delay).
 type Store interface {
 	Claim(context.Context, int64, time.Duration) (*Job, error)
 	MarkSent(context.Context, int64, int64, string) error
@@ -52,9 +52,9 @@ type Sender interface {
 	SendMessageOnce(context.Context, telegram.SendMessageRequest) error
 }
 
-// Worker réserve puis livre une alerte à la fois. Le lease rend un job de
-// nouveau disponible si le processus s'arrête entre Claim et l'acquittement :
-// la livraison est donc at-least-once, un doublon d'alerte reste possible.
+// Worker reserves then delivers one alert at a time. The lease makes a job
+// available again if the process stops between Claim and acknowledgement:
+// delivery is therefore at-least-once, a duplicate alert remains possible.
 type Worker struct {
 	store  Store
 	sender Sender
@@ -66,15 +66,15 @@ func NewWorker(store Store, sender Sender, logger *slog.Logger) *Worker {
 	return &Worker{store: store, sender: sender, logger: logger, lease: defaultLease}
 }
 
-// ProcessOne traite au plus une alerte du tenant. Le contenu, la connexion et
-// le texte des erreurs Telegram ne sont jamais journalisés.
+// ProcessOne processes at most one alert for the tenant. The content, the
+// connection and the text of Telegram errors are never logged.
 func (w *Worker) ProcessOne(ctx context.Context, ownerUserID int64) (bool, error) {
 	job, err := w.store.Claim(ctx, ownerUserID, w.lease)
 	if err != nil {
 		if isShutdown(ctx, err) {
 			return false, nil
 		}
-		return false, fmt.Errorf("réservation outbox: %w", err)
+		return false, fmt.Errorf("outbox reservation: %w", err)
 	}
 	if job == nil {
 		return false, nil
@@ -83,28 +83,28 @@ func (w *Worker) ProcessOne(ctx context.Context, ownerUserID int64) (bool, error
 	err = w.sender.SendMessageOnce(ctx, telegram.SendMessageRequest{
 		ChatID: job.OwnerTelegramUserID,
 		Text:   job.Text,
-		// BusinessConnectionID reste volontairement vide : l'alerte vient du bot.
+		// BusinessConnectionID is intentionally left empty: the alert comes from the bot.
 	})
 	if err == nil {
 		if err := w.store.MarkSent(ctx, ownerUserID, job.ID, job.LeaseToken); err != nil {
 			if isShutdown(ctx, err) {
-				// Alerte partie mais non acquittée : le lease expirera et le job
-				// sera repris, donc au pire un doublon après redémarrage.
-				w.logger.Warn("acquittement outbox interrompu par l'arrêt, redélivrance possible", slog.Int64("outbox_id", job.ID))
+				// Alert sent but not acknowledged: the lease will expire and the job
+				// will be picked up again, so at worst a duplicate after restart.
+				w.logger.Warn("outbox acknowledgement interrupted by shutdown, possible redelivery", slog.Int64("outbox_id", job.ID))
 				return false, nil
 			}
-			return true, fmt.Errorf("acquittement outbox: %w", err)
+			return true, fmt.Errorf("outbox acknowledgement: %w", err)
 		}
-		w.logger.Info("alerte outbox envoyée", slog.Int64("outbox_id", job.ID), slog.Int("attempt", job.Attempts+1))
+		w.logger.Info("outbox alert sent", slog.Int64("outbox_id", job.ID), slog.Int("attempt", job.Attempts+1))
 		return true, nil
 	}
 
-	// Arrêt du processus : le contexte est mort, aucun MarkRetry/MarkFailed
-	// n'aboutirait. On laisse le lease expirer, le job repartira au
-	// redémarrage. Un vrai timeout HTTP Telegram laisse ctx vivant et suit
-	// donc la voie normale du retry.
+	// Process shutdown: the context is dead, no MarkRetry/MarkFailed would
+	// succeed. We let the lease expire; the job will be picked up again on
+	// restart. A real Telegram HTTP timeout leaves ctx alive and therefore
+	// follows the normal retry path.
 	if isShutdown(ctx, err) {
-		w.logger.Info("livraison outbox interrompue par l'arrêt, reprise après expiration du lease", slog.Int64("outbox_id", job.ID))
+		w.logger.Info("outbox delivery interrupted by shutdown, resuming after lease expiry", slog.Int64("outbox_id", job.ID))
 		return false, nil
 	}
 
@@ -114,19 +114,19 @@ func (w *Worker) ProcessOne(ctx context.Context, ownerUserID int64) (bool, error
 		code = fmt.Sprintf("telegram_%d", apiErr.Code)
 		if apiErr.Code >= http.StatusBadRequest && apiErr.Code < http.StatusInternalServerError && apiErr.Code != http.StatusTooManyRequests {
 			if markErr := w.store.MarkFailed(ctx, ownerUserID, job.ID, job.LeaseToken, code); markErr != nil {
-				return true, fmt.Errorf("échec définitif outbox: %w", markErr)
+				return true, fmt.Errorf("outbox permanent failure: %w", markErr)
 			}
 			metrics.AddOutboxFailed(1)
-			w.logger.Warn("alerte outbox en échec définitif", slog.Int64("outbox_id", job.ID), slog.String("error_class", code))
+			w.logger.Warn("outbox alert permanently failed", slog.Int64("outbox_id", job.ID), slog.String("error_class", code))
 			return true, nil
 		}
 	}
 	if job.Attempts+1 >= maxDeliveryAttempts {
 		if markErr := w.store.MarkFailed(ctx, ownerUserID, job.ID, job.LeaseToken, code); markErr != nil {
-			return true, fmt.Errorf("épuisement des tentatives outbox: %w", markErr)
+			return true, fmt.Errorf("outbox attempts exhausted: %w", markErr)
 		}
 		metrics.AddOutboxFailed(1)
-		w.logger.Warn("alerte outbox en échec après épuisement des tentatives", slog.Int64("outbox_id", job.ID), slog.String("error_class", code), slog.Int("attempt", job.Attempts+1))
+		w.logger.Warn("outbox alert failed after exhausting attempts", slog.Int64("outbox_id", job.ID), slog.String("error_class", code), slog.Int("attempt", job.Attempts+1))
 		return true, nil
 	}
 
@@ -135,17 +135,17 @@ func (w *Worker) ProcessOne(ctx context.Context, ownerUserID int64) (bool, error
 		wait = time.Duration(apiErr.RetryAfter) * time.Second
 	}
 	if markErr := w.store.MarkRetry(ctx, ownerUserID, job.ID, job.LeaseToken, wait, code); markErr != nil {
-		return true, fmt.Errorf("planification retry outbox: %w", markErr)
+		return true, fmt.Errorf("outbox retry scheduling: %w", markErr)
 	}
 	metrics.AddOutboxRetries(1)
-	w.logger.Warn("alerte outbox replanifiée", slog.Int64("outbox_id", job.ID), slog.String("error_class", code), slog.Duration("retry_in", wait))
+	w.logger.Warn("outbox alert rescheduled", slog.Int64("outbox_id", job.ID), slog.String("error_class", code), slog.Duration("retry_in", wait))
 	return true, nil
 }
 
-// isShutdown distingue l'annulation du contexte du worker (arrêt du processus)
-// d'un timeout réseau côté Telegram : le timeout du client HTTP laisse ctx
-// vivant et doit rester rejouable, alors qu'un ctx mort rend toute écriture en
-// base impossible.
+// isShutdown distinguishes worker context cancellation (process shutdown) from
+// a network timeout on the Telegram side: the HTTP client timeout leaves ctx
+// alive and must remain replayable, whereas a dead ctx makes any database
+// write impossible.
 func isShutdown(ctx context.Context, err error) bool {
 	if ctx.Err() == nil {
 		return false

@@ -1,10 +1,10 @@
-// Package messages gère les tables messages et chats, toutes deux protégées
-// par FORCE ROW LEVEL SECURITY. Toute méthode de ce package qui les touche
-// passe par storage.DB.InTenant : il n'existe volontairement aucun chemin qui
-// les requêterait via le pool nu.
+// Package messages manages the messages and chats tables, both protected by
+// FORCE ROW LEVEL SECURITY. Every method in this package that touches them
+// goes through storage.DB.InTenant: there is deliberately no path that would
+// query them via the bare pool.
 //
-// chats ne porte que des libellés d'affichage (cf. migration 0003) : aucune
-// méthode d'ici ne l'interroge pour décider quoi sauvegarder ou notifier.
+// chats only carries display labels (cf. migration 0003): no method here
+// queries it to decide what to save or notify.
 package messages
 
 import (
@@ -20,33 +20,33 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/users"
 )
 
-// Record représente un message à sauvegarder. Phase 1 : texte uniquement.
+// Record represents a message to save. Phase 1: text only.
 //
-// TODO Phase 2 : ajouter les champs nécessaires aux médias (file_id
-// Telegram, chemin local sous ./media, mime_type) et les propager vers une
-// table media_files séparée (voir TODO dans la migration 0001).
+// TODO Phase 2: add the fields needed for media (Telegram file_id, local
+// path under ./media, mime_type) and propagate them to a separate
+// media_files table (see the TODO in migration 0001).
 type Record struct {
 	BusinessConnectionID string
 	ChatID               int64
 	MessageID            int64
 	FromUserID           *int64
 	FromDisplay          string
-	// MessageType est Phase 1 toujours "text" ; le champ existe déjà en
-	// base pour ne pas nécessiter de migration quand les médias arriveront.
+	// MessageType is always "text" in Phase 1; the column already exists in
+	// the database so no migration is needed when media arrives.
 	MessageType  string
 	TextContent  string
 	TelegramDate int64
-	// ChatTitle/ChatUsername/ChatType sont le libellé du chat porté par
-	// l'update. Ils ne sont pas des colonnes de messages : ils alimentent la
-	// table chats, upsertée dans la même transaction que le message (c'est le
-	// seul moment où le code voit le Chat complet, cf. migration 0003).
+	// ChatTitle/ChatUsername/ChatType are the chat label carried by the
+	// update. They are not messages columns: they feed the chats table,
+	// upserted in the same transaction as the message (the only moment the
+	// code sees the full Chat, cf. migration 0003).
 	ChatTitle    string
 	ChatUsername string
 	ChatType     string
 }
 
-// DeletedRecord est ce qui est restitué à la suppression : juste assez pour
-// notifier le owner sans avoir à requêter la ligne complète séparément.
+// DeletedRecord is what is returned on deletion: just enough to notify the
+// owner without having to query the full row separately.
 type DeletedRecord struct {
 	ChatID       int64
 	MessageID    int64
@@ -57,7 +57,7 @@ type DeletedRecord struct {
 	TelegramDate int64
 }
 
-// Repository donne accès à la table messages, exclusivement via InTenant.
+// Repository provides access to the messages table, exclusively via InTenant.
 type Repository struct {
 	db *storage.DB
 }
@@ -66,51 +66,48 @@ func NewRepository(db *storage.DB) *Repository {
 	return &Repository{db: db}
 }
 
-// Save insère ou met à jour un message.
+// Save inserts or updates a message.
 //
-// ON CONFLICT DO UPDATE : Telegram peut relivrer un update déjà traité
-// (redémarrage du poller avant confirmation de l'offset, retry réseau) ;
-// l'upsert rend l'opération idempotente sur la clé (owner_user_id,
+// ON CONFLICT DO UPDATE: Telegram may redeliver an already processed update
+// (poller restart before offset confirmation, network retry); the upsert
+// makes the operation idempotent on the key (owner_user_id,
 // business_connection_id, chat_id, message_id).
 //
-// Sur édition (edited=true), on ne garde que la DERNIÈRE version du texte
-// (comportement demandé : pas d'historique des éditions en Phase 1) et on
-// pose edited_at. Sur un nouvel enregistrement (edited=false) via un
-// business_message qui matcherait par accident un conflit existant (double
-// livraison), edited_at n'est pas touché.
+// On edit (edited=true), only the LATEST version of the text is kept
+// (requested behavior: no edit history in Phase 1) and edited_at is set. On
+// a new record (edited=false) via a business_message that accidentally
+// matches an existing conflict (double delivery), edited_at is not touched.
 //
-// Contrainte n°8 : cette méthode est appelée pour TOUT business_message /
-// edited_business_message reçu, sans aucune condition sur chat_id ou sur
-// une quelconque préférence utilisateur -- il n'existe nulle part dans ce
-// package de notion de chat "activé" ou "sélectionné". La seule chose qui
-// détermine si un message arrive jusqu'ici est le périmètre d'accès que
-// Telegram a effectivement transmis à la connexion Business (filtré en
-// amont par business.Service.Resolve, pas ici).
+// Constraint #8: this method is called for EVERY received business_message /
+// edited_business_message, with no condition on chat_id or on any user
+// preference -- there is nowhere in this package a notion of an "enabled" or
+// "selected" chat. The only thing that determines whether a message reaches
+// this point is the access scope Telegram actually granted to the Business
+// connection (filtered upstream by business.Service.Resolve, not here).
 func (r *Repository) Save(ctx context.Context, ownerUserID int64, m Record, edited bool) error {
 	return r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
-		// Libellé du chat d'abord, dans la MÊME transaction : c'est ici, et
-		// nulle part ailleurs, que le Chat complet est visible (l'update
-		// deleted_business_messages ne le transporte pas de façon fiable pour
-		// les chats déjà connus). Un renommage de contact est donc répercuté
-		// au message suivant, jamais rétroactivement.
+		// Chat label first, in the SAME transaction: this is here, and nowhere
+		// else, that the full Chat is visible (the deleted_business_messages
+		// update does not reliably carry it for already known chats). A contact
+		// rename is therefore reflected at the next message, never
+		// retroactively.
 		//
-		// Contrainte n°8 : aucune condition sur chat_id ici non plus, cette
-		// table décrit les chats vus, elle n'en sélectionne aucun.
+		// Constraint #8: no condition on chat_id here either; this table
+		// describes the chats seen, it selects none of them.
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO chats (owner_user_id, business_connection_id, chat_id, title, username, type)
 			VALUES ($1, $2, $3, $4, $5, $6)
 			ON CONFLICT (owner_user_id, business_connection_id, chat_id)
 			DO UPDATE SET
-				-- Un update qui n'apporte aucun libellé (Telegram omet les
-				-- champs optionnels du Chat selon le type d'update) ne doit
-				-- pas EFFACER celui déjà connu : on ne remplace que par une
-				-- valeur non vide.
+				-- An update that carries no label (Telegram omits optional
+				-- Chat fields depending on the update type) must not WIPE the
+				-- one already known: only replace with a non-empty value.
 				title        = CASE WHEN EXCLUDED.title    <> '' THEN EXCLUDED.title    ELSE chats.title    END,
 				username     = CASE WHEN EXCLUDED.username <> '' THEN EXCLUDED.username ELSE chats.username END,
 				type         = CASE WHEN EXCLUDED.type     <> '' THEN EXCLUDED.type     ELSE chats.type     END,
 				last_seen_at = now()
 		`, ownerUserID, m.BusinessConnectionID, m.ChatID, m.ChatTitle, m.ChatUsername, m.ChatType); err != nil {
-			return fmt.Errorf("upsert libellé de chat: %w", err)
+			return fmt.Errorf("chat label upsert: %w", err)
 		}
 
 		_, err := tx.Exec(ctx, `
@@ -133,36 +130,35 @@ func (r *Repository) Save(ctx context.Context, ownerUserID int64, m Record, edit
 			m.TelegramDate, edited,
 		)
 		if err != nil {
-			return fmt.Errorf("upsert message: %w", err)
+			return fmt.Errorf("message upsert: %w", err)
 		}
 		return nil
 	})
 }
 
-// MarkDeleted positionne deleted_at pour chaque message_id du lot, dans une
-// unique transaction, et renvoie les messages effectivement trouvés (donc
-// restituables au owner).
+// MarkDeleted sets deleted_at for each message_id in the batch, in a single
+// transaction, and returns the messages actually found (and therefore
+// restorable to the owner).
 //
-// message_ids est un tableau (contrainte n°6) : on boucle dessus via
-// ANY($n), une seule requête pour tout le lot plutôt qu'une requête par id.
+// message_ids is an array (constraint #6): we iterate over it via ANY($n),
+// one query for the whole batch rather than one query per id.
 //
-// COALESCE(deleted_at, now()) : idempotent si Telegram relivre le même
-// update deleted_business_messages (on ne veut pas écraser un deleted_at
-// déjà posé par un timestamp plus tardif).
+// COALESCE(deleted_at, now()): idempotent if Telegram redelivers the same
+// deleted_business_messages update (we do not want to overwrite an already
+// set deleted_at with a later timestamp).
 func (r *Repository) MarkDeleted(ctx context.Context, ownerUserID, ownerTelegramUserID int64, businessConnectionID string, chatID int64, messageIDs []int64) ([]DeletedRecord, error) {
 	var found []DeletedRecord
 
 	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
-		// Une seule requête supplémentaire, dans la même transaction : le
-		// libellé du chat sert uniquement à rendre l'alerte lisible. Absence
-		// de ligne = chat jamais revu depuis la migration 0003 (pas de
-		// backfill), l'alerte retombe sur son repli « chat <id> ».
+		// One extra query, in the same transaction: the chat label only serves
+		// to make the alert readable. Missing row = chat never seen since
+		// migration 0003 (no backfill), the alert falls back to "chat <id>".
 		var chatTitle, chatUsername string
 		if err := tx.QueryRow(ctx, `
 			SELECT title, username FROM chats
 			WHERE business_connection_id = $1 AND chat_id = $2
 		`, businessConnectionID, chatID).Scan(&chatTitle, &chatUsername); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("lecture libellé de chat: %w", err)
+			return fmt.Errorf("reading chat label: %w", err)
 		}
 
 		rows, err := tx.Query(ctx, `
@@ -175,7 +171,7 @@ func (r *Repository) MarkDeleted(ctx context.Context, ownerUserID, ownerTelegram
 			          message_type, COALESCE(text_content, ''), telegram_date
 		`, businessConnectionID, chatID, messageIDs)
 		if err != nil {
-			return fmt.Errorf("update deleted_at: %w", err)
+			return fmt.Errorf("updating deleted_at: %w", err)
 		}
 		defer rows.Close()
 
@@ -183,7 +179,7 @@ func (r *Repository) MarkDeleted(ctx context.Context, ownerUserID, ownerTelegram
 			var d DeletedRecord
 			if err := rows.Scan(&d.ChatID, &d.MessageID, &d.FromUserID, &d.FromDisplay,
 				&d.MessageType, &d.TextContent, &d.TelegramDate); err != nil {
-				return fmt.Errorf("lecture message supprimé: %w", err)
+				return fmt.Errorf("reading deleted message: %w", err)
 			}
 			found = append(found, d)
 		}
@@ -193,11 +189,11 @@ func (r *Repository) MarkDeleted(ctx context.Context, ownerUserID, ownerTelegram
 		rows.Close()
 
 		for _, d := range found {
-			// telegram.BuildDeletionMessageRequests est l'unique source du
-			// format et du découpage UTF-16 des alertes de suppression (les
-			// fixtures bot-api-10.3 sont produites par ce même chemin) : les
-			// chunks écrits en outbox ici sont exactement ceux que le worker
-			// enverra, sans reformulation locale parallèle.
+			// telegram.BuildDeletionMessageRequests is the single source of the
+			// format and UTF-16 splitting of deletion alerts (the bot-api-10.3
+			// fixtures are produced by this same path): the chunks written to
+			// the outbox here are exactly what the worker will send, with no
+			// parallel local rewording.
 			alert := telegram.DeletionAlert{
 				OwnerTelegramUserID: ownerTelegramUserID,
 				ChatID:              d.ChatID,
@@ -223,24 +219,24 @@ func (r *Repository) MarkDeleted(ctx context.Context, ownerUserID, ownerTelegram
 		return nil, err
 	}
 
-	// Les message_ids du lot absents de `found` correspondent à des
-	// messages jamais vus (antérieurs à la connexion Business) ou déjà
-	// purgés par la rétention : comportement attendu, pas une erreur. Le
-	// niveau debug et la décision "on continue" sont du ressort de
-	// l'appelant (app/handler.go), qui a le contexte du lot complet.
+	// message_ids of the batch missing from `found` correspond to messages
+	// never seen (prior to the Business connection) or already purged by
+	// retention: expected behavior, not an error. The debug level and the
+	// "continue" decision are up to the caller (app/handler.go), which has the
+	// context of the full batch.
 	return found, nil
 }
 
-// PurgeExpired supprime les messages dont la rétention est dépassée,
-// tenant par tenant.
+// PurgeExpired deletes messages whose retention has elapsed, tenant by
+// tenant.
 //
-// ⚠️ Piège non négociable : ceci ne PEUT PAS être un DELETE global exécuté
-// via le pool nu. Avec FORCE ROW LEVEL SECURITY sur messages et aucun
-// contexte app.current_owner_user_id posé, un tel DELETE s'exécuterait
-// SANS ERREUR et supprimerait EXACTEMENT ZÉRO ligne (la policy USING filtre
-// tout, NULL ne matchant jamais rien) -- la purge semblerait fonctionner
-// indéfiniment (aucun log d'erreur) tout en ne purgeant jamais rien. D'où
-// la boucle explicite tenant par tenant, chacun dans son propre InTenant.
+// Non-negotiable trap: this MUST NOT be a global DELETE executed via the bare
+// pool. With FORCE ROW LEVEL SECURITY on messages and no
+// app.current_owner_user_id context set, such a DELETE would run WITHOUT
+// ERROR and delete EXACTLY ZERO rows (the USING policy filters everything,
+// NULL never matching anything) -- the purge would appear to work
+// indefinitely (no error log) while never purging anything. Hence the
+// explicit tenant-by-tenant loop, each in its own InTenant.
 func (r *Repository) PurgeExpired(ctx context.Context, tenants []users.TenantRetention) (int64, error) {
 	var totalPurged int64
 

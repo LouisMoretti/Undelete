@@ -14,9 +14,9 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
 )
 
-// fakeStore tient l'horloge que le vrai Repository délègue à PostgreSQL : le
-// worker ne passe plus que des durées, c'est donc le store qui date les
-// transitions. Les tests avancent `clock` explicitement.
+// fakeStore keeps the clock that the real Repository delegates to PostgreSQL:
+// the worker only passes durations, so it is the store that timestamps the
+// transitions. Tests advance `clock` explicitly.
 type fakeStore struct {
 	job       *Job
 	clock     time.Time
@@ -68,7 +68,7 @@ func newTestWorker(store Store, sender Sender, logBuffer *bytes.Buffer) *Worker 
 }
 
 func testJob() *Job {
-	return &Job{ID: 7, OwnerUserID: 11, OwnerTelegramUserID: 42, BusinessConnectionID: "bc-secret", ChatID: 99, MessageID: 3, EventType: EventDeletedMessage, Text: "contenu privé"}
+	return &Job{ID: 7, OwnerUserID: 11, OwnerTelegramUserID: 42, BusinessConnectionID: "bc-secret", ChatID: 99, MessageID: 3, EventType: EventDeletedMessage, Text: "private content"}
 }
 
 func TestWorkerSuccessSendsAsBotAndMarksSent(t *testing.T) {
@@ -79,7 +79,7 @@ func TestWorkerSuccessSendsAsBotAndMarksSent(t *testing.T) {
 
 	processed, err := worker.ProcessOne(context.Background(), 11)
 	if err != nil || !processed {
-		t.Fatalf("ProcessOne = (%t, %v), attendu (true, nil)", processed, err)
+		t.Fatalf("ProcessOne = (%t, %v), expected (true, nil)", processed, err)
 	}
 	if !store.sent || len(sender.requests) != 1 {
 		t.Fatalf("sent=%t requests=%d", store.sent, len(sender.requests))
@@ -89,13 +89,13 @@ func TestWorkerSuccessSendsAsBotAndMarksSent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(raw), "business_connection_id") {
-		t.Fatalf("business_connection_id ne doit jamais être sérialisé pour une alerte: %s", raw)
+		t.Fatalf("business_connection_id must never be serialized for an alert: %s", raw)
 	}
-	if sender.requests[0].ChatID != 42 || !strings.Contains(sender.requests[0].Text, "contenu privé") {
-		t.Fatalf("requête inattendue: %#v", sender.requests[0])
+	if sender.requests[0].ChatID != 42 || !strings.Contains(sender.requests[0].Text, "private content") {
+		t.Fatalf("unexpected request: %#v", sender.requests[0])
 	}
-	if strings.Contains(logs.String(), "contenu privé") || strings.Contains(logs.String(), "bc-secret") {
-		t.Fatalf("fuite de contenu ou identifiant dans les logs: %s", logs.String())
+	if strings.Contains(logs.String(), "private content") || strings.Contains(logs.String(), "bc-secret") {
+		t.Fatalf("content or identifier leak in logs: %s", logs.String())
 	}
 }
 
@@ -109,7 +109,7 @@ func TestWorker429UsesRetryAfter(t *testing.T) {
 		t.Fatalf("ProcessOne = (%t, %v)", processed, err)
 	}
 	if store.retryIn != 17*time.Second {
-		t.Fatalf("délai de retry=%v, attendu 17s", store.retryIn)
+		t.Fatalf("retry delay=%v, expected 17s", store.retryIn)
 	}
 }
 
@@ -132,7 +132,7 @@ func TestWorker5xxAndTimeoutUseExponentialBackoff(t *testing.T) {
 				t.Fatal(err)
 			}
 			if store.retryIn != 4*time.Second {
-				t.Fatalf("délai de retry=%v, attendu 4s", store.retryIn)
+				t.Fatalf("retry delay=%v, expected 4s", store.retryIn)
 			}
 		})
 	}
@@ -172,8 +172,8 @@ func TestWorkerPermanent4xxMarksFailed(t *testing.T) {
 	}
 }
 
-// outboxFailedCount lit la série exposée plutôt qu'un champ interne : c'est
-// la valeur que verra réellement un scrape.
+// outboxFailedCount reads the exposed series rather than an internal field: it
+// is the value a scrape will actually see.
 func outboxFailedCount(t *testing.T) int64 {
 	t.Helper()
 	const name = "undelete_outbox_failed_total"
@@ -184,26 +184,26 @@ func outboxFailedCount(t *testing.T) int64 {
 		}
 		n, err := strconv.ParseInt(value, 10, 64)
 		if err != nil {
-			t.Fatalf("valeur illisible pour %s: %q", name, value)
+			t.Fatalf("unreadable value for %s: %q", name, value)
 		}
 		return n
 	}
-	t.Fatalf("série %s absente de l'exposition", name)
+	t.Fatalf("series %s missing from the exposition", name)
 	return 0
 }
 
-// Une alerte abandonnée quitte le backlog sans avoir été livrée : sans ce
-// compteur, les deux chemins MarkFailed ne laisseraient aucune trace
-// métrique et l'échec ne serait visible que dans les logs.
-func TestWorkerComptabiliseLesAlertesAbandonnees(t *testing.T) {
+// An abandoned alert leaves the backlog without having been delivered:
+// without this counter, both MarkFailed paths would leave no metric trace and
+// the failure would only be visible in the logs.
+func TestWorkerCountsAbandonedAlerts(t *testing.T) {
 	cases := map[string]*fakeSender{
-		"4xx définitif":       {err: &telegram.APIError{Method: "sendMessage", Code: 400}},
-		"tentatives épuisées": {err: &telegram.APIError{Method: "sendMessage", Code: 500}},
+		"permanent 4xx":      {err: &telegram.APIError{Method: "sendMessage", Code: 400}},
+		"attempts exhausted": {err: &telegram.APIError{Method: "sendMessage", Code: 500}},
 	}
 
 	for name, sender := range cases {
 		t.Run(name, func(t *testing.T) {
-			// attempts sur le store : c'est Claim qui date la tentative.
+			// attempts on the store: it is Claim that stamps the attempt.
 			store := &fakeStore{job: testJob(), attempts: maxDeliveryAttempts - 1}
 			worker := newTestWorker(store, sender, &bytes.Buffer{})
 
@@ -212,18 +212,18 @@ func TestWorkerComptabiliseLesAlertesAbandonnees(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !store.failed {
-				t.Fatal("le job devait être marqué failed")
+				t.Fatal("the job must have been marked failed")
 			}
 			if got := outboxFailedCount(t) - before; got != 1 {
-				t.Fatalf("undelete_outbox_failed_total a progressé de %d, attendu 1", got)
+				t.Fatalf("undelete_outbox_failed_total progressed by %d, expected 1", got)
 			}
 		})
 	}
 }
 
-// Un retry n'est PAS un abandon : le compteur ne doit pas bouger tant que le
-// job reste rejouable, sinon la métrique perdrait tout pouvoir d'alerte.
-func TestWorkerNeComptePasUnRetryCommeAbandon(t *testing.T) {
+// A retry is NOT an abandonment: the counter must not move while the job
+// remains replayable, otherwise the metric would lose all alerting value.
+func TestWorkerDoesNotCountRetryAsAbandonment(t *testing.T) {
 	store := &fakeStore{job: testJob()}
 	sender := &fakeSender{err: &telegram.APIError{Method: "sendMessage", Code: 500}}
 	worker := newTestWorker(store, sender, &bytes.Buffer{})
@@ -233,10 +233,10 @@ func TestWorkerNeComptePasUnRetryCommeAbandon(t *testing.T) {
 		t.Fatal(err)
 	}
 	if store.failed {
-		t.Fatal("un 500 sur une première tentative doit être replanifié, pas abandonné")
+		t.Fatal("a 500 on a first attempt must be rescheduled, not abandoned")
 	}
 	if got := outboxFailedCount(t); got != before {
-		t.Fatalf("undelete_outbox_failed_total = %d, attendu inchangé (%d)", got, before)
+		t.Fatalf("undelete_outbox_failed_total = %d, expected unchanged (%d)", got, before)
 	}
 }
 
@@ -248,10 +248,10 @@ func TestWorkerShutdownCancellationLeavesJobToLeaseExpiry(t *testing.T) {
 
 	processed, err := worker.ProcessOne(ctx, 11)
 	if err != nil || processed {
-		t.Fatalf("ProcessOne = (%t, %v), attendu (false, nil)", processed, err)
+		t.Fatalf("ProcessOne = (%t, %v), expected (false, nil)", processed, err)
 	}
 	if store.failed || !store.retryAt.IsZero() || store.attempts != 0 {
-		t.Fatalf("aucun marquage attendu avec un contexte mort: failed=%t retryAt=%v attempts=%d", store.failed, store.retryAt, store.attempts)
+		t.Fatalf("no marking expected with a dead context: failed=%t retryAt=%v attempts=%d", store.failed, store.retryAt, store.attempts)
 	}
 }
 
@@ -259,11 +259,11 @@ func TestRetryDelaySaturatesInsteadOfOverflowing(t *testing.T) {
 	for _, attempts := range []int{0, 3, 64, 1024} {
 		got := retryDelay(attempts)
 		if got <= 0 || got > maxBackoff {
-			t.Fatalf("retryDelay(%d) = %v, attendu dans ]0, %v]", attempts, got, maxBackoff)
+			t.Fatalf("retryDelay(%d) = %v, expected in ]0, %v]", attempts, got, maxBackoff)
 		}
 	}
 	if got := retryDelay(2); got != 4*time.Second {
-		t.Fatalf("retryDelay(2) = %v, attendu 4s", got)
+		t.Fatalf("retryDelay(2) = %v, expected 4s", got)
 	}
 }
 
@@ -271,20 +271,20 @@ func TestClaimLeaseAllowsRecoveryAfterCrash(t *testing.T) {
 	store := &fakeStore{job: testJob(), clock: time.Unix(100, 0)}
 	claimed, err := store.Claim(context.Background(), 11, time.Minute)
 	if err != nil || claimed == nil {
-		t.Fatal("première réservation impossible")
+		t.Fatal("first reservation impossible")
 	}
 	store.clock = store.clock.Add(30 * time.Second)
 	if again, _ := store.Claim(context.Background(), 11, time.Minute); again != nil {
-		t.Fatal("le job ne doit pas être repris avant expiration du lease")
+		t.Fatal("the job must not be picked up before lease expiry")
 	}
 	store.clock = store.clock.Add(30 * time.Second)
 	if recovered, _ := store.Claim(context.Background(), 11, time.Minute); recovered == nil {
-		t.Fatal("le job doit être repris après un crash et expiration du lease")
+		t.Fatal("the job must be picked up after a crash and lease expiry")
 	}
 }
 
-// sequentialStore livre les jobs dans l'ordre et sans échec : suffisant pour
-// vérifier le relais de tous les chunks d'un même message.
+// sequentialStore delivers the jobs in order and without failure: sufficient
+// to verify the relay of all chunks of a single message.
 type sequentialStore struct {
 	jobs []*Job
 	i    int
@@ -313,15 +313,15 @@ func (s *sequentialStore) MarkFailed(context.Context, int64, int64, string, stri
 	return nil
 }
 
-// TestWorkerSendsEveryChunkInOrderToOwner est le contrat de suppression sur
-// le chemin de production actuel : les chunks sont écrits en outbox par
-// messages.MarkDeleted (via telegram.BuildDeletionMessageRequests) et le
-// worker doit les relayer TOUS, dans l'ordre, au owner, sans jamais
-// sérialiser business_connection_id.
+// TestWorkerSendsEveryChunkInOrderToOwner is the deletion contract on the
+// current production path: the chunks are written to the outbox by
+// messages.MarkDeleted (via telegram.BuildDeletionMessageRequests) and the
+// worker must relay ALL of them, in order, to the owner, without ever
+// serializing business_connection_id.
 func TestWorkerSendsEveryChunkInOrderToOwner(t *testing.T) {
 	store := &sequentialStore{jobs: []*Job{
-		{ID: 1, OwnerUserID: 11, OwnerTelegramUserID: 42, BusinessConnectionID: "bc-secret", ChatID: 99, MessageID: 3, EventType: EventDeletedMessage, Text: "partie-un"},
-		{ID: 2, OwnerUserID: 11, OwnerTelegramUserID: 42, BusinessConnectionID: "bc-secret", ChatID: 99, MessageID: 3, EventType: EventDeletedMessage, Text: "partie-deux"},
+		{ID: 1, OwnerUserID: 11, OwnerTelegramUserID: 42, BusinessConnectionID: "bc-secret", ChatID: 99, MessageID: 3, EventType: EventDeletedMessage, Text: "part-one"},
+		{ID: 2, OwnerUserID: 11, OwnerTelegramUserID: 42, BusinessConnectionID: "bc-secret", ChatID: 99, MessageID: 3, EventType: EventDeletedMessage, Text: "part-two"},
 	}}
 	sender := &fakeSender{}
 	var logs bytes.Buffer
@@ -330,12 +330,12 @@ func TestWorkerSendsEveryChunkInOrderToOwner(t *testing.T) {
 	for i := 0; i < len(store.jobs); i++ {
 		processed, err := worker.ProcessOne(context.Background(), 11)
 		if err != nil || !processed {
-			t.Fatalf("ProcessOne %d = (%t, %v), attendu (true, nil)", i, processed, err)
+			t.Fatalf("ProcessOne %d = (%t, %v), expected (true, nil)", i, processed, err)
 		}
 	}
 
 	if len(sender.requests) != 2 || store.sent != 2 {
-		t.Fatalf("requests=%d sent=%d, attendu 2/2", len(sender.requests), store.sent)
+		t.Fatalf("requests=%d sent=%d, expected 2/2", len(sender.requests), store.sent)
 	}
 	for i, req := range sender.requests {
 		raw, err := json.Marshal(req)
@@ -343,16 +343,16 @@ func TestWorkerSendsEveryChunkInOrderToOwner(t *testing.T) {
 			t.Fatal(err)
 		}
 		if strings.Contains(string(raw), "business_connection_id") {
-			t.Fatalf("business_connection_id sérialisé sur le chunk %d: %s", i, raw)
+			t.Fatalf("business_connection_id serialized on chunk %d: %s", i, raw)
 		}
 		if req.ChatID != 42 {
-			t.Fatalf("chunk %d adressé au chat %d, attendu le owner 42", i, req.ChatID)
+			t.Fatalf("chunk %d addressed to chat %d, expected owner 42", i, req.ChatID)
 		}
 	}
-	if sender.requests[0].Text != "partie-un" || sender.requests[1].Text != "partie-deux" {
-		t.Fatalf("chunks relayés hors ordre: %q puis %q", sender.requests[0].Text, sender.requests[1].Text)
+	if sender.requests[0].Text != "part-one" || sender.requests[1].Text != "part-two" {
+		t.Fatalf("chunks relayed out of order: %q then %q", sender.requests[0].Text, sender.requests[1].Text)
 	}
-	if strings.Contains(logs.String(), "partie-un") || strings.Contains(logs.String(), "bc-secret") {
-		t.Fatalf("fuite de contenu ou identifiant dans les logs: %s", logs.String())
+	if strings.Contains(logs.String(), "part-one") || strings.Contains(logs.String(), "bc-secret") {
+		t.Fatalf("content or identifier leak in logs: %s", logs.String())
 	}
 }

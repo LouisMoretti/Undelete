@@ -3,12 +3,12 @@
 # Build Go
 bot/undelete-bot
 
-# Données locales (bind mounts docker-compose)
+# Local data (docker-compose bind mounts)
 /media/*
 !/media/.gitkeep
 /backups/*
 !/backups/.gitkeep
 
-# Éditeurs / OS
+# Editors / OS
 .DS_Store
 *.swp

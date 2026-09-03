@@ -5,9 +5,9 @@ import (
 	"testing"
 )
 
-// expectedSeries fige le contrat d'exposition : cette liste EST la
-// cardinalité totale de /metrics. Un ajout de série doit être un choix
-// délibéré, visible en revue, pas un effet de bord.
+// expectedSeries freezes the exposition contract: this list IS the total
+// cardinality of /metrics. Adding a series must be a deliberate choice,
+// visible in review, not a side effect.
 var expectedSeries = []string{
 	"undelete_updates_total",
 	"undelete_update_errors_total",
@@ -17,7 +17,7 @@ var expectedSeries = []string{
 	"undelete_outbox_backlog",
 }
 
-func TestRenderPrometheusExposeLesSeriesAttendues(t *testing.T) {
+func TestRenderPrometheusExposesExpectedSeries(t *testing.T) {
 	c := &Counters{}
 	c.AddUpdates(3)
 	c.AddUpdateErrors(1)
@@ -37,22 +37,21 @@ func TestRenderPrometheusExposeLesSeriesAttendues(t *testing.T) {
 		"undelete_outbox_backlog 4",
 	} {
 		if !strings.Contains(out, want) {
-			t.Fatalf("sortie sans %q:\n%s", want, out)
+			t.Fatalf("output without %q:\n%s", want, out)
 		}
 	}
 
 	for _, name := range expectedSeries {
 		if !strings.Contains(out, "# HELP "+name+" ") || !strings.Contains(out, "# TYPE "+name+" ") {
-			t.Fatalf("série %q sans HELP/TYPE:\n%s", name, out)
+			t.Fatalf("series %q without HELP/TYPE:\n%s", name, out)
 		}
 	}
 }
 
-// TestRenderPrometheusNEmetAucunLabel est le garde-fou de confidentialité :
-// aucun label n'est émis, donc aucun id, nom, texte ou jeton ne peut se
-// glisser dans l'exposition. Un `{` sur une ligne de valeur signalerait
-// l'apparition d'une dimension dynamique.
-func TestRenderPrometheusNEmetAucunLabel(t *testing.T) {
+// TestRenderPrometheusEmitsNoLabel is the confidentiality guardrail: no label
+// is emitted, so no id, name, text or token can slip into the exposition. A
+// `{` on a value line would signal the appearance of a dynamic dimension.
+func TestRenderPrometheusEmitsNoLabel(t *testing.T) {
 	c := &Counters{}
 	c.AddUpdates(1)
 
@@ -64,35 +63,35 @@ func TestRenderPrometheusNEmetAucunLabel(t *testing.T) {
 			continue
 		}
 		if strings.ContainsAny(line, "{}") {
-			t.Fatalf("label détecté dans la ligne %q", line)
+			t.Fatalf("label detected in line %q", line)
 		}
 		name, _, found := strings.Cut(line, " ")
 		if !found {
-			t.Fatalf("ligne de métrique malformée: %q", line)
+			t.Fatalf("malformed metric line: %q", line)
 		}
 		if names[name] {
-			t.Fatalf("série %q exposée deux fois", name)
+			t.Fatalf("series %q exposed twice", name)
 		}
 		names[name] = true
 	}
 
 	if len(names) != len(expectedSeries) {
-		t.Fatalf("nombre de séries = %d, attendu %d (cardinalité bornée)", len(names), len(expectedSeries))
+		t.Fatalf("number of series = %d, expected %d (bounded cardinality)", len(names), len(expectedSeries))
 	}
 	for _, want := range expectedSeries {
 		if !names[want] {
-			t.Fatalf("série %q absente de l'exposition", want)
+			t.Fatalf("series %q missing from the exposition", want)
 		}
 	}
 }
 
-func TestCountersSontIndependantsDeLInstanceParDefaut(t *testing.T) {
+func TestCountersAreIndependentOfDefaultInstance(t *testing.T) {
 	before := Default().RenderPrometheus()
 
 	c := &Counters{}
 	c.AddDeletions(42)
 
 	if Default().RenderPrometheus() != before {
-		t.Fatal("un jeu de compteurs isolé a modifié l'instance par défaut")
+		t.Fatal("an isolated set of counters modified the default instance")
 	}
 }

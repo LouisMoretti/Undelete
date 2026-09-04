@@ -19,8 +19,9 @@ All commands are run from the repository root on the VM.
 
 > ### ⛔ FORBIDDEN WITHOUT EXPLICIT CONFIRMATION FROM LOUIS
 >
-> The commands below destroy data that **nothing restores** (the dumps in
-> `./backups` cover the database, never the volume nor `./media`).
+> The commands below destroy data that **nothing restores** (`./backups` holds
+> the database dumps and the media archives, never the volume itself, and
+> never anything newer than the last pass).
 > None of them is required to deploy, update or roll back. They must **never**
 > be run "to unblock" an incident, nor be proposed as a remedy by an agent.
 >
@@ -148,6 +149,19 @@ docker compose exec -T -e BACKUP_DIR=/backups backup sh /scripts/backup.sh
 > **Do not deploy without a fresh dump.** Step 2 applies migrations with the
 > owner role; this is the only moment where the schema can change in a
 > non-reversible way.
+
+Media are backed up in the same pass, right after the dump. Forcing one by
+hand takes the same shape — and, like the dump, needs its directories passed
+explicitly since an `exec` session inherits nothing from the service loop:
+
+```bash
+docker compose exec -T -e BACKUP_DIR=/backups -e MEDIA_DIR=/media backup sh /scripts/backup-media.sh
+```
+
+It writes an archive plus its `MANIFEST`, `.sha256` and `.meta` sidecars, and
+**deletes nothing** — media retention is manual. Exit code `2` means the
+archive was written but some paths were excluded (see the `.skipped` sidecar).
+Details, retention procedure and restore order: `docs/backup-restore.md`.
 
 Note the dump name: it is the rollback point of §3.3.
 
@@ -480,10 +494,14 @@ to "test faster" on the production database.
 ```bash
 sh scripts/preflight.sh   # configuration drift, disk, token validity
 make test-restore         # (after #7) restoration of a real dump into a throwable database
+make test-restore-media   # restoration of the dump + media pair, and reconciliation
 ```
 
 A backup that has never been restored is not a backup. `make test-restore`
-is the check that turns `./backups` into a real safety net.
+is the check that turns `./backups` into a real safety net;
+`make test-restore-media` extends it to the other half of the data, since a
+restored catalogue whose files are missing is a database of dangling
+references.
 
 **Suggested homelab cron** (non-root user owning the repository):
 
@@ -492,8 +510,9 @@ is the check that turns `./backups` into a real safety net.
 15 6 * * *  cd /srv/undelete && sh scripts/preflight.sh >> /var/log/undelete-preflight.log 2>&1
 
 # Weekly recipe: integration suite + restoration of a real dump.
-30 3 * * 0  cd /srv/undelete && make test-integration >> /var/log/undelete-recipe.log 2>&1
-45 3 * * 0  cd /srv/undelete && make test-restore     >> /var/log/undelete-recipe.log 2>&1
+30 3 * * 0  cd /srv/undelete && make test-integration   >> /var/log/undelete-recipe.log 2>&1
+45 3 * * 0  cd /srv/undelete && make test-restore       >> /var/log/undelete-recipe.log 2>&1
+15 4 * * 0  cd /srv/undelete && make test-restore-media >> /var/log/undelete-recipe.log 2>&1
 ```
 
 On NixOS, the declarative equivalent (`services.cron.systemCronJobs` or a
@@ -508,6 +527,7 @@ path to the actual location of the repository on the VM.
 |---|---|
 | Preflight | `sh scripts/preflight.sh` |
 | Immediate backup | `docker compose exec -T -e BACKUP_DIR=/backups backup sh /scripts/backup.sh` |
+| Immediate media backup | `docker compose exec -T -e BACKUP_DIR=/backups -e MEDIA_DIR=/media backup sh /scripts/backup-media.sh` |
 | Deploy / update | `make up` (`docker compose up --build -d`) |
 | Logs | `make logs` (`docker compose logs -f bot`) |
 | Service state | `docker compose ps` |

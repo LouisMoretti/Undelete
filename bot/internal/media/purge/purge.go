@@ -137,7 +137,7 @@ var ErrUnsafeTarget = errors.New("unsafe media purge target")
 // this package therefore loops tenant by tenant (constraint #4), exactly like
 // messages.PurgeExpired.
 type Catalogue interface {
-	ListExpiredStored(ctx context.Context, ownerUserID int64, retentionDays, limit int) ([]media.File, error)
+	ListExpiredStored(ctx context.Context, ownerUserID, afterID int64, retentionDays, limit int) ([]media.File, error)
 	ListStoredPage(ctx context.Context, ownerUserID, afterID int64, limit int) ([]media.File, error)
 	KnownPaths(ctx context.Context, ownerUserID int64, relPaths []string) (map[string]struct{}, error)
 	MarkPurged(ctx context.Context, ownerUserID, id int64) error
@@ -341,15 +341,21 @@ func (p *Purger) runTenant(ctx context.Context, tenant users.TenantRetention) (S
 // A refused entry (symlink, not a regular file, path outside the root) leaves
 // its row untouched and 'stored'. Marking it purged would erase the only
 // pointer to something that is still on disk, and the point of refusing is to
-// keep a human able to look at it.
+// keep a human able to look at it. Which is exactly why the batches advance on
+// a keyset cursor: a refused row stays expired and would otherwise be handed
+// back at the head of every following batch, and enough of them would fill the
+// batch entirely and stall the retention of everything behind them. The cursor
+// skips them for the rest of the run; the next run retries them from scratch.
 func (p *Purger) purgeExpired(ctx context.Context, tenant users.TenantRetention) (Stats, error) {
 	var stats Stats
+	var cursor int64
+	capped := true
 
 	for batch := 0; batch < maxBatchesPerTenant; batch++ {
 		if ctx.Err() != nil {
 			return stats, nil
 		}
-		files, err := p.cfg.Catalogue.ListExpiredStored(ctx, tenant.OwnerUserID, tenant.RetentionDays, batchSize)
+		files, err := p.cfg.Catalogue.ListExpiredStored(ctx, tenant.OwnerUserID, cursor, tenant.RetentionDays, batchSize)
 		if err != nil {
 			return stats, err
 		}
@@ -357,6 +363,7 @@ func (p *Purger) purgeExpired(ctx context.Context, tenant users.TenantRetention)
 			if ctx.Err() != nil {
 				return stats, nil
 			}
+			cursor = file.ID
 			unlinked, err := p.removeFiles(file, "retention")
 			stats.add(unlinked)
 			if err != nil {
@@ -380,8 +387,19 @@ func (p *Purger) purgeExpired(ctx context.Context, tenant users.TenantRetention)
 			stats.RowsPurged++
 		}
 		if p.cfg.DryRun || len(files) < batchSize {
+			capped = false
 			break
 		}
+	}
+	if capped {
+		// The bound did its job, and that is worth seeing: a tenant capturing
+		// more than maxBatchesPerTenant*batchSize expiring media a day falls
+		// further behind on every pass, and without this line the summary of a
+		// run that could not keep up looks exactly like a healthy one.
+		p.cfg.Logger.Warn("media purge: retention stopped at its per-run bound, resuming tomorrow",
+			slog.Int64("owner_user_id", tenant.OwnerUserID),
+			slog.Int("files_deleted", int(stats.FilesDeleted)),
+			slog.Int64("refused", stats.Refused))
 	}
 	return stats, nil
 }
@@ -595,6 +613,19 @@ func (p *Purger) reconcileDisk(ctx context.Context, tenant users.TenantRetention
 			stats.Refused++
 			return nil
 		}
+		// WalkDir walks in lexical order, so a path at or before the cursor was
+		// already examined by a previous run. Tested BEFORE the refusals, so an
+		// anomaly is reported once, when the sweep first reaches it, instead of
+		// being re-counted by every resumed pass over the same prefix.
+		//
+		// This compares whole relative paths where WalkDir orders entry NAMES
+		// per directory. The two agree because the layout is uniform --
+		// <owner>/<yyyy-mm>/<dd>/<key>, every file at the same depth, every
+		// directory component fixed-width -- and a future layout with files and
+		// directories side by side in one parent would have to revisit it.
+		if rel <= cursor {
+			return nil
+		}
 		if entry.Type()&fs.ModeSymlink != 0 {
 			stats.Refused++
 			p.refused(rel, "symlink in the media tree",
@@ -605,11 +636,6 @@ func (p *Purger) reconcileDisk(ctx context.Context, tenant users.TenantRetention
 			stats.Refused++
 			p.refused(rel, "irregular entry in the media tree",
 				fmt.Errorf("%w: %s", ErrUnsafeTarget, entry.Type()))
-			return nil
-		}
-		// WalkDir walks in lexical order, so a path at or before the cursor was
-		// already examined by a previous run.
-		if rel <= cursor {
 			return nil
 		}
 		if examined >= maxFilesPerRun {
@@ -694,6 +720,7 @@ func (p *Purger) sweepBatch(ctx context.Context, owner int64, batch []candidate)
 		removed, err := p.remove(c.rel, "unreferenced")
 		if err != nil {
 			stats.Refused++
+			p.refused(c.rel, "unreferenced entry refused", err)
 			continue
 		}
 		if !removed {

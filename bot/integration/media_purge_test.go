@@ -242,6 +242,17 @@ func TestPostgreSQL16MediaRetentionPurge(t *testing.T) {
 		if !queued {
 			t.Fatal("the requeued row is not visible to the fetch loop")
 		}
+		// And the retry window it was just granted is real: the row was
+		// captured long before PendingMaxAge, so a stale-pending deadline read
+		// from created_at alone would delete it on the very next pass, before
+		// the fetch loop ever got its chance.
+		backdate(t, id, purge.PendingMaxAge+time.Hour, 0)
+		if _, err := newPurger(t, false).Run(phaseContext(t), []users.TenantRetention{tenant}); err != nil {
+			t.Fatalf("second run: %v", err)
+		}
+		if !rowExists(t, id) {
+			t.Fatal("the requeued row was deleted before the fetch loop had its retry window")
+		}
 		// Leave a clean slate for the phases below.
 		if _, err := admin.Exec(ctx, `DELETE FROM media_files WHERE id = $1`, id); err != nil {
 			t.Fatalf("cleanup: %v", err)

@@ -420,21 +420,29 @@ func (r *Repository) MarkPendingRetry(ctx context.Context, ownerUserID, id int64
 	`)
 }
 
-// ListExpiredStored returns at most limit attachments whose file is on disk and
-// whose retention has elapsed, oldest first. The caller deletes the blob then
-// calls MarkPurged; the batch is bounded so one pass can never turn into an
-// unbounded scan-and-delete.
-func (r *Repository) ListExpiredStored(ctx context.Context, ownerUserID int64, retentionDays, limit int) ([]File, error) {
+// ListExpiredStored returns at most limit attachments whose file is on disk,
+// whose retention has elapsed and whose id is strictly greater than afterID,
+// oldest first. The caller deletes the blob then calls MarkPurged; the batch is
+// bounded so one pass can never turn into an unbounded scan-and-delete.
+//
+// The cursor is what keeps a batch from being filled by rows that cannot
+// advance. A row leaves this result set by becoming 'purged', and a REFUSED
+// row (a symlink at the storage path, anything that is not a plain file) is
+// deliberately left 'stored': without a cursor it would come back at the head
+// of every following batch, and enough of them would fill the whole batch and
+// stall the retention of everything behind them.
+func (r *Repository) ListExpiredStored(ctx context.Context, ownerUserID, afterID int64, retentionDays, limit int) ([]File, error) {
 	var files []File
 	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT`+selectColumns+`
 			FROM media_files
 			WHERE status = 'stored'
-			  AND created_at < now() - make_interval(days => $1)
+			  AND id > $1
+			  AND created_at < now() - make_interval(days => $2)
 			ORDER BY id
-			LIMIT $2
-		`, retentionDays, limit)
+			LIMIT $3
+		`, afterID, retentionDays, limit)
 		if err != nil {
 			return err
 		}
@@ -528,6 +536,16 @@ func (r *Repository) KnownPaths(ctx context.Context, ownerUserID int64, relPaths
 // indefinitely), and the tenant's own retention, which no metadata may
 // outlive.
 //
+// The two are NOT symmetrical, which is why they are not a LEAST any more.
+// Retention is absolute: past it the row goes, whatever happened to it since.
+// maxAge, on the other hand, measures a wait, and a wait starts over when the
+// row is requeued -- MarkPendingRetry sends a row whose file vanished back to
+// the download queue while leaving created_at at the capture time, so on
+// created_at alone a row requeued from an older crash would be deleted at the
+// very next daily pass instead of getting the retry window it was just
+// granted. It is therefore counted from created_at AND updated_at, which are
+// equal for a row that was never downloaded.
+//
 // DELETE ... WHERE id IN (SELECT ... LIMIT): PostgreSQL has no LIMIT on
 // DELETE, and the bound is the point.
 func (r *Repository) DeleteStalePending(ctx context.Context, ownerUserID int64, maxAge time.Duration, retentionDays, limit int) (int64, error) {
@@ -538,9 +556,14 @@ func (r *Repository) DeleteStalePending(ctx context.Context, ownerUserID int64, 
 			WHERE id IN (
 				SELECT id FROM media_files
 				WHERE status = 'pending'
-				  AND created_at < now() - LEAST(
-				        make_interval(secs => $1),
-				        make_interval(days => $2))
+				  AND (
+				        -- Retention is absolute: no metadata outlives it,
+				        -- requeued or not.
+				        created_at < now() - make_interval(days => $2)
+				        -- Staleness, which a requeue resets.
+				        OR (created_at < now() - make_interval(secs => $1)
+				            AND updated_at < now() - make_interval(secs => $1))
+				      )
 				ORDER BY id
 				LIMIT $3
 			)

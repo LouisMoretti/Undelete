@@ -75,12 +75,12 @@ func (c *fakeCatalogue) note(limit int) {
 	}
 }
 
-func (c *fakeCatalogue) ListExpiredStored(_ context.Context, _ int64, retentionDays, limit int) ([]media.File, error) {
+func (c *fakeCatalogue) ListExpiredStored(_ context.Context, _, afterID int64, retentionDays, limit int) ([]media.File, error) {
 	c.note(limit)
 	cutoff := c.now().AddDate(0, 0, -retentionDays)
 	var out []media.File
 	for _, row := range c.sorted() {
-		if row.file.Status == media.StatusStored && row.file.CreatedAt.Before(cutoff) {
+		if row.file.Status == media.StatusStored && row.file.ID > afterID && row.file.CreatedAt.Before(cutoff) {
 			out = append(out, row.file)
 			if len(out) == limit {
 				break
@@ -155,16 +155,18 @@ func (c *fakeCatalogue) MarkPendingRetry(_ context.Context, _, id int64) error {
 
 func (c *fakeCatalogue) DeleteStalePending(_ context.Context, _ int64, maxAge time.Duration, retentionDays, limit int) (int64, error) {
 	c.note(limit)
-	cutoff := c.now().Add(-maxAge)
-	if byRetention := c.now().AddDate(0, 0, -retentionDays); byRetention.After(cutoff) {
-		cutoff = byRetention
-	}
+	staleCutoff := c.now().Add(-maxAge)
+	retentionCutoff := c.now().AddDate(0, 0, -retentionDays)
 	var deleted int64
 	for _, row := range c.sorted() {
 		if deleted == int64(limit) {
 			break
 		}
-		if row.file.Status == media.StatusPending && row.file.CreatedAt.Before(cutoff) {
+		// Mirrors the SQL: retention is absolute, staleness is reset by a
+		// requeue (which moves updated_at and not created_at).
+		expired := row.file.CreatedAt.Before(retentionCutoff)
+		stale := row.file.CreatedAt.Before(staleCutoff) && row.updatedAt.Before(staleCutoff)
+		if row.file.Status == media.StatusPending && (expired || stale) {
 			c.writes = append(c.writes, fmt.Sprintf("deleted:%d", row.file.ID))
 			delete(c.rows, row.file.ID)
 			deleted++
@@ -678,11 +680,11 @@ type failingCatalogue struct {
 	Catalogue
 }
 
-func (f *failingCatalogue) ListExpiredStored(ctx context.Context, ownerUserID int64, retentionDays, limit int) ([]media.File, error) {
+func (f *failingCatalogue) ListExpiredStored(ctx context.Context, ownerUserID, afterID int64, retentionDays, limit int) ([]media.File, error) {
 	if ownerUserID == 1 {
 		return nil, errCatalogueDown
 	}
-	return f.Catalogue.ListExpiredStored(ctx, ownerUserID, retentionDays, limit)
+	return f.Catalogue.ListExpiredStored(ctx, ownerUserID, afterID, retentionDays, limit)
 }
 
 // A tenant that has never stored anything has no directory at all. That is a
@@ -696,6 +698,107 @@ func TestATenantWithNoStorageIsNotAnError(t *testing.T) {
 	}
 	if (stats != Stats{}) {
 		t.Fatalf("stats = %+v, want an empty run", stats)
+	}
+}
+
+// A refused row stays expired and stays 'stored', so it is handed back by the
+// next query for as long as the anomaly is there. Without a cursor it would
+// refill the batch on every pass, and a batch made entirely of refusals would
+// stall the retention of every row behind them -- silently, since a purge that
+// deletes nothing looks exactly like a purge with nothing to do.
+func TestRefusedRowsDoNotStallTheRetentionBehindThem(t *testing.T) {
+	root := t.TempDir()
+	victim := filepath.Join(t.TempDir(), "precious")
+	if err := os.WriteFile(victim, []byte("do not delete"), 0o640); err != nil {
+		t.Fatalf("write victim: %v", err)
+	}
+
+	cat := newCatalogue(fixedNow)
+	expiredAt := fixedNow().AddDate(0, 0, -30)
+	// A full batch of unpurgeable rows, ahead of the real one by id.
+	for id := int64(1); id <= batchSize; id++ {
+		rel := fmt.Sprintf("42/2026-01/05/linked-%04d", id)
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o750); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.Symlink(victim, full); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		cat.add(id, media.StatusStored, rel, expiredAt)
+	}
+	reachable := writeMedia(t, root, "42/2026-01/05/expired", 30*24*time.Hour)
+	cat.add(batchSize+1, media.StatusStored, reachable, expiredAt)
+
+	stats, err := newPurger(t, root, cat, false).Run(context.Background(), []users.TenantRetention{testTenant})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if exists(t, filepath.Join(root, reachable)) {
+		t.Fatal("an expired blob survived because refused rows filled the batch ahead of it")
+	}
+	if cat.rows[batchSize+1].file.Status != media.StatusPurged {
+		t.Fatalf("status = %q, want the row behind the refusals purged", cat.rows[batchSize+1].file.Status)
+	}
+	if !exists(t, victim) {
+		t.Fatal("a symlink was followed and its target deleted")
+	}
+	// One deletion, and every symlink refused by each phase that met it
+	// (retention, the row sweep, the disk sweep) -- never followed by any of
+	// them.
+	if stats.FilesDeleted != 1 || stats.Refused < batchSize {
+		t.Fatalf("stats = %+v, want 1 deletion and at least %d refusals", stats, batchSize)
+	}
+}
+
+// A requeued row is waiting for a download that was granted a moment ago, not
+// for the one it was created with. Deciding its deadline on created_at alone
+// would delete it at the very next daily pass -- and with it the last trace
+// that an attachment existed, while it is still well within retention.
+func TestARequeuedRowKeepsItsFullRetryWindow(t *testing.T) {
+	root := t.TempDir()
+	cat := newCatalogue(fixedNow)
+	// Captured five days ago (inside a seven-day retention, but far past
+	// PendingMaxAge), and its file has vanished: exactly the crash leftover the
+	// reconciliation requeues.
+	rel := "42/2026-02/24/vanished"
+	cat.add(1, media.StatusStored, rel, fixedNow().AddDate(0, 0, -5))
+	if err := os.MkdirAll(filepath.Join(root, filepath.Dir(rel)), 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	p := newPurger(t, root, cat, false)
+	if _, err := p.Run(context.Background(), []users.TenantRetention{testTenant}); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if cat.rows[1].file.Status != media.StatusPending {
+		t.Fatalf("status after the repair = %q, want pending", cat.rows[1].file.Status)
+	}
+
+	if _, err := p.Run(context.Background(), []users.TenantRetention{testTenant}); err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if _, ok := cat.rows[1]; !ok {
+		t.Fatal("the requeued row was deleted before the fetch loop had its retry window")
+	}
+}
+
+// Retention still wins over the retry window: a requeue may postpone the
+// staleness deadline, never the tenant's own retention.
+func TestARequeuedRowStillObeysRetention(t *testing.T) {
+	root := t.TempDir()
+	cat := newCatalogue(fixedNow)
+	// Requeued a moment ago (updated_at is recent), captured well past a
+	// one-day retention.
+	row := cat.add(1, media.StatusPending, "", fixedNow().AddDate(0, 0, -5))
+	row.updatedAt = fixedNow()
+
+	tenant := users.TenantRetention{OwnerUserID: testOwner, RetentionDays: 1}
+	if _, err := newPurger(t, root, cat, false).Run(context.Background(), []users.TenantRetention{tenant}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if _, ok := cat.rows[1]; ok {
+		t.Fatal("a recently requeued row outlived the tenant's retention")
 	}
 }
 

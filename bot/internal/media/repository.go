@@ -274,6 +274,49 @@ func SelectStoredTx(ctx context.Context, tx pgx.Tx, businessConnectionID string,
 	return files, nil
 }
 
+// SelectAlbumAnchorsTx returns, for each album touched by the given messages,
+// the SMALLEST message_id it is made of -- whatever the status of its files.
+//
+// Status-independent on purpose, and that is the whole point of this query: the
+// set of 'stored' rows moves under our feet (the fetch loop turns pending into
+// stored, and a failed download into purged), so an anchor derived from the
+// stored subset would shift between two deliveries of the SAME deletion. The
+// outbox anti-duplicate key contains the message_id, so a shifting anchor lets
+// the same album through twice. Catalogued membership, itself written once at
+// capture time, does not move.
+//
+// Same transaction contract as SelectStoredTx: the tenant context is set by the
+// caller, RLS applies unchanged.
+func SelectAlbumAnchorsTx(ctx context.Context, tx pgx.Tx, businessConnectionID string, chatID int64, messageIDs []int64) (map[string]int64, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT media_group_id, MIN(message_id)
+		FROM media_files
+		WHERE business_connection_id = $1
+		  AND chat_id = $2
+		  AND message_id = ANY($3)
+		  AND media_group_id IS NOT NULL
+		GROUP BY media_group_id
+	`, businessConnectionID, chatID, messageIDs)
+	if err != nil {
+		return nil, fmt.Errorf("reading album anchors: %w", err)
+	}
+	defer rows.Close()
+
+	anchors := make(map[string]int64)
+	for rows.Next() {
+		var groupID string
+		var anchor int64
+		if err := rows.Scan(&groupID, &anchor); err != nil {
+			return nil, fmt.Errorf("reading album anchors: %w", err)
+		}
+		anchors[groupID] = anchor
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading album anchors: %w", err)
+	}
+	return anchors, nil
+}
+
 // ListPending returns at most limit attachments still awaiting download, oldest
 // first so a burst of new media never starves an older one. The caller loops
 // tenant by tenant: like every other query here, this one only sees the rows of

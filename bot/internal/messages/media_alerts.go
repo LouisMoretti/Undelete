@@ -49,8 +49,15 @@ func enqueueMediaAlerts(ctx context.Context, tx pgx.Tx, scope mediaAlertScope, f
 	if err != nil {
 		return err
 	}
+	// Read from the FULL catalogue, not from files: the anchor must not depend
+	// on which downloads happened to be finished at this instant (cf.
+	// SelectAlbumAnchorsTx).
+	anchors, err := media.SelectAlbumAnchorsTx(ctx, tx, scope.businessConnectionID, scope.chatID, ids)
+	if err != nil {
+		return err
+	}
 
-	for _, group := range groupMedia(files) {
+	for _, group := range groupMedia(files, anchors) {
 		payload := outbox.MediaPayload{MediaGroupID: group.mediaGroupID}
 		for _, file := range group.files {
 			payload.Items = append(payload.Items, outbox.MediaItem{
@@ -79,10 +86,12 @@ func enqueueMediaAlerts(ctx context.Context, tx pgx.Tx, scope mediaAlertScope, f
 // mediaGroup is the set of files delivered by a single outbox entry.
 type mediaGroup struct {
 	// anchorMessageID is the message the entry is keyed on. For an album it is
-	// the SMALLEST message_id of the group: the outbox unique key is
-	// (message, event, chunk_index), so the anchor has to be stable across a
-	// redelivery of the same deletion, otherwise the same album would be
-	// enqueued twice.
+	// the SMALLEST message_id of the group as the CATALOGUE knows it, whatever
+	// the status of its files: the outbox unique key is (message, event,
+	// chunk_index), so the anchor has to be stable across a redelivery of the
+	// same deletion, otherwise the same album would be enqueued twice. Deriving
+	// it from the stored files alone would not be stable -- a download finishing
+	// between the two deliveries would move it. Cf. media.SelectAlbumAnchorsTx.
 	anchorMessageID int64
 	mediaGroupID    string
 	files           []media.File
@@ -92,7 +101,11 @@ type mediaGroup struct {
 // by SelectStoredTx (message_id, then file_index): that is the order the sender
 // composed the album in, and the only one the owner can check against what
 // disappeared.
-func groupMedia(files []media.File) []mediaGroup {
+//
+// anchors maps a media_group_id onto the album's stable anchor message. A group
+// missing from it (catalogue read that returned nothing for it) falls back to
+// the first message seen, which is the previous behaviour.
+func groupMedia(files []media.File, anchors map[string]int64) []mediaGroup {
 	var groups []mediaGroup
 	// Two key spaces that cannot collide: albums by media_group_id, lone media
 	// by message. A media without media_group_id is only ever grouped with the
@@ -113,8 +126,14 @@ func groupMedia(files []media.File) []mediaGroup {
 			continue
 		}
 
+		anchor := file.MessageID
+		if file.MediaGroupID != "" {
+			if catalogued, ok := anchors[file.MediaGroupID]; ok {
+				anchor = catalogued
+			}
+		}
 		groups = append(groups, mediaGroup{
-			anchorMessageID: file.MessageID,
+			anchorMessageID: anchor,
 			mediaGroupID:    file.MediaGroupID,
 			files:           []media.File{file},
 		})

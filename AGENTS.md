@@ -6,6 +6,7 @@
 | Build + lint + vet + fmt | `make check` |
 | Run integration tests (Docker) | `make test-integration` |
 | Verify a backup is restorable (Docker) | `make test-restore` |
+| Verify dump + media restore together (Docker) | `make test-restore-media` |
 | Start dev stack | `docker compose up --build -d` |
 | View bot logs | `docker compose logs -f bot` |
 | Stop stack | `docker compose down` (never `-v` — deletes the DB volume) |
@@ -35,12 +36,14 @@
 - Unit tests: `cd bot && go test ./...` (no special tags)
 - Integration tests: `make test-integration` (requires Docker) OR provide `POSTGRES_INTEGRATION_ADMIN_DSN`, `POSTGRES_INTEGRATION_RUNTIME_DSN`, `POSTGRES_INTEGRATION_ALLOW_DESTRUCTIVE=I_UNDERSTAND_THIS_WILL_DELETE_DATA`
 - Integration tests run against real Postgres 16, verify migrations, RLS, multi-tenant isolation, outbox retry/backoff
+- Media restore test: `make test-restore-media` (requires Docker) — runs the real `scripts/backup.sh` **and** `scripts/backup-media.sh` (full then incremental), restores the pair into a throwaway container plus an empty directory, verifies the `.meta` coupling, the `.sha256`/MANIFEST integrity, and asserts a missing object and an altered file are both detected. Same guardrails as `test-restore`.
 - Restore test: `make test-restore` (requires Docker) — dumps a throwaway source DB with `scripts/backup.sh`, restores into a **separate blank** target container, checks gzip integrity, tables, `schema_migrations`, row counts, canary rows, `FORCE RLS`, and reports the measured RTO. Refuses to run if `MIGRATION_DATABASE_URL`/`DATABASE_URL` are set. Never touches existing volumes. See `docs/backup-restore.md` (RPO/RTO, weekly recipe).
 
 ## Environment
 - Copy `.env.example` → `.env`, fill in tokens/passwords
 - `OWNER_TELEGRAM_USER_ID` — mono-tenant guard (Phase 1). Empty in dev only.
-- `BACKUP_RETENTION_DAYS` — daily pg_dump retention
+- `BACKUP_RETENTION_DAYS` — daily pg_dump retention (media archives are **not** purged automatically)
+- `MEDIA_BACKUP_MODE` (`auto`) / `MEDIA_BACKUP_FULL_INTERVAL_DAYS` (`7`) — media full/incremental cadence
 
 ## Key Architecture Notes
 - Migrations run at boot with owner DSN, BEFORE app pool opens

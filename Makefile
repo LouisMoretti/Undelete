@@ -1,4 +1,4 @@
-.PHONY: build vet fmt tidy check test-integration test-restore up down logs
+.PHONY: build vet fmt tidy check test-integration test-restore test-restore-media up down logs
 
 # The 4 delivery commands, grouped together.
 check:
@@ -23,6 +23,13 @@ test-integration:
 # See docs/backup-restore.md (RPO/RTO, periodic recipe).
 test-restore:
 	./scripts/restore-test.sh
+
+# Restores the PAIR (database dump + media archives) into disposable
+# containers and a disposable directory, then reconciles the restored
+# catalogue against the restored tree.
+# See docs/backup-restore.md (media RPO/RTO, retention, restore order).
+test-restore-media:
+	./scripts/restore-media-test.sh
 
 up:
 	docker compose up --build -d

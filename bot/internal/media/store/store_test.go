@@ -399,6 +399,148 @@ func TestDownloadNeverLeaksTokenInErrorsOrLogs(t *testing.T) {
 	}
 }
 
+// A 429 clears on its own: giving up on it would lose the media for good,
+// file_path being valid for one hour only.
+func TestDownloadRetriesRateLimitThenSucceeds(t *testing.T) {
+	payload := []byte("available once the rate limit lifts")
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if hits.Add(1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+
+	d, _ := newDownloader(t, srv, func(c *Config) { c.Retries = 2 })
+	stored, err := d.Download(context.Background(), testToken, defaultRequest())
+	if err != nil {
+		t.Fatalf("Download() = %v", err)
+	}
+	if hits.Load() != 2 {
+		t.Fatalf("attempts = %d, want 2 (one 429 then a success)", hits.Load())
+	}
+	if stored.SHA256 != sha256Hex(payload) {
+		t.Fatalf("SHA256 = %q, want %q", stored.SHA256, sha256Hex(payload))
+	}
+}
+
+// A redirect must never be followed: net/http fills the Referer of the
+// redirected request with the origin URL, whose PATH carries the bot token.
+// Following one 302 would hand the secret to a third-party host.
+func TestDownloadRefusesRedirectAndDoesNotLeakTokenToThirdParty(t *testing.T) {
+	var thirdPartyHits atomic.Int64
+	var gotReferer atomic.Value
+	gotReferer.Store("")
+	thirdParty := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		thirdPartyHits.Add(1)
+		gotReferer.Store(r.Header.Get("Referer"))
+		_, _ = w.Write([]byte("payload served by the attacker"))
+	}))
+	defer thirdParty.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, thirdParty.URL+"/stolen", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	// A bare client, like production: srv.Client() would not change the
+	// redirect behaviour, but this makes the tested configuration explicit.
+	d, root := newDownloader(t, srv, func(c *Config) { c.HTTPClient = &http.Client{} })
+	_, err := d.Download(context.Background(), testToken, defaultRequest())
+	if !errors.Is(err, ErrHTTP) {
+		t.Fatalf("Download() = %v, want ErrHTTP (the 302 surfaced, not followed)", err)
+	}
+	if n := thirdPartyHits.Load(); n != 0 {
+		t.Fatalf("the redirect was followed: third party hit %d times, referer %q",
+			n, gotReferer.Load())
+	}
+	if got := listFiles(t, root); len(got) != 0 {
+		t.Fatalf("files left behind: %v", got)
+	}
+	if strings.Contains(err.Error(), testToken) {
+		t.Fatalf("error exposes the token: %q", err)
+	}
+}
+
+// A symlink planted at the storage path must not be dereferenced: hashing its
+// target would return content read from anywhere on the filesystem as if it
+// were the stored media.
+func TestDownloadRefusesNonRegularTarget(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte("payload"))
+	}))
+	defer srv.Close()
+
+	secret := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(secret, []byte("content outside the storage root"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	d, root := newDownloader(t, srv, nil)
+	target := filepath.Join(root, "4242", "2026-09", "04", string(testUniqueID))
+	if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.Symlink(secret, target); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	stored, err := d.Download(context.Background(), testToken, defaultRequest())
+	if !errors.Is(err, ErrPathTraversal) {
+		t.Fatalf("Download() = (%+v, %v), want ErrPathTraversal", stored, err)
+	}
+	if stored.Reused {
+		t.Fatal("a symlink was reused as stored media")
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("server called %d times, want 0", hits.Load())
+	}
+	// The symlink target must be intact: the refusal happens before any write.
+	content, err := os.ReadFile(secret)
+	if err != nil {
+		t.Fatalf("reading the symlink target: %v", err)
+	}
+	if string(content) != "content outside the storage root" {
+		t.Fatalf("wrote through the symlink: %q", content)
+	}
+}
+
+// Disk full: any failure to write the temporary file must abort without a
+// final path and without a leftover. An unwritable target directory exercises
+// the same exit path as an ENOSPC, deterministically and without Docker.
+func TestDownloadFailsCleanlyWhenTheDiskRefusesTheWrite(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: directory permissions are not enforced")
+	}
+	srv := serveBytes([]byte("payload that will never reach the disk"))
+	defer srv.Close()
+
+	d, root := newDownloader(t, srv, nil)
+	dir := filepath.Join(root, "4242", "2026-09", "04")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	// MkdirAll on an existing directory does not restore the mode, so
+	// Download reaches os.CreateTemp and fails there, like a full disk.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o750) })
+
+	if _, err := d.Download(context.Background(), testToken, defaultRequest()); err == nil {
+		t.Fatal("Download() should have failed on an unwritable directory")
+	} else if strings.Contains(err.Error(), testToken) {
+		t.Fatalf("error exposes the token: %q", err)
+	}
+	if got := listFiles(t, root); len(got) != 0 {
+		t.Fatalf("files left behind after a write failure: %v", got)
+	}
+}
+
 // Durable resume: after a restart, downloading the same media again is a
 // no-op and issues no request.
 func TestDownloadIsIdempotentAcrossRestarts(t *testing.T) {

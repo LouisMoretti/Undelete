@@ -36,7 +36,10 @@
 // The bot token only ever exists in the download URL built in memory. It is
 // never logged and never returned inside an error: transport errors from
 // net/http are unwrapped (*url.Error carries the full URL, token included)
-// and every message goes through redact before leaving the package.
+// and every message goes through redact before leaving the package. Nor does
+// it leave over the network: redirects are refused, because net/http would
+// forward the origin URL — token in its path — in the Referer header of the
+// redirected request.
 package store
 
 import (
@@ -114,6 +117,23 @@ type Config struct {
 	Now func() time.Time
 }
 
+// noRedirect returns a copy of client that never follows a redirect. The
+// token travels in the URL PATH, and net/http fills the Referer of the
+// redirected request with the origin URL — a single 302 would hand the secret
+// to a third-party host. The file endpoint serves the content directly, so a
+// redirect is either a misconfiguration or an attack: the 3xx is surfaced as
+// ErrHTTP instead, and no second request is ever issued.
+//
+// The copy is shallow (Transport and Jar are shared, which is what we want)
+// and leaves the caller's client untouched.
+func noRedirect(client *http.Client) *http.Client {
+	copied := *client
+	copied.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &copied
+}
+
 // Downloader fetches media from the Bot API and stores it atomically.
 type Downloader struct {
 	cfg Config
@@ -172,6 +192,7 @@ func New(cfg Config) (*Downloader, error) {
 		// which also covers the body transfer.
 		cfg.HTTPClient = &http.Client{}
 	}
+	cfg.HTTPClient = noRedirect(cfg.HTTPClient)
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = defaultBaseURL
 	}
@@ -202,6 +223,12 @@ func New(cfg Config) (*Downloader, error) {
 // It is idempotent: if the target path already exists (and matches
 // ExpectedSHA256 when provided), no request is made and StoredFile.Reused is
 // true. That is what makes a restart mid-batch safe to replay.
+//
+// Caveat on that replay: the target path embeds the CURRENT UTC date (cf.
+// relPath), so a replay that crosses midnight recomputes a different path,
+// finds nothing there and downloads a second copy, orphaning the first. A
+// caller that persists StoredFile.RelPath should therefore resume through
+// Verify on that stored path rather than by calling Download again.
 func (d *Downloader) Download(ctx context.Context, token string, req Request) (StoredFile, error) {
 	rel, err := d.relPath(req)
 	if err != nil {
@@ -238,14 +265,21 @@ func (d *Downloader) Download(ctx context.Context, token string, req Request) (S
 
 // reuse reports whether the final path already holds usable content.
 func (d *Downloader) reuse(full, rel, wantSHA string) (StoredFile, bool, error) {
-	info, err := os.Stat(full)
+	// Lstat, not Stat: a symlink planted at the storage path would otherwise
+	// be dereferenced, and the file it points at — anywhere on the filesystem
+	// — hashed and returned as if it were the stored media. The containment
+	// check in resolve works on strings and cannot see that. Anything that is
+	// not a plain regular file is never legitimate here, so it is refused
+	// loudly rather than silently overwritten.
+	info, err := os.Lstat(full)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return StoredFile{}, false, nil
 	case err != nil:
 		return StoredFile{}, false, fmt.Errorf("media: inspecting target: %w", err)
-	case info.IsDir():
-		return StoredFile{}, false, fmt.Errorf("%w: target is a directory", ErrPathTraversal)
+	case !info.Mode().IsRegular():
+		return StoredFile{}, false, fmt.Errorf(
+			"%w: target is not a regular file (%s)", ErrPathTraversal, info.Mode().Type())
 	}
 
 	sum, err := sha256File(full)
@@ -325,7 +359,7 @@ func (d *Downloader) attempt(ctx context.Context, token, full string, req Reques
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", 0, fmt.Errorf("%w: %d", ErrHTTP, resp.StatusCode)
+		return "", 0, &httpError{status: resp.StatusCode}
 	}
 	// Cheap pre-check: avoids opening a temporary file for a download we
 	// already know we will refuse. The streaming counter below stays the
@@ -531,8 +565,20 @@ func validateFilePath(p string) error {
 	return nil
 }
 
-// retryable: only network glitches and 5xx are worth another attempt. A 4xx
-// (file expired, bad token) would return the same thing forever.
+// httpError carries the status code alongside the ErrHTTP sentinel, so the
+// retry decision reads a field instead of re-parsing the message it just
+// formatted. errors.Is(err, ErrHTTP) keeps working for callers.
+type httpError struct{ status int }
+
+func (e *httpError) Error() string { return fmt.Sprintf("%s: %d", ErrHTTP.Error(), e.status) }
+
+func (e *httpError) Unwrap() error { return ErrHTTP }
+
+// retryable: only network glitches and the statuses that can clear on their
+// own are worth another attempt. A 404 or a 401 (file expired, revoked token)
+// would return the same thing forever; a 429 or a 408, on the contrary, is
+// exactly what an exponential backoff is for — and giving up on it loses the
+// media for good, since file_path expires one hour after getFile.
 func retryable(err error) bool {
 	switch {
 	case errors.Is(err, ErrPathTraversal), errors.Is(err, ErrHashMismatch), errors.Is(err, ErrTooLarge):
@@ -541,23 +587,14 @@ func retryable(err error) bool {
 		return false
 	case errors.Is(err, ErrTimeout):
 		return true
-	case errors.Is(err, ErrHTTP):
-		return httpStatus(err) >= 500
+	}
+	var httpErr *httpError
+	if errors.As(err, &httpErr) {
+		return httpErr.status >= 500 ||
+			httpErr.status == http.StatusTooManyRequests ||
+			httpErr.status == http.StatusRequestTimeout
 	}
 	return isNetworkError(err) || strings.Contains(err.Error(), "transport error")
-}
-
-// httpStatus extracts the code appended by the ErrHTTP wrapping.
-func httpStatus(err error) int {
-	_, after, found := strings.Cut(err.Error(), ErrHTTP.Error()+": ")
-	if !found {
-		return 0
-	}
-	code, convErr := strconv.Atoi(strings.TrimSpace(after))
-	if convErr != nil {
-		return 0
-	}
-	return code
 }
 
 func isNetworkError(err error) bool {

@@ -107,7 +107,11 @@ func TestExtractMedia(t *testing.T) {
 			}},
 		},
 		{
-			name: "animation",
+			name: "animation is not doubled by its backward-compatibility document",
+			// Telegram sets `document` alongside `animation`, on the same
+			// file, for backward compatibility. Only the animation must come
+			// out: a doubled attachment means the GIF stored and restored
+			// twice.
 			payload: `{
 				"message_id": 604,
 				"chat": {"id": 800001, "type": "private", "first_name": "Anaïs"},
@@ -123,7 +127,14 @@ func TestExtractMedia(t *testing.T) {
 					"file_size": 245760,
 					"thumbnail": {"file_id": "anim-thumb", "file_unique_id": "u-anim-thumb", "width": 90, "height": 90}
 				},
-				"document": null
+				"document": {
+					"file_id": "anim-1",
+					"file_unique_id": "u-anim-1",
+					"file_name": "reaction.mp4",
+					"mime_type": "video/mp4",
+					"file_size": 245760,
+					"thumbnail": {"file_id": "anim-thumb", "file_unique_id": "u-anim-thumb", "width": 90, "height": 90}
+				}
 			}`,
 			want: []MediaAttachment{{
 				Type:         MediaTypeAnimation,

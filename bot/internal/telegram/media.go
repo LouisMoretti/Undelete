@@ -107,7 +107,12 @@ func ExtractMedia(msg *Message) []MediaAttachment {
 			DurationSec:  animation.Duration,
 		})
 	}
-	if document := msg.Document; document != nil {
+	// The Bot API states, on Message.animation: "For backward compatibility,
+	// when this field is set, the document field will also be set." The two
+	// fields then describe the SAME file; consolidating both would persist the
+	// media twice, download it twice, and restore it twice. The animation is
+	// the richer of the two (dimensions, duration), so it wins.
+	if document := msg.Document; document != nil && msg.Animation == nil {
 		add(MediaAttachment{
 			Type:         MediaTypeDocument,
 			FileID:       document.FileID,

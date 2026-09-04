@@ -105,7 +105,10 @@ type Chat struct {
 // Media fields are mutually exclusive in practice — Telegram sends one
 // attachment per message, an album being N messages sharing the same
 // media_group_id — but nothing in the API guarantees it, so ExtractMedia
-// reads them all rather than stopping at the first match.
+// reads them all rather than stopping at the first match. The documented
+// exception is Animation, which the Bot API duplicates into Document for
+// backward compatibility; ExtractMedia collapses that pair back into one
+// attachment.
 type Message struct {
 	MessageID            int64  `json:"message_id"`
 	From                 *User  `json:"from,omitempty"`
@@ -194,7 +197,8 @@ type Video struct {
 }
 
 // Animation is a GIF, or an H.264/MPEG-4 AVC video without sound. Telegram
-// sends it as its own type, never as a Video.
+// sends it as its own type, never as a Video, but also mirrors it into
+// Message.Document for backward compatibility (cf. ExtractMedia).
 type Animation struct {
 	FileID       string     `json:"file_id"`
 	FileUniqueID string     `json:"file_unique_id"`

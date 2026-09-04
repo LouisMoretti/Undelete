@@ -37,6 +37,14 @@ type Config struct {
 	// single row.
 	MediaDir string
 
+	// MediaPurgeDryRun switches the media retention purge to a mode where it
+	// logs every file it would delete and removes nothing. Meant for the
+	// first runs on a real storage tree, where the cost of a wrong deletion
+	// (a blob is gone for good) is not symmetric with the cost of keeping it
+	// one more day. Defaults to false: retention that does not run is a
+	// silent breach of the promise made to the owner.
+	MediaPurgeDryRun bool
+
 	// HealthAddr is the listen address for the /livez, /readyz and
 	// /metrics probes. Defaults to defaultHealthAddr if HEALTH_ADDR is not
 	// set; an explicitly EMPTY value disables the server (no port opened).
@@ -77,6 +85,17 @@ func Load() (*Config, error) {
 	// instead, and only a non-empty value overrides it.
 	if raw := strings.TrimSpace(os.Getenv("MEDIA_DIR")); raw != "" {
 		cfg.MediaDir = raw
+	}
+
+	// Only an explicit, unambiguous opt-in enables the dry run. A typo
+	// ("yes", "on") must not silently disable retention: it falls through to
+	// the parse error below rather than to false.
+	if raw := strings.TrimSpace(os.Getenv("MEDIA_PURGE_DRY_RUN")); raw != "" {
+		dryRun, err := strconv.ParseBool(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid MEDIA_PURGE_DRY_RUN (expected a boolean, e.g. \"true\" or \"false\"): %w", err)
+		}
+		cfg.MediaPurgeDryRun = dryRun
 	}
 
 	// LookupEnv rather than Getenv: "variable absent" (we want the default)

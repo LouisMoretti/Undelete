@@ -46,4 +46,5 @@
 - Migrations run at boot with owner DSN, BEFORE app pool opens
 - Outbox: `deleted_at` + notification chunks written atomically; worker processes leases with exponential backoff, respects 429 `retry_after`
 - Retention purge runs daily, separate from poller loop (poller must stay responsive)
+- Media retention (`internal/media/purge`) extends that daily cycle to `./media`: the blob is unlinked BEFORE the row is marked `purged`, so a crash between the two leaves only the mismatch the catalogue can detect on its own. The reconciliation repairs both directions (row without file, file without row), always bounded per run and resumed by cursor. `MEDIA_PURGE_DRY_RUN=true` logs without deleting.
 - Logs: `slog` JSON, never contain message content

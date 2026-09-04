@@ -99,3 +99,41 @@ func TestLoadParsesOwnerGuard(t *testing.T) {
 		t.Fatalf("OwnerTelegramUserID = %d", cfg.OwnerTelegramUserID)
 	}
 }
+
+// The dry run is an opt-in, and an ambiguous value must not silently disable
+// retention: a purge that never runs breaks the promise made to the owner
+// without a single error in the logs.
+func TestLoadParsesMediaPurgeDryRun(t *testing.T) {
+	cases := map[string]struct {
+		env     string
+		want    bool
+		wantErr bool
+	}{
+		"absent defaults to a real purge": {env: "", want: false},
+		"explicit true":                   {env: "true", want: true},
+		"numeric true":                    {env: "1", want: true},
+		"explicit false":                  {env: "false", want: false},
+		"ambiguous value is refused":      {env: "yes", wantErr: true},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			validEnv(t)
+			t.Setenv("MEDIA_PURGE_DRY_RUN", tc.env)
+
+			cfg, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("Load() accepted MEDIA_PURGE_DRY_RUN=%q", tc.env)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() unexpected error: %v", err)
+			}
+			if cfg.MediaPurgeDryRun != tc.want {
+				t.Fatalf("MediaPurgeDryRun = %t, want %t", cfg.MediaPurgeDryRun, tc.want)
+			}
+		})
+	}
+}

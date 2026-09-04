@@ -502,6 +502,48 @@ path to the actual location of the repository on the VM.
 
 ---
 
+## 6. Media retention — first rollout
+
+The daily retention cycle now deletes **files under `./media`**, not just rows.
+That is the one operation in this project with no safety net: the backups cover
+the database and never `./media` (§0), so an unlinked blob is gone. Postgres can
+be restored from last night's dump; a photo cannot.
+
+Hence the rollout, once, on the first deployment that carries the media purge:
+
+1. **Dry run for one cycle.** In `.env`:
+   ```
+   MEDIA_PURGE_DRY_RUN=true
+   ```
+   Only a real boolean is accepted; a typo fails at startup rather than silently
+   disabling retention. At boot the logs carry
+   `media retention purge running in DRY RUN: no file will be deleted`.
+2. **Wait for one pass.** The retention loop is on a 24h ticker and does *not*
+   fire at boot: the first summary line appears one day after the rollout. Read
+   it in `docker compose logs bot`, on the `retention purge complete` line:
+
+   | Counter | Read it as |
+   |---|---|
+   | `media_files_deleted` | blobs the purge WOULD have deleted. Compare with the volume of media older than `retention_days`; an order of magnitude too high means the media root does not point where you think. |
+   | `media_orphans_deleted` | unreferenced files older than 24h. A large number on a first run is normal (crash leftovers); a large number on every run is a bug worth reporting. |
+   | `media_refused` | entries the purge declined to touch: a symlink, something that is not a plain file, a path resolving outside the root. **Never expected to be non-zero.** Investigate before switching the dry run off — the corresponding rows are deliberately left alone, nothing is lost by waiting. |
+   | `media_requeued` | files missing while still within retention, sent back to the download queue. |
+   | `media_rows_purged` / `media_rows_deleted` / `media_pending_deleted` | catalogue side only, no file involved. |
+
+   A `media purge: retention stopped at its per-run bound` line means the tenant
+   has more expiring media than one pass can absorb: the purge resumes the next
+   day, and only sustained repetition is a problem.
+3. **Switch it off** (`MEDIA_PURGE_DRY_RUN=false`, or remove the line) and
+   `docker compose up -d`. Leaving the dry run on is not a safe default: a
+   retention that never runs is a silent breach of the promise made to the
+   owner, and nothing else in the logs says so.
+
+The purge is idempotent and interruptible: it always unlinks the blob **before**
+marking the row purged, so a crash between the two leaves only a mismatch that
+the next pass repairs on its own. Restarting the bot is always a valid answer.
+
+---
+
 ## Cheat sheet
 
 | Need | Command |
@@ -515,4 +557,5 @@ path to the actual location of the repository on the VM.
 | Build + lint | `make check` |
 | Integration tests | `make test-integration` |
 | Restore recipe | `make test-restore` *(after #7)* |
+| Media purge, first rollout | `MEDIA_PURGE_DRY_RUN=true` in `.env`, then §6 |
 | Probes | `curl -fsS localhost:9090/{livez,readyz,metrics}` *(after #6)* |

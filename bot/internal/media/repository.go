@@ -8,15 +8,18 @@
 // and validated by ValidateRelativePath before it ever reaches the database
 // (see migration 0004 for the rationale and the mirrored CHECK constraints).
 //
-// Downloading the files (writing them under ./media), backing them up (#13)
-// and purging them from disk (#12) live outside this package: here we only
-// carry the metadata and the status those workflows drive.
+// Downloading the files (writing them under ./media, see media/store and
+// media/fetch), backing them up (#13) and purging them from disk (media/purge)
+// live outside this package: here we only carry the metadata and the status
+// those workflows drive. The queries the purge needs are still here, for the
+// same reason as every other one: InTenant is the only way to the table.
 package media
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -108,6 +111,12 @@ type File struct {
 	SHA256                string
 	Status                string
 	MediaGroupID          string
+	// CreatedAt is the capture time of the attachment, the instant retention
+	// counts from -- the media equivalent of messages.saved_at. It is read
+	// back because the disk purge decides on it: a 'stored' row whose file
+	// vanished is re-downloaded while it is still within retention, and
+	// written off as purged once it is not.
+	CreatedAt time.Time
 }
 
 // StoredFile describes a file that has just been written under ./media.
@@ -140,7 +149,7 @@ const selectColumns = `
 	COALESCE(mime_type, ''), COALESCE(file_name, ''),
 	byte_size, width, height, duration_sec,
 	COALESCE(relative_path, ''), COALESCE(thumbnail_relative_path, ''),
-	COALESCE(sha256, ''), status, COALESCE(media_group_id, '')
+	COALESCE(sha256, ''), status, COALESCE(media_group_id, ''), created_at
 `
 
 // Save inserts or refreshes the metadata of one attachment and returns its id.
@@ -391,6 +400,199 @@ func (r *Repository) MarkPurged(ctx context.Context, ownerUserID, id int64) erro
 	`)
 }
 
+// MarkPendingRetry sends a row back to the download queue: the file it claimed
+// to have on disk is not there any more.
+//
+// The reverse of MarkStored, and the reconciliation half of the disk purge. It
+// only makes sense while the attachment is still within retention -- past that
+// point there is nothing left to download for, and MarkPurged is the right
+// answer. The path and the hash are cleared, so nothing keeps pointing at a
+// file that does not exist and the fetch loop recomputes both.
+func (r *Repository) MarkPendingRetry(ctx context.Context, ownerUserID, id int64) error {
+	return r.update(ctx, ownerUserID, id, `
+		UPDATE media_files
+		SET status                  = 'pending',
+		    relative_path           = NULL,
+		    thumbnail_relative_path = NULL,
+		    sha256                  = NULL,
+		    updated_at              = now()
+		WHERE id = $1
+	`)
+}
+
+// ListExpiredStored returns at most limit attachments whose file is on disk and
+// whose retention has elapsed, oldest first. The caller deletes the blob then
+// calls MarkPurged; the batch is bounded so one pass can never turn into an
+// unbounded scan-and-delete.
+func (r *Repository) ListExpiredStored(ctx context.Context, ownerUserID int64, retentionDays, limit int) ([]File, error) {
+	var files []File
+	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT`+selectColumns+`
+			FROM media_files
+			WHERE status = 'stored'
+			  AND created_at < now() - make_interval(days => $1)
+			ORDER BY id
+			LIMIT $2
+		`, retentionDays, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		files, err = scanFiles(rows)
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing expired media: %w", err)
+	}
+	return files, nil
+}
+
+// ListStoredPage returns at most limit stored attachments with an id strictly
+// greater than afterID, ordered by id.
+//
+// Keyset pagination rather than OFFSET: the reconciliation sweeps the whole
+// catalogue a page at a time across successive runs, and rows disappear under
+// it (that is precisely what it is there for). A cursor on the primary key
+// keeps the sweep total, where an offset would skip rows every time an earlier
+// one is deleted.
+func (r *Repository) ListStoredPage(ctx context.Context, ownerUserID, afterID int64, limit int) ([]File, error) {
+	var files []File
+	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT`+selectColumns+`
+			FROM media_files
+			WHERE status = 'stored' AND id > $1
+			ORDER BY id
+			LIMIT $2
+		`, afterID, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		files, err = scanFiles(rows)
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing stored media: %w", err)
+	}
+	return files, nil
+}
+
+// KnownPaths returns the subset of relPaths that a row of THIS tenant still
+// references, either as a file or as a thumbnail.
+//
+// The question the disk side of the reconciliation asks: "does anything still
+// point at what I just found on disk?". Answering it with the paths in hand,
+// rather than by loading the catalogue, is what bounds the query by the size of
+// the batch the caller scanned.
+func (r *Repository) KnownPaths(ctx context.Context, ownerUserID int64, relPaths []string) (map[string]struct{}, error) {
+	known := make(map[string]struct{}, len(relPaths))
+	if len(relPaths) == 0 {
+		return known, nil
+	}
+	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT relative_path FROM media_files WHERE relative_path = ANY($1)
+			UNION
+			SELECT thumbnail_relative_path FROM media_files WHERE thumbnail_relative_path = ANY($1)
+		`, relPaths)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var path string
+			if err := rows.Scan(&path); err != nil {
+				return err
+			}
+			known[path] = struct{}{}
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("resolving media paths: %w", err)
+	}
+	return known, nil
+}
+
+// DeleteStalePending removes the rows that have been waiting for a download
+// that is never coming, and returns how many went.
+//
+// The row is deleted rather than marked purged: 'purged' means "we had the
+// file and retention took it", and a pending row never had one -- keeping it
+// would only make the fetch loop ask Telegram for it forever.
+//
+// Two independent deadlines, whichever comes first: maxAge, past which no
+// retry can succeed any more (a Telegram file_id does not stay downloadable
+// indefinitely), and the tenant's own retention, which no metadata may
+// outlive.
+//
+// DELETE ... WHERE id IN (SELECT ... LIMIT): PostgreSQL has no LIMIT on
+// DELETE, and the bound is the point.
+func (r *Repository) DeleteStalePending(ctx context.Context, ownerUserID int64, maxAge time.Duration, retentionDays, limit int) (int64, error) {
+	var deleted int64
+	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			DELETE FROM media_files
+			WHERE id IN (
+				SELECT id FROM media_files
+				WHERE status = 'pending'
+				  AND created_at < now() - LEAST(
+				        make_interval(secs => $1),
+				        make_interval(days => $2))
+				ORDER BY id
+				LIMIT $3
+			)
+		`, maxAge.Seconds(), retentionDays, limit)
+		if err != nil {
+			return err
+		}
+		deleted = tag.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("deleting stale pending media: %w", err)
+	}
+	return deleted, nil
+}
+
+// DeletePurged removes the rows whose file is long gone, and returns how many
+// went.
+//
+// Two conditions, and the first one is the one that is easy to forget: a
+// 'purged' row is not necessarily a purged FILE. The fetch loop also marks
+// purged what Telegram will never hand over (over the 20 MB ceiling, expired
+// handle), and that row is the only remaining trace that an attachment
+// existed -- a deletion alert within retention still needs it. So retention
+// gates the deletion, and grace (counted from updated_at, the instant the row
+// became purged) only adds a margin on top of it.
+func (r *Repository) DeletePurged(ctx context.Context, ownerUserID int64, grace time.Duration, retentionDays, limit int) (int64, error) {
+	var deleted int64
+	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			DELETE FROM media_files
+			WHERE id IN (
+				SELECT id FROM media_files
+				WHERE status = 'purged'
+				  AND created_at < now() - make_interval(days => $1)
+				  AND updated_at < now() - make_interval(secs => $2)
+				ORDER BY id
+				LIMIT $3
+			)
+		`, retentionDays, grace.Seconds(), limit)
+		if err != nil {
+			return err
+		}
+		deleted = tag.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("deleting purged media rows: %w", err)
+	}
+	return deleted, nil
+}
+
 // update runs a single-row UPDATE inside the tenant context and turns "no row
 // affected" into ErrNotFound. Without this check the call would silently
 // succeed against another tenant's row hidden by RLS -- the same fail-closed
@@ -417,7 +619,7 @@ func scanFiles(rows pgx.Rows) ([]File, error) {
 			&f.TelegramFileID, &f.TelegramFileUniqueID, &f.MediaType,
 			&f.MimeType, &f.FileName, &f.ByteSize, &f.Width, &f.Height, &f.DurationSec,
 			&f.RelativePath, &f.ThumbnailRelativePath,
-			&f.SHA256, &f.Status, &f.MediaGroupID,
+			&f.SHA256, &f.Status, &f.MediaGroupID, &f.CreatedAt,
 		); err != nil {
 			return nil, err
 		}

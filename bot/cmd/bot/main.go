@@ -17,6 +17,7 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/health"
 	"github.com/LouisMoretti/Undelete/bot/internal/media"
 	"github.com/LouisMoretti/Undelete/bot/internal/media/fetch"
+	"github.com/LouisMoretti/Undelete/bot/internal/media/purge"
 	"github.com/LouisMoretti/Undelete/bot/internal/media/store"
 	"github.com/LouisMoretti/Undelete/bot/internal/messages"
 	"github.com/LouisMoretti/Undelete/bot/internal/metrics"
@@ -100,13 +101,29 @@ func run(logger *slog.Logger) error {
 	}
 	fetcher := fetch.New(mediaRepo, client, downloader, cfg.TelegramBotToken, logger)
 
+	// Same root as the downloader and the outbox worker: the three of them
+	// resolve the paths of media_files against it, and a purger pointed
+	// somewhere else would see every stored file as an orphan.
+	mediaPurger, err := purge.New(purge.Config{
+		MediaDir:  cfg.MediaDir,
+		Catalogue: mediaRepo,
+		DryRun:    cfg.MediaPurgeDryRun,
+		Logger:    logger,
+	})
+	if err != nil {
+		return err
+	}
+	if cfg.MediaPurgeDryRun {
+		logger.Warn("media retention purge running in DRY RUN: no file will be deleted")
+	}
+
 	poller := telegram.NewPoller(client, logger)
 
 	var wg sync.WaitGroup
 	wg.Add(5)
 	go func() {
 		defer wg.Done()
-		runRetentionLoop(ctx, usersRepo, messagesRepo, outboxRepo, logger)
+		runRetentionLoop(ctx, usersRepo, messagesRepo, outboxRepo, mediaPurger, logger)
 	}()
 	go func() {
 		defer wg.Done()
@@ -255,7 +272,13 @@ func runBacklogLoop(ctx context.Context, usersRepo *users.Repository, outboxRepo
 // escaping retention_days. Independent of the poller loop: a slow or failing
 // purge must never delay the processing of Telegram updates (long-polling
 // responsiveness constraint).
-func runRetentionLoop(ctx context.Context, usersRepo *users.Repository, messagesRepo *messages.Repository, outboxRepo *outbox.Repository, logger *slog.Logger) {
+//
+// The media purge closes the same cycle on disk, and runs LAST: it deletes
+// blobs and repairs the database/filesystem discrepancies a crash leaves
+// behind, which is the slowest and the only I/O-bound phase. A failure there
+// must not cost the text retention, which is why it does not `continue` before
+// the summary log.
+func runRetentionLoop(ctx context.Context, usersRepo *users.Repository, messagesRepo *messages.Repository, outboxRepo *outbox.Repository, mediaPurger *purge.Purger, logger *slog.Logger) {
 	ticker := time.NewTicker(retentionInterval)
 	defer ticker.Stop()
 
@@ -279,10 +302,16 @@ func runRetentionLoop(ctx context.Context, usersRepo *users.Repository, messages
 				logger.Error("outbox retention purge: failed", slog.String("error", err.Error()), slog.Int64("purged_before_error", purgedOutbox))
 				continue
 			}
+			mediaStats, err := mediaPurger.Run(ctx, tenants)
+			if err != nil && ctx.Err() == nil {
+				logger.Error("media retention purge: failed", slog.String("error", err.Error()))
+			}
 			logger.Info("retention purge complete",
-				slog.Int64("purged", purged),
-				slog.Int64("purged_outbox", purgedOutbox),
-				slog.Int("tenants", len(tenants)))
+				append([]any{
+					slog.Int64("purged", purged),
+					slog.Int64("purged_outbox", purgedOutbox),
+					slog.Int("tenants", len(tenants)),
+				}, mediaStats.LogAttrs()...)...)
 		}
 	}
 }

@@ -316,6 +316,22 @@ func TestExtractMedia(t *testing.T) {
 				DurationSec:  5,
 			}},
 		},
+		{
+			name: "media objects without file_id are dropped",
+			// Malformed or truncated payload: file_id is required in every
+			// Bot API media object. Such an attachment is neither
+			// downloadable nor restorable, so it must not reach the
+			// persistence layer — and it must not panic either.
+			payload: `{
+				"message_id": 612,
+				"chat": {"id": 800001, "type": "private", "first_name": "Anaïs"},
+				"date": 1788019311,
+				"photo": [{}],
+				"video": {},
+				"voice": {"duration": 3}
+			}`,
+			want: nil,
+		},
 	}
 
 	for _, tt := range tests {

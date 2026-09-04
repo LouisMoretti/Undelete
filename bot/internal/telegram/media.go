@@ -66,6 +66,13 @@ func ExtractMedia(msg *Message) []MediaAttachment {
 
 	var media []MediaAttachment
 	add := func(attachment MediaAttachment) {
+		// file_id is required in every Bot API media object: its absence
+		// means the payload is malformed, not that a media is there. Such an
+		// attachment could neither be downloaded nor restored, so it is
+		// dropped rather than persisted (same guard as decodeRawFiles).
+		if attachment.FileID == "" {
+			return
+		}
 		attachment.MediaGroupID = msg.MediaGroupID
 		attachment.Caption = msg.Caption
 		media = append(media, attachment)
@@ -235,6 +242,15 @@ type rawFile struct {
 // walked, so the thumbnails nested inside a known media are not reported a
 // second time. Fields are visited in alphabetical order, which makes the
 // output deterministic across two decodings of the same payload.
+//
+// That criterion has two known bounds, deliberately accepted:
+//   - it only catches FLAT future types. A type whose files sit under a
+//     wrapper object — paid_media (PaidMediaInfo), external_reply — carries no
+//     top-level file_id and is not seen. Such a type has to be modelled
+//     explicitly.
+//   - a service message field holding an array of PhotoSize (new_chat_photo)
+//     is reported once per resolution. Business messages are private-chat
+//     messages, where those fields do not occur.
 func extractUnknownMedia(raw json.RawMessage) []MediaAttachment {
 	if len(raw) == 0 {
 		return nil

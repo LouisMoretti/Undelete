@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Config holds the bot's runtime configuration.
@@ -30,6 +31,12 @@ type Config struct {
 	// 0 = no restriction (not recommended outside local dev).
 	OwnerTelegramUserID int64
 
+	// MediaDir is the storage root of the downloaded attachments ("media" by
+	// default, bind-mounted to /app/media by Compose). Every path stored in
+	// media_files is RELATIVE to it, so moving the root does not invalidate a
+	// single row.
+	MediaDir string
+
 	// HealthAddr is the listen address for the /livez, /readyz and
 	// /metrics probes. Defaults to defaultHealthAddr if HEALTH_ADDR is not
 	// set; an explicitly EMPTY value disables the server (no port opened).
@@ -42,6 +49,10 @@ type Config struct {
 // application traffic (the bot listens on nothing else, it is in outgoing
 // long polling).
 const defaultHealthAddr = ":9090"
+
+// defaultMediaDir matches the volume mounted by docker-compose (./media ->
+// /app/media), the bot running with /app as its working directory.
+const defaultMediaDir = "media"
 
 // Load reads the configuration from the environment and validates it.
 //
@@ -58,6 +69,14 @@ func Load() (*Config, error) {
 		MigrationDatabaseURL: os.Getenv("MIGRATION_DATABASE_URL"),
 		TelegramBotToken:     os.Getenv("TELEGRAM_BOT_TOKEN"),
 		HealthAddr:           defaultHealthAddr,
+		MediaDir:             defaultMediaDir,
+	}
+
+	// An empty MEDIA_DIR is not a way to disable anything: it would resolve
+	// every relative path against the working directory. The default applies
+	// instead, and only a non-empty value overrides it.
+	if raw := strings.TrimSpace(os.Getenv("MEDIA_DIR")); raw != "" {
+		cfg.MediaDir = raw
 	}
 
 	// LookupEnv rather than Getenv: "variable absent" (we want the default)

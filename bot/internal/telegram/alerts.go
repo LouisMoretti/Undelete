@@ -62,6 +62,32 @@ func BuildDeletionMessageRequests(alert DeletionAlert) []SendMessageRequest {
 	return requests
 }
 
+// MediaUnavailableNote is appended to the text of a media alert that could not
+// carry its files (purged from disk, storage unmounted, file above the Bot API
+// limit, definitive Telegram refusal). The owner is told a media existed rather
+// than being left with a silent hole -- an alert is never dropped.
+const MediaUnavailableNote = "[media unavailable]"
+
+// BuildMediaAlertText is the text that travels WITH the media entry of an
+// alert: the one-line summary of what is attached. It is written to the outbox
+// at deletion time and is what the worker sends, plus MediaUnavailableNote,
+// when the files cannot go out.
+//
+// The identity context (chat, sender, date, caption) is NOT repeated here: it
+// was already delivered by the text chunks of the same alert, which the outbox
+// sends first (chunk ordering).
+func BuildMediaAlertText(mediaTypes []string) string {
+	if len(mediaTypes) == 0 {
+		return "Attached media"
+	}
+	suffix := ""
+	if len(mediaTypes) > 1 {
+		suffix = "s"
+	}
+	return fmt.Sprintf("Attached media (%d file%s: %s)",
+		len(mediaTypes), suffix, strings.Join(mediaTypes, ", "))
+}
+
 // buildDeletionText composes the full alert text: a title line, the identity
 // header, then the restored content.
 //

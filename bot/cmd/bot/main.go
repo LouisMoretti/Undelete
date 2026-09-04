@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -14,6 +15,9 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/business"
 	"github.com/LouisMoretti/Undelete/bot/internal/config"
 	"github.com/LouisMoretti/Undelete/bot/internal/health"
+	"github.com/LouisMoretti/Undelete/bot/internal/media"
+	"github.com/LouisMoretti/Undelete/bot/internal/media/fetch"
+	"github.com/LouisMoretti/Undelete/bot/internal/media/store"
 	"github.com/LouisMoretti/Undelete/bot/internal/messages"
 	"github.com/LouisMoretti/Undelete/bot/internal/metrics"
 	"github.com/LouisMoretti/Undelete/bot/internal/outbox"
@@ -31,6 +35,11 @@ const httpClientTimeout = 60 * time.Second
 // purge is more than enough (retention_days minimum = 1 day).
 const retentionInterval = 24 * time.Hour
 const outboxInterval = time.Second
+
+// mediaInterval paces the download of the attachments. Slower than the outbox:
+// a media is only useful once its message is deleted, and hammering getFile
+// every second would only spend rate limit on files nobody is waiting for.
+const mediaInterval = 5 * time.Second
 
 // backlogInterval sets the refresh rate of the outbox backlog gauge.
 // Deliberately much slower than outboxInterval: the gauge is meant to spot
@@ -73,20 +82,42 @@ func run(logger *slog.Logger) error {
 	usersRepo := users.NewRepository(db.Pool)
 	messagesRepo := messages.NewRepository(db)
 	outboxRepo := outbox.NewRepository(db)
+	mediaRepo := media.NewRepository(db)
 	businessSvc := business.NewService(db.Pool, client, usersRepo, cfg.OwnerTelegramUserID, logger)
-	handler := app.NewHandler(businessSvc, messagesRepo, logger)
+	handler := app.NewHandler(businessSvc, messagesRepo, mediaRepo, logger)
+
+	// Dedicated HTTP client for the downloads: a media transfer must not share
+	// the connection pool of the long-polling client, whose timeout is sized
+	// for getUpdates. store.Downloader bounds each attempt with its own
+	// deadline, body transfer included.
+	downloader, err := store.New(store.Config{
+		BaseDir:    cfg.MediaDir,
+		HTTPClient: &http.Client{},
+		Logger:     logger,
+	})
+	if err != nil {
+		return err
+	}
+	fetcher := fetch.New(mediaRepo, client, downloader, cfg.TelegramBotToken, logger)
 
 	poller := telegram.NewPoller(client, logger)
 
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(5)
 	go func() {
 		defer wg.Done()
 		runRetentionLoop(ctx, usersRepo, messagesRepo, outboxRepo, logger)
 	}()
 	go func() {
 		defer wg.Done()
-		runOutboxLoop(ctx, usersRepo, outbox.NewWorker(outboxRepo, client, logger), logger)
+		// WithMediaDir: the same root the paths in media_files are relative
+		// to. Without it the worker would deliver every media alert as text.
+		worker := outbox.NewWorker(outboxRepo, client, logger, outbox.WithMediaDir(cfg.MediaDir))
+		runOutboxLoop(ctx, usersRepo, worker, logger)
+	}()
+	go func() {
+		defer wg.Done()
+		runMediaLoop(ctx, usersRepo, fetcher, logger)
 	}()
 	go func() {
 		defer wg.Done()
@@ -138,6 +169,46 @@ func runOutboxLoop(ctx context.Context, usersRepo *users.Repository, worker *out
 					if !didProcess {
 						break
 					}
+				}
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// runMediaLoop downloads the attachments catalogued as pending, tenant by
+// tenant (constraint #4: media_files is under FORCE RLS, so every read goes
+// through InTenant).
+//
+// Separate from both the poller and the outbox: a download is slow and can
+// fail, and neither the capture of new messages nor the delivery of alerts may
+// wait on it. A media that is not stored yet simply does not travel with its
+// alert -- the text goes out regardless.
+func runMediaLoop(ctx context.Context, usersRepo *users.Repository, fetcher *fetch.Fetcher, logger *slog.Logger) {
+	ticker := time.NewTicker(mediaInterval)
+	defer ticker.Stop()
+
+	for {
+		tenants, err := usersRepo.ListTenantsForRetention(ctx)
+		if err != nil {
+			if ctx.Err() == nil {
+				logger.Error("media fetch: failed to list tenants", slog.String("error", err.Error()))
+			}
+		} else {
+			for _, tenant := range tenants {
+				stored, err := fetcher.ProcessTenant(ctx, tenant.OwnerUserID)
+				if err != nil && ctx.Err() == nil {
+					logger.Error("media fetch: processing failed",
+						slog.Int64("owner_user_id", tenant.OwnerUserID),
+						slog.String("error", err.Error()))
+				}
+				if stored > 0 {
+					logger.Info("media stored", slog.Int("files", stored))
 				}
 			}
 		}

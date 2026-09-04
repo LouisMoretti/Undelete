@@ -147,11 +147,12 @@ const selectColumns = `
 // same attachment. The upsert therefore refreshes telegram_file_id, which
 // Telegram is free to change between updates.
 //
-// What the upsert deliberately does NOT touch: status, relative_path, sha256
-// and thumbnail_relative_path. Those describe the file ON DISK, a fact this
-// method knows nothing about. Resetting them to pending/NULL on a redelivery
-// would orphan an already downloaded blob -- nothing would ever come back to
-// delete it, since the row would no longer point at it.
+// What the upsert deliberately does NOT touch: status, relative_path, sha256,
+// thumbnail_relative_path, and byte_size once the file is stored. Those
+// describe the file ON DISK, a fact this method knows nothing about. Resetting
+// them to pending/NULL on a redelivery would orphan an already downloaded blob
+// -- nothing would ever come back to delete it, since the row would no longer
+// point at it.
 func (r *Repository) Save(ctx context.Context, ownerUserID int64, m Record) (int64, error) {
 	var id int64
 	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
@@ -168,7 +169,15 @@ func (r *Repository) Save(ctx context.Context, ownerUserID int64, m Record) (int
 				telegram_file_unique_id = EXCLUDED.telegram_file_unique_id,
 				media_type              = EXCLUDED.media_type,
 				mime_type               = EXCLUDED.mime_type,
-				byte_size               = EXCLUDED.byte_size,
+				-- byte_size carries two different facts: the size DECLARED by
+				-- Telegram while the row is pending, then the size actually
+				-- MEASURED on disk once MarkStored ran. A redelivery must not
+				-- push the declared value back over the measured one -- the
+				-- disk purge and any integrity check would then compare a real
+				-- file against a size that was never its own.
+				byte_size               = CASE WHEN media_files.status = 'stored'
+				                              THEN media_files.byte_size
+				                              ELSE EXCLUDED.byte_size END,
 				width                   = EXCLUDED.width,
 				height                  = EXCLUDED.height,
 				duration_sec            = EXCLUDED.duration_sec,

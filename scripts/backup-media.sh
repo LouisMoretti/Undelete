@@ -35,6 +35,13 @@
 # chosen predicate away from silently truncating the chain. Retention is
 # documented and applied by hand (docs/backup-restore.md).
 set -eu
+# An archive holds message attachments in the clear: whoever can read the file
+# can read the content. Default umask in the backup container is 022, which
+# would publish every archive, manifest and skipped list to any other account
+# on the host. 0600/0700 for everything this script writes -- host-side
+# commands on ./backups (verification, manual retention, offsite copy) are
+# consequently run under sudo, cf. docs/backup-restore.md.
+umask 077
 
 MEDIA_DIR="${MEDIA_DIR:-./media}"
 BACKUP_DIR="${BACKUP_DIR:-./backups}"
@@ -61,13 +68,32 @@ BACKUP_DIR=$(CDPATH= cd -- "$BACKUP_DIR" && pwd)
 # ("<hex>  <path>") in both cases, so a MANIFEST is checkable with
 # `sha256sum -c` wherever coreutils exists.
 if command -v sha256sum >/dev/null 2>&1; then
-    sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+    sha256_raw() { sha256sum "$1"; }
 elif command -v shasum >/dev/null 2>&1; then
-    sha256_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
+    sha256_raw() { shasum -a 256 "$1"; }
 else
     echo "backup-media: neither sha256sum nor shasum available" >&2
     exit 1
 fi
+
+# The `| cut` that extracts the hash returns cut's status, not the hasher's:
+# with no pipefail (see below), a file the hasher cannot read -- EIO on a bad
+# sector, a permission the container does not have -- yields an EMPTY hash and
+# a status of 0. That empty hash then produces a malformed manifest line, and
+# the failure only surfaces later as a confusing `tar: Cannot stat`. The shape
+# of the output is therefore checked here: exactly 64 hex characters, or the
+# run fails on the spot, naming the file.
+sha256_of() {
+    _hash=$(sha256_raw "$1" 2>/dev/null | cut -d' ' -f1) || _hash=''
+    case "$_hash" in
+        *[!0-9a-f]* | '') _hash='' ;;
+    esac
+    if [ -z "$_hash" ] || [ "${#_hash}" -ne 64 ]; then
+        echo "backup-media: cannot compute the sha256 of $1 (unreadable file?)" >&2
+        return 1
+    fi
+    printf '%s\n' "$_hash"
+}
 
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -80,6 +106,41 @@ timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 newest_full=$(find "$BACKUP_DIR" -maxdepth 1 -name 'undelete-media-*-full.tar.gz' -type f \
     | sort | tail -n 1)
 
+# Days elapsed since 1970-01-01 for a civil date, in pure arithmetic. NOT
+# `date -d "$iso"`: that spelling is a GNU extension, BusyBox date (the one in
+# postgres:16-alpine, where this script actually runs in production) parses a
+# different and narrower set of formats, and a `date -d` that quietly fails
+# would make `auto` take a FULL every single day -- ./media duplicated daily
+# into ./backups, with no purge to catch it. Algorithm: days_from_civil,
+# exact for any proleptic Gregorian date.
+days_from_civil() {
+    dfc_y=$1
+    dfc_m=$2
+    dfc_d=$3
+    # March-based year: February's leap day lands at the end, so no month
+    # table is needed.
+    if [ "$dfc_m" -le 2 ]; then
+        dfc_y=$((dfc_y - 1))
+        dfc_shifted=$((dfc_m + 9))
+    else
+        dfc_shifted=$((dfc_m - 3))
+    fi
+    dfc_era=$((dfc_y / 400))
+    dfc_yoe=$((dfc_y - dfc_era * 400))
+    dfc_doy=$(((153 * dfc_shifted + 2) / 5 + dfc_d - 1))
+    dfc_doe=$((dfc_yoe * 365 + dfc_yoe / 4 - dfc_yoe / 100 + dfc_doy))
+    echo $((dfc_era * 146097 + dfc_doe - 719468))
+}
+
+# "09" is not a number in POSIX arithmetic, it is a malformed octal constant
+# and dash errors out on it. Every field extracted from a timestamp goes
+# through here first.
+strip_zeros() {
+    sz=${1#0}
+    [ -n "$sz" ] || sz=0
+    echo "$sz"
+}
+
 full_age_days() {
     # Age of the base full, derived from its NAME rather than its mtime: a
     # copy or an rsync to an offsite target rewrites mtime, which would then
@@ -87,16 +148,23 @@ full_age_days() {
     base=$(basename "$1")
     stamp=${base#undelete-media-}
     stamp=${stamp%-full.tar.gz}
-    # "20260904T041200Z" -> "2026-09-04" -> days since epoch, computed with
-    # `date -d` (GNU) or `date -j` (BusyBox/macOS). If neither works we return
-    # an empty age and the caller falls back to taking a full: an extra full
-    # costs disk, a missing one costs the chain.
     day="${stamp%T*}"
-    iso="$(printf '%s-%s-%s' "$(echo "$day" | cut -c1-4)" "$(echo "$day" | cut -c5-6)" "$(echo "$day" | cut -c7-8)")"
-    base_epoch=$(date -u -d "$iso" +%s 2>/dev/null || date -u -j -f '%Y-%m-%d' "$iso" +%s 2>/dev/null || echo '')
-    [ -n "$base_epoch" ] || return 1
-    now_epoch=$(date -u +%s)
-    echo $(( (now_epoch - base_epoch) / 86400 ))
+    # A name that does not carry a plain YYYYMMDD (renamed by hand, truncated
+    # by a transfer) yields no age, and the caller falls back to taking a
+    # full: an extra full costs disk, a missing one costs the chain.
+    case "$day" in
+        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+        *) return 1 ;;
+    esac
+    base_days=$(days_from_civil \
+        "$(strip_zeros "$(echo "$day" | cut -c1-4)")" \
+        "$(strip_zeros "$(echo "$day" | cut -c5-6)")" \
+        "$(strip_zeros "$(echo "$day" | cut -c7-8)")")
+    today_days=$(days_from_civil \
+        "$(strip_zeros "$(date -u +%Y)")" \
+        "$(strip_zeros "$(date -u +%m)")" \
+        "$(strip_zeros "$(date -u +%d)")")
+    echo $((today_days - base_days))
 }
 
 mode="$MEDIA_BACKUP_MODE"
@@ -104,6 +172,15 @@ case "$mode" in
     full | incremental | auto) ;;
     *)
         echo "backup-media: invalid MEDIA_BACKUP_MODE=$mode (expected auto, full or incremental)" >&2
+        exit 1
+        ;;
+esac
+
+# Validated before use: `[ "$age" -ge "$X" ]` on a non-numeric X aborts the
+# run with a bare "bad number" and no indication of which variable is wrong.
+case "$MEDIA_BACKUP_FULL_INTERVAL_DAYS" in
+    '' | *[!0-9]*)
+        echo "backup-media: invalid MEDIA_BACKUP_FULL_INTERVAL_DAYS=${MEDIA_BACKUP_FULL_INTERVAL_DAYS} (expected a number of days)" >&2
         exit 1
         ;;
 esac
@@ -128,6 +205,14 @@ if [ "$mode" = incremental ] && [ -z "$newest_full" ]; then
 fi
 
 archive="${BACKUP_DIR}/undelete-media-${timestamp}-${mode}.tar.gz"
+# The name has one-second resolution: two runs in the same second (the daily
+# loop plus a manual `docker compose exec`) would target the same paths, and
+# the failure of the second would take the outputs of the first with it via
+# cleanup_partial. Refuse instead of overwriting.
+if [ -e "$archive" ]; then
+    echo "backup-media: $(basename "$archive") already exists, another run is in flight or just finished" >&2
+    exit 1
+fi
 manifest="${archive%.tar.gz}.manifest"
 meta="${archive%.tar.gz}.meta"
 checksum="${archive%.tar.gz}.sha256"
@@ -143,10 +228,23 @@ started_marker="${archive%.tar.gz}.started"
 # leave behind a truncated archive that a future restore would trust. The trap
 # removes the whole output set and is lifted only once everything is written.
 cleanup_partial() { rm -f "$archive" "$manifest" "$meta" "$checksum" "$skipped" "$started_marker"; }
-trap 'cleanup_partial' EXIT HUP INT TERM
+workdir=''
+cleanup_all() {
+    cleanup_partial
+    [ -z "$workdir" ] || rm -rf "$workdir"
+}
+# A signal handler runs and then execution RESUMES where it left off: a plain
+# `trap cleanup HUP INT TERM` would delete the outputs and let the script
+# carry on writing a .meta for an archive that no longer exists, ending on
+# exit 0. The signal traps therefore exit; only the EXIT trap returns.
+# PIPE is in the list because it is the one signal that kills the shell
+# without running any trap when untrapped -- a reader closing this script's
+# stdout would otherwise leave the archive and its manifest behind with no
+# .meta, which is exactly the half-written output set the trap exists for.
+trap 'cleanup_all' EXIT
+trap 'cleanup_all; exit 143' HUP INT TERM PIPE
 
 workdir=$(mktemp -d)
-trap 'cleanup_partial; rm -rf "$workdir"' EXIT HUP INT TERM
 
 echo "backup-media: mode=${mode} media=${MEDIA_DIR} -> $(basename "$archive")"
 
@@ -215,7 +313,14 @@ while IFS= read -r rel; do
         echo "backup-media: WARNING: ${rel} disappeared while listing, excluded" >&2
         continue
     fi
-    printf '%s  %s\n' "$(sha256_of "${MEDIA_DIR}/${rel}")" "$rel" >> "$manifest"
+    # Assigned, not inlined in printf: a command substitution that fails
+    # inside an argument list does not trip `set -e`, so an unreadable file
+    # would slip through as an empty hash.
+    if ! rel_sha=$(sha256_of "${MEDIA_DIR}/${rel}"); then
+        echo "backup-media: aborting -- the manifest would not describe the archive" >&2
+        exit 1
+    fi
+    printf '%s  %s\n' "$rel_sha" "$rel" >> "$manifest"
 done < "$workdir/files"
 
 # The manifest is authoritative for the archive's content: tar is fed from it,
@@ -264,8 +369,10 @@ manifest=$(basename "$manifest")
 skipped_paths=${skipped_count}
 EOF
 
-# Everything is on disk and coherent: the partial-output trap can go.
-trap 'rm -rf "$workdir"' EXIT HUP INT TERM
+# Everything is on disk and coherent: the partial-output trap can go, only
+# the temporary directory still has to be removed.
+trap 'rm -rf "$workdir"' EXIT
+trap 'rm -rf "$workdir"; exit 143' HUP INT TERM PIPE
 
 echo "backup-media: ${manifest_count} file(s), ${archive_bytes} bytes, sha256 ${archive_sha}"
 echo "backup-media: coupled to db dump ${dump_name}"

@@ -93,7 +93,12 @@ cleanup() {
     docker rm -f "$dst_container" >/dev/null 2>&1 || true
     rm -rf "$workdir"
 }
-trap cleanup EXIT HUP INT TERM
+# The signal traps exit; a handler that only cleans up would return control to
+# the script, which would then keep running against a workdir it just deleted
+# (and against containers it just removed), burying the real cause under a
+# cascade of errors.
+trap cleanup EXIT
+trap 'cleanup; exit 130' HUP INT TERM
 
 failures=0
 ok() { echo "  [OK]   $1"; }

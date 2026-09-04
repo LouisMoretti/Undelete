@@ -124,7 +124,14 @@ infrastructure and are portable to any offsite target.
 | Mode | When | Contents |
 |---|---|---|
 | `full` | first run, then every `MEDIA_BACKUP_FULL_INTERVAL_DAYS` (7) | every file under `./media` |
-| `incremental` | the other days | files modified or added since the base full **started** |
+| `incremental` | the other days | files modified or added since the base **full** started |
+
+The reference is always the base full, never the previous incremental: what
+the script writes is therefore a **differential** archive, cumulative within a
+chain. Day 3's archive contains days 1 to 3, day 6's contains days 1 to 6.
+This is deliberate — restoring needs only the full plus the *last* archive of
+the chain, so a single lost incremental in the middle costs nothing — but it
+is the reason the disk budget below counts the deltas several times over.
 
 `MEDIA_BACKUP_MODE` (`auto` by default) forces one mode when needed. The mode
 is chosen from the base full's *name*, not its mtime: copying archives offsite
@@ -159,10 +166,19 @@ archive=undelete-media-20260904T041200Z-full.tar.gz
 mode=full
 base_full=-
 db_dump=undelete-20260904T041000Z.sql.gz
+media_dir=/media
+started_at=2026-09-04T04:12:00Z
+finished_at=2026-09-04T04:19:31Z
 file_count=1284
 archive_bytes=3183129016
 archive_sha256=<hex>
+manifest=undelete-media-20260904T041200Z-full.manifest
+skipped_paths=0
 ```
+
+`.meta` is written **last**, once everything else is on disk and coherent: an
+archive without its `.meta` is the signature of an interrupted run and must
+not be trusted, whatever the rest of the sidecars say.
 
 `db_dump` names the most recent dump present when the archive was taken: the
 database state this tree is coherent with.
@@ -173,6 +189,25 @@ manifest, so it is excluded, listed in `.skipped`, and the script exits **2**
 produces has such a name — this only fires on a file dropped into `./media` by
 hand.
 
+Exit codes, since the difference decides whether there is anything to keep:
+
+| Code | Meaning |
+|---|---|
+| `0` | archive and sidecars written, nothing to report |
+| `2` | archive and sidecars **written**, some paths excluded — see `.skipped` |
+| other | **nothing was written**: the whole output set is removed on the way out, so a failed run never leaves a truncated archive a later restore could trust |
+
+### Permissions
+
+The script runs with `umask 077`: archives, manifests and sidecars come out
+`0600`, owned by the identity that ran it (`root`, in the backup container).
+An archive holds attachments in the clear — whoever reads the file reads the
+content — so this is not left to the default `022`.
+
+Practical consequence: the host-side commands of this document that touch
+`./backups` (verification, manual retention, offsite copy) are run under
+`sudo`, or from an account that can read the files.
+
 ### Media RPO / RTO and disk space
 
 | Parameter | Value |
@@ -180,14 +215,21 @@ hand.
 | Cadence | daily incremental, weekly full (same pass as the dump, right after it) |
 | **Media RPO** | **24 h**, same as the database |
 | **Media RTO** | measured by `make test-restore-media` (extraction only), reported as `measured media RTO (extraction only): Ns` |
-| Space, steady state | ≈ (size of `./media`) × number of fulls kept + the deltas |
+| Space, steady state | ≈ (size of `./media`) × number of fulls kept + the differentials of the current chain |
 
 The archives are `gzip`-compressed, but the payload is photos, video and
 voice notes — already-compressed formats. **Budget the archives at roughly
 the size of `./media` itself**; the compression gain is real only on
-documents. With the default 7-day full interval and 4 fulls kept, provision
-about **4 × the size of `./media`**, plus the incrementals (one day of new
-attachments each).
+documents. With the default 7-day full interval and 4 chains kept, provision
+about **4 × the size of `./media`** for the fulls.
+
+Then the differentials, which are the part that is easy to under-budget: each
+one carries *everything added since its base full*, so a 7-day chain holds
+1+2+…+6 ≈ **21 days' worth of new attachments**, not 6. Call it `D` the volume
+of attachments received per day; a chain costs `1 × media + 21 × D`, and four
+of them `4 × media + 84 × D`. `D` is small next to `./media` at the start and
+stops being small as soon as usage picks up — which is why the check below is
+to be redone whenever `./media` grows, not once.
 
 Check before enabling, and again whenever `./media` grows:
 
@@ -415,6 +457,14 @@ Step-by-step procedure, to be done **towards a new target**:
    matters: a later incremental legitimately overwrites an earlier version of
    the same path.
 
+   Because the incrementals are differential (each one is taken against the
+   base full, not against the previous incremental), the full plus the **last**
+   incremental of the chain would be enough. The loop below extracts them all
+   anyway: it costs a few seconds, it needs no judgement call at 3 a.m., and
+   it still gives the right tree if one of the archives turns out to be
+   unreadable — the missing content simply comes back from an earlier one, and
+   the MANIFEST check at step (c) says whether anything is left over.
+
    ```sh
    # a. Verify the archives BEFORE extracting anything.
    ( cd backups && sha256sum -c undelete-media-<full-ts>-full.sha256 )
@@ -430,8 +480,17 @@ Step-by-step procedure, to be done **towards a new target**:
 
    # c. Verify the extracted tree against the MANIFESTs, hash by hash.
    #    This is what turns "it extracted" into "every byte came back".
+   #    Two manifests, and they are enough: the full's covers the tree as it
+   #    stood at the base, the LAST incremental's covers everything added
+   #    since (differential, cf. above). Together they describe every file.
+   #    Checking the intermediate ones adds nothing and can report a stale
+   #    hash for a path that was rewritten later.
+   B=/path/to/Undelete/backups
+   last_incr=$(grep -l 'base_full=undelete-media-<full-ts>-full.tar.gz' "$B"/*.meta \
+               | sort | tail -n 1)
    ( cd /srv/undelete-restore/media \
-     && sha256sum -c /path/to/Undelete/backups/undelete-media-<full-ts>-full.manifest )
+     && sha256sum -c "$B/undelete-media-<full-ts>-full.manifest" \
+     && { [ -z "$last_incr" ] || sha256sum -c "${last_incr%.meta}.manifest"; } )
    ```
 
    The manifest paths are relative to the media root, so the `sha256sum -c`

@@ -160,8 +160,12 @@ docker compose exec -T -e BACKUP_DIR=/backups -e MEDIA_DIR=/media backup sh /scr
 
 It writes an archive plus its `MANIFEST`, `.sha256` and `.meta` sidecars, and
 **deletes nothing** — media retention is manual. Exit code `2` means the
-archive was written but some paths were excluded (see the `.skipped` sidecar).
-Details, retention procedure and restore order: `docs/backup-restore.md`.
+archive was written but some paths were excluded (see the `.skipped` sidecar);
+any other non-zero code means **nothing** was kept — a failed run removes its
+own partial output rather than leaving a truncated archive behind. The files
+are written `0600` and owned by `root` (the container's identity), so reading
+them from the host is a `sudo` matter. Details, retention procedure and
+restore order: `docs/backup-restore.md`.
 
 Note the dump name: it is the rollback point of §3.3.
 

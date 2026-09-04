@@ -98,9 +98,17 @@ type Chat struct {
 }
 
 // Message is a Telegram message, as received via business_message /
-// edited_business_message. Phase 1: text only (message_type derived
-// downstream, media out of scope -- cf. TODO Phase 2 in
-// messages/repository.go).
+// edited_business_message. Text and every media type documented by the Bot
+// API for a Business message are decoded here; the consolidated form used
+// downstream is produced by ExtractMedia (cf. media.go).
+//
+// Media fields are mutually exclusive in practice — Telegram sends one
+// attachment per message, an album being N messages sharing the same
+// media_group_id — but nothing in the API guarantees it, so ExtractMedia
+// reads them all rather than stopping at the first match. The documented
+// exception is Animation, which the Bot API duplicates into Document for
+// backward compatibility; ExtractMedia collapses that pair back into one
+// attachment.
 type Message struct {
 	MessageID            int64  `json:"message_id"`
 	From                 *User  `json:"from,omitempty"`
@@ -108,6 +116,158 @@ type Message struct {
 	Date                 int64  `json:"date"`
 	Text                 string `json:"text,omitempty"`
 	BusinessConnectionID string `json:"business_connection_id,omitempty"`
+
+	// MediaGroupID ties together the messages of one album. Empty on a
+	// standalone media.
+	MediaGroupID string `json:"media_group_id,omitempty"`
+	// Caption is the text attached to a media (Text stays empty in that
+	// case: Telegram never populates both).
+	Caption         string          `json:"caption,omitempty"`
+	CaptionEntities []MessageEntity `json:"caption_entities,omitempty"`
+
+	// Photo is the ONLY media sent as an array: the same image in several
+	// resolutions. Cf. selectLargestPhoto for the retained size.
+	Photo     []PhotoSize `json:"photo,omitempty"`
+	Video     *Video      `json:"video,omitempty"`
+	Animation *Animation  `json:"animation,omitempty"`
+	Document  *Document   `json:"document,omitempty"`
+	Audio     *Audio      `json:"audio,omitempty"`
+	Voice     *Voice      `json:"voice,omitempty"`
+	VideoNote *VideoNote  `json:"video_note,omitempty"`
+	Sticker   *Sticker    `json:"sticker,omitempty"`
+
+	// raw keeps the bytes of the message object as received, so ExtractMedia
+	// can surface a media type this struct does not know yet instead of
+	// silently dropping it (cf. MediaTypeUnknown). It is unexported: it takes
+	// no part in serialization and stays invisible to the callers.
+	raw json.RawMessage
+}
+
+// UnmarshalJSON decodes a Message normally, then keeps a copy of the raw
+// object for the unknown-media fallback.
+func (m *Message) UnmarshalJSON(data []byte) error {
+	// messageAlias drops the methods of Message, UnmarshalJSON included:
+	// without it, encoding/json would call this function recursively.
+	type messageAlias Message
+	var alias messageAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+	*m = Message(alias)
+	m.raw = append(json.RawMessage(nil), data...)
+	return nil
+}
+
+// MessageEntity is a special entity of a text or a caption (mention, URL,
+// bold, custom emoji...). Kept whole so a restored caption can be re-rendered
+// with its formatting.
+type MessageEntity struct {
+	Type          string `json:"type"`
+	Offset        int    `json:"offset"`
+	Length        int    `json:"length"`
+	URL           string `json:"url,omitempty"`
+	User          *User  `json:"user,omitempty"`
+	Language      string `json:"language,omitempty"`
+	CustomEmojiID string `json:"custom_emoji_id,omitempty"`
+}
+
+// PhotoSize is one resolution of a photo, or the thumbnail of another media.
+// FileSize is optional: Telegram omits it on some sizes, hence the absence of
+// any "size 0 = empty file" meaning.
+type PhotoSize struct {
+	FileID       string `json:"file_id"`
+	FileUniqueID string `json:"file_unique_id"`
+	Width        int    `json:"width"`
+	Height       int    `json:"height"`
+	FileSize     int64  `json:"file_size,omitempty"`
+}
+
+// Video is a video file.
+type Video struct {
+	FileID            string     `json:"file_id"`
+	FileUniqueID      string     `json:"file_unique_id"`
+	Width             int        `json:"width"`
+	Height            int        `json:"height"`
+	Duration          int        `json:"duration"`
+	Thumbnail         *PhotoSize `json:"thumbnail,omitempty"`
+	FileName          string     `json:"file_name,omitempty"`
+	MimeType          string     `json:"mime_type,omitempty"`
+	FileSize          int64      `json:"file_size,omitempty"`
+	SupportsStreaming bool       `json:"supports_streaming,omitempty"`
+}
+
+// Animation is a GIF, or an H.264/MPEG-4 AVC video without sound. Telegram
+// sends it as its own type, never as a Video, but also mirrors it into
+// Message.Document for backward compatibility (cf. ExtractMedia).
+type Animation struct {
+	FileID       string     `json:"file_id"`
+	FileUniqueID string     `json:"file_unique_id"`
+	Width        int        `json:"width"`
+	Height       int        `json:"height"`
+	Duration     int        `json:"duration"`
+	Thumbnail    *PhotoSize `json:"thumbnail,omitempty"`
+	FileName     string     `json:"file_name,omitempty"`
+	MimeType     string     `json:"mime_type,omitempty"`
+	FileSize     int64      `json:"file_size,omitempty"`
+}
+
+// Document is any file not matching a more specific type.
+type Document struct {
+	FileID       string     `json:"file_id"`
+	FileUniqueID string     `json:"file_unique_id"`
+	Thumbnail    *PhotoSize `json:"thumbnail,omitempty"`
+	FileName     string     `json:"file_name,omitempty"`
+	MimeType     string     `json:"mime_type,omitempty"`
+	FileSize     int64      `json:"file_size,omitempty"`
+}
+
+// Audio is a music file, as opposed to Voice.
+type Audio struct {
+	FileID       string     `json:"file_id"`
+	FileUniqueID string     `json:"file_unique_id"`
+	Duration     int        `json:"duration"`
+	Performer    string     `json:"performer,omitempty"`
+	Title        string     `json:"title,omitempty"`
+	FileName     string     `json:"file_name,omitempty"`
+	MimeType     string     `json:"mime_type,omitempty"`
+	FileSize     int64      `json:"file_size,omitempty"`
+	Thumbnail    *PhotoSize `json:"thumbnail,omitempty"`
+}
+
+// Voice is a voice message. It carries neither dimensions nor thumbnail.
+type Voice struct {
+	FileID       string `json:"file_id"`
+	FileUniqueID string `json:"file_unique_id"`
+	Duration     int    `json:"duration"`
+	MimeType     string `json:"mime_type,omitempty"`
+	FileSize     int64  `json:"file_size,omitempty"`
+}
+
+// VideoNote is a round video message. Length is the side of the square video,
+// which is why it feeds both Width and Height downstream.
+type VideoNote struct {
+	FileID       string     `json:"file_id"`
+	FileUniqueID string     `json:"file_unique_id"`
+	Length       int        `json:"length"`
+	Duration     int        `json:"duration"`
+	Thumbnail    *PhotoSize `json:"thumbnail,omitempty"`
+	FileSize     int64      `json:"file_size,omitempty"`
+}
+
+// Sticker is a sticker. Type is the sticker's own kind ("regular", "mask",
+// "custom_emoji") and must not be confused with MediaAttachment.Type.
+type Sticker struct {
+	FileID       string     `json:"file_id"`
+	FileUniqueID string     `json:"file_unique_id"`
+	Type         string     `json:"type,omitempty"`
+	Width        int        `json:"width"`
+	Height       int        `json:"height"`
+	IsAnimated   bool       `json:"is_animated,omitempty"`
+	IsVideo      bool       `json:"is_video,omitempty"`
+	Thumbnail    *PhotoSize `json:"thumbnail,omitempty"`
+	Emoji        string     `json:"emoji,omitempty"`
+	SetName      string     `json:"set_name,omitempty"`
+	FileSize     int64      `json:"file_size,omitempty"`
 }
 
 // BusinessMessagesDeleted corresponds to the deleted_business_messages update.

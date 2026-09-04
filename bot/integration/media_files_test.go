@@ -219,6 +219,60 @@ func TestPostgreSQL16MediaFilesSchema(t *testing.T) {
 		}
 	})
 
+	t.Run("a poorer redelivery does not erase known metadata", func(t *testing.T) {
+		ctx := phaseContext(t)
+		if _, err := repo.Save(ctx, ownerA.ID, record("owner-a", 7, 0)); err != nil {
+			t.Fatalf("initial save: %v", err)
+		}
+
+		// An edited_business_message that re-describes the same attachment
+		// without repeating its MIME type or its dimensions: NULL means "this
+		// update did not say", never "the value was cleared".
+		poorer := record("owner-a", 7, 0)
+		poorer.MimeType = ""
+		poorer.ByteSize = nil
+		poorer.Width = nil
+		poorer.Height = nil
+		if _, err := repo.Save(ctx, ownerA.ID, poorer); err != nil {
+			t.Fatalf("poorer redelivery: %v", err)
+		}
+
+		files, err := repo.GetByMessage(ctx, ownerA.ID, "owner-a", 770, 7)
+		if err != nil || len(files) != 1 {
+			t.Fatalf("after poorer redelivery: files=%d err=%v", len(files), err)
+		}
+		f := files[0]
+		if f.MimeType != "image/jpeg" || f.Width == nil || *f.Width != 800 || f.ByteSize == nil || *f.ByteSize != 1024 {
+			t.Fatalf("the poorer redelivery erased known metadata: %+v", f)
+		}
+	})
+
+	t.Run("MarkStored refuses a malformed hash before touching the row", func(t *testing.T) {
+		ctx := phaseContext(t)
+		id, err := repo.Save(ctx, ownerA.ID, record("owner-a", 8, 0))
+		if err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		// Uppercase hex: the CHECK of migration 0004 would refuse it too, but
+		// only after the blob was written under ./media. The Go guard must fire
+		// first, and name the field.
+		err = repo.MarkStored(ctx, ownerA.ID, id, media.StoredFile{
+			RelativePath: "92001/owner-a/770/8/0.jpg",
+			SHA256:       "9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08",
+			ByteSize:     2048,
+		})
+		if !errors.Is(err, media.ErrInvalidSHA256) {
+			t.Fatalf("MarkStored with an uppercase hash = %v, want media.ErrInvalidSHA256", err)
+		}
+		files, err := repo.GetByMessage(ctx, ownerA.ID, "owner-a", 770, 8)
+		if err != nil || len(files) != 1 {
+			t.Fatalf("after the refused MarkStored: files=%d err=%v", len(files), err)
+		}
+		if files[0].Status != media.StatusPending || files[0].RelativePath != "" {
+			t.Fatalf("the refused MarkStored still touched the row: %+v", files[0])
+		}
+	})
+
 	t.Run("several files per message and albums coexist", func(t *testing.T) {
 		ctx := phaseContext(t)
 		// Two attachments on the same message: distinct file_index, so the

@@ -153,6 +153,11 @@ const selectColumns = `
 // them to pending/NULL on a redelivery would orphan an already downloaded blob
 // -- nothing would ever come back to delete it, since the row would no longer
 // point at it.
+//
+// The optional metadata (mime_type, dimensions, duration, album) is refreshed
+// through COALESCE rather than overwritten, for the same reason at a smaller
+// scale: a redelivery that says nothing must not erase what a previous one
+// knew.
 func (r *Repository) Save(ctx context.Context, ownerUserID int64, m Record) (int64, error) {
 	var id int64
 	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
@@ -168,7 +173,15 @@ func (r *Repository) Save(ctx context.Context, ownerUserID int64, m Record) (int
 				telegram_file_id        = EXCLUDED.telegram_file_id,
 				telegram_file_unique_id = EXCLUDED.telegram_file_unique_id,
 				media_type              = EXCLUDED.media_type,
-				mime_type               = EXCLUDED.mime_type,
+				-- COALESCE, not a plain overwrite: NULL here means "this
+				-- delivery did not say", never "the value was cleared". An
+				-- edited_business_message re-describes the attachment and may
+				-- carry less than the original update did (a photo edit that
+				-- reports no MIME, dimensions dropped by a client): keeping the
+				-- known value is always closer to the truth than replacing it
+				-- with NULL. A richer redelivery still wins, since a non-NULL
+				-- EXCLUDED value takes precedence.
+				mime_type               = COALESCE(EXCLUDED.mime_type, media_files.mime_type),
 				-- byte_size carries two different facts: the size DECLARED by
 				-- Telegram while the row is pending, then the size actually
 				-- MEASURED on disk once MarkStored ran. A redelivery must not
@@ -177,11 +190,11 @@ func (r *Repository) Save(ctx context.Context, ownerUserID int64, m Record) (int
 				-- file against a size that was never its own.
 				byte_size               = CASE WHEN media_files.status = 'stored'
 				                              THEN media_files.byte_size
-				                              ELSE EXCLUDED.byte_size END,
-				width                   = EXCLUDED.width,
-				height                  = EXCLUDED.height,
-				duration_sec            = EXCLUDED.duration_sec,
-				media_group_id          = EXCLUDED.media_group_id,
+				                              ELSE COALESCE(EXCLUDED.byte_size, media_files.byte_size) END,
+				width                   = COALESCE(EXCLUDED.width, media_files.width),
+				height                  = COALESCE(EXCLUDED.height, media_files.height),
+				duration_sec            = COALESCE(EXCLUDED.duration_sec, media_files.duration_sec),
+				media_group_id          = COALESCE(EXCLUDED.media_group_id, media_files.media_group_id),
 				updated_at              = now()
 			RETURNING id
 		`,

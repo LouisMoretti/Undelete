@@ -74,7 +74,10 @@ type Record struct {
 	// Optional metadata: empty strings and nil pointers are stored as NULL
 	// rather than as a zero value, so "unknown size" stays distinguishable
 	// from "empty file".
-	MimeType     string
+	MimeType string
+	// FileName is the name chosen by the sender, when Telegram carries one. It
+	// is display metadata only: it never contributes to a storage path.
+	FileName     string
 	ByteSize     *int64
 	Width        *int
 	Height       *int
@@ -93,6 +96,7 @@ type File struct {
 	TelegramFileUniqueID string
 	MediaType            string
 	MimeType             string
+	FileName             string
 	ByteSize             *int64
 	Width                *int
 	Height               *int
@@ -133,7 +137,8 @@ func NewRepository(db *storage.DB) *Repository {
 const selectColumns = `
 	id, business_connection_id, chat_id, message_id, file_index,
 	telegram_file_id, telegram_file_unique_id, media_type,
-	COALESCE(mime_type, ''), byte_size, width, height, duration_sec,
+	COALESCE(mime_type, ''), COALESCE(file_name, ''),
+	byte_size, width, height, duration_sec,
 	COALESCE(relative_path, ''), COALESCE(thumbnail_relative_path, ''),
 	COALESCE(sha256, ''), status, COALESCE(media_group_id, '')
 `
@@ -165,9 +170,9 @@ func (r *Repository) Save(ctx context.Context, ownerUserID int64, m Record) (int
 			INSERT INTO media_files (
 				owner_user_id, business_connection_id, chat_id, message_id, file_index,
 				telegram_file_id, telegram_file_unique_id, media_type,
-				mime_type, byte_size, width, height, duration_sec, media_group_id
+				mime_type, file_name, byte_size, width, height, duration_sec, media_group_id
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10, $11, $12, $13, NULLIF($14, ''))
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), NULLIF($10, ''), $11, $12, $13, $14, NULLIF($15, ''))
 			ON CONFLICT (owner_user_id, business_connection_id, chat_id, message_id, file_index)
 			DO UPDATE SET
 				telegram_file_id        = EXCLUDED.telegram_file_id,
@@ -182,6 +187,7 @@ func (r *Repository) Save(ctx context.Context, ownerUserID int64, m Record) (int
 				-- with NULL. A richer redelivery still wins, since a non-NULL
 				-- EXCLUDED value takes precedence.
 				mime_type               = COALESCE(EXCLUDED.mime_type, media_files.mime_type),
+				file_name               = COALESCE(EXCLUDED.file_name, media_files.file_name),
 				-- byte_size carries two different facts: the size DECLARED by
 				-- Telegram while the row is pending, then the size actually
 				-- MEASURED on disk once MarkStored ran. A redelivery must not
@@ -200,7 +206,7 @@ func (r *Repository) Save(ctx context.Context, ownerUserID int64, m Record) (int
 		`,
 			ownerUserID, m.BusinessConnectionID, m.ChatID, m.MessageID, m.FileIndex,
 			m.TelegramFileID, m.TelegramFileUniqueID, m.MediaType,
-			m.MimeType, m.ByteSize, m.Width, m.Height, m.DurationSec, m.MediaGroupID,
+			m.MimeType, m.FileName, m.ByteSize, m.Width, m.Height, m.DurationSec, m.MediaGroupID,
 		).Scan(&id)
 	})
 	if err != nil {
@@ -229,6 +235,41 @@ func (r *Repository) GetByMessage(ctx context.Context, ownerUserID int64, busine
 	})
 	if err != nil {
 		return nil, fmt.Errorf("reading media of message %d: %w", messageID, err)
+	}
+	return files, nil
+}
+
+// SelectStoredTx returns the attachments of the given messages that are
+// actually ON DISK, ordered by (message_id, file_index) -- the order the sender
+// saw, and the one an album must be restored in.
+//
+// It takes the caller's transaction instead of opening its own: the deletion
+// alert is written by messages.MarkDeleted inside a single InTenant
+// transaction, and the media entry must be enqueued atomically with the
+// deleted_at it belongs to. The tenant context is therefore already set by the
+// caller, and RLS applies exactly as it does everywhere else in this package.
+//
+// Only 'stored' rows are returned: a pending row has no path yet, and a purged
+// one no longer has a file. Both leave the alert to its text, which already
+// states the message type.
+func SelectStoredTx(ctx context.Context, tx pgx.Tx, businessConnectionID string, chatID int64, messageIDs []int64) ([]File, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT`+selectColumns+`
+		FROM media_files
+		WHERE business_connection_id = $1
+		  AND chat_id = $2
+		  AND message_id = ANY($3)
+		  AND status = 'stored'
+		  AND relative_path IS NOT NULL
+		ORDER BY message_id, file_index
+	`, businessConnectionID, chatID, messageIDs)
+	if err != nil {
+		return nil, fmt.Errorf("reading stored media: %w", err)
+	}
+	defer rows.Close()
+	files, err := scanFiles(rows)
+	if err != nil {
+		return nil, fmt.Errorf("reading stored media: %w", err)
 	}
 	return files, nil
 }
@@ -331,7 +372,7 @@ func scanFiles(rows pgx.Rows) ([]File, error) {
 		if err := rows.Scan(
 			&f.ID, &f.BusinessConnectionID, &f.ChatID, &f.MessageID, &f.FileIndex,
 			&f.TelegramFileID, &f.TelegramFileUniqueID, &f.MediaType,
-			&f.MimeType, &f.ByteSize, &f.Width, &f.Height, &f.DurationSec,
+			&f.MimeType, &f.FileName, &f.ByteSize, &f.Width, &f.Height, &f.DurationSec,
 			&f.RelativePath, &f.ThumbnailRelativePath,
 			&f.SHA256, &f.Status, &f.MediaGroupID,
 		); err != nil {

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 
 	"github.com/LouisMoretti/Undelete/bot/internal/business"
+	"github.com/LouisMoretti/Undelete/bot/internal/media"
 	"github.com/LouisMoretti/Undelete/bot/internal/messages"
 	"github.com/LouisMoretti/Undelete/bot/internal/metrics"
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
@@ -23,13 +24,18 @@ import (
 type Handler struct {
 	business *business.Service
 	messages *messages.Repository
-	logger   *slog.Logger
+	// media catalogues the attachments of every saved message. Nil disables
+	// the capture entirely (text-only mode): the messages keep being saved,
+	// and no deletion alert will carry a file.
+	media  *media.Repository
+	logger *slog.Logger
 }
 
-func NewHandler(businessSvc *business.Service, messagesRepo *messages.Repository, logger *slog.Logger) *Handler {
+func NewHandler(businessSvc *business.Service, messagesRepo *messages.Repository, mediaRepo *media.Repository, logger *slog.Logger) *Handler {
 	return &Handler{
 		business: businessSvc,
 		messages: messagesRepo,
+		media:    mediaRepo,
 		logger:   logger,
 	}
 }
@@ -89,22 +95,32 @@ func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited
 		fromDisplay = displayName(msg.From)
 	}
 
+	attachments := telegram.ExtractMedia(msg)
+
 	record := messages.Record{
 		BusinessConnectionID: msg.BusinessConnectionID,
 		ChatID:               msg.Chat.ID,
 		MessageID:            msg.MessageID,
 		FromUserID:           fromUserID,
 		FromDisplay:          fromDisplay,
-		MessageType:          "text", // Phase 1: text only
-		TextContent:          msg.Text,
-		TelegramDate:         msg.Date,
-		ChatTitle:            chatTitle(msg.Chat),
-		ChatUsername:         msg.Chat.Username,
-		ChatType:             msg.Chat.Type,
+		MessageType:          messageType(attachments),
+		// A media message carries its text in caption, never in text: storing
+		// it in the same column keeps ONE place holding what was written, which
+		// the alert then restores both in its text and as the caption of the
+		// file itself.
+		TextContent:  messageText(msg),
+		TelegramDate: msg.Date,
+		ChatTitle:    chatTitle(msg.Chat),
+		ChatUsername: msg.Chat.Username,
+		ChatType:     msg.Chat.Type,
 	}
 
 	if err := h.messages.Save(ctx, conn.OwnerUserID, record, edited); err != nil {
 		return fmt.Errorf("message save: %w", err)
+	}
+
+	if err := h.saveMedia(ctx, conn.OwnerUserID, msg, attachments); err != nil {
+		return err
 	}
 
 	// Logs: ids, types, counters only. NEVER msg.Text nor any user
@@ -115,9 +131,74 @@ func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited
 		slog.String("business_connection_id", conn.ID),
 		slog.Int64("chat_id", msg.Chat.ID),
 		slog.Int64("message_id", msg.MessageID),
+		slog.Int("attachments", len(attachments)),
 		slog.Bool("edited", edited))
 
 	return nil
+}
+
+// saveMedia catalogues the attachments of a message. The rows are created
+// pending: the bytes are downloaded afterwards, by the media fetch loop, and
+// only a stored row can end up in a deletion alert.
+//
+// file_index is the position in the list returned by ExtractMedia, which is
+// deterministic for a given message: a Telegram redelivery therefore hits the
+// upsert on the same (message, file_index) instead of duplicating the file.
+func (h *Handler) saveMedia(ctx context.Context, ownerUserID int64, msg *telegram.Message, attachments []telegram.MediaAttachment) error {
+	if h.media == nil {
+		return nil
+	}
+	for index, attachment := range attachments {
+		record := media.Record{
+			BusinessConnectionID: msg.BusinessConnectionID,
+			ChatID:               msg.Chat.ID,
+			MessageID:            msg.MessageID,
+			FileIndex:            index,
+			TelegramFileID:       attachment.FileID,
+			TelegramFileUniqueID: attachment.FileUniqueID,
+			MediaType:            attachment.Type,
+			MimeType:             attachment.MimeType,
+			FileName:             attachment.FileName,
+			MediaGroupID:         attachment.MediaGroupID,
+			// Zero means "Telegram did not say", never "empty file": the
+			// optional metadata stays NULL rather than being stored as 0.
+			ByteSize:    optional(attachment.ByteSize),
+			Width:       optional(attachment.Width),
+			Height:      optional(attachment.Height),
+			DurationSec: optional(attachment.DurationSec),
+		}
+		if _, err := h.media.Save(ctx, ownerUserID, record); err != nil {
+			return fmt.Errorf("media catalogue: %w", err)
+		}
+	}
+	return nil
+}
+
+// optional turns a Telegram optional numeric field into a nullable column.
+func optional[T int | int64](value T) *T {
+	if value == 0 {
+		return nil
+	}
+	return &value
+}
+
+// messageType describes what was deleted. The type of the FIRST attachment
+// wins: a Telegram message carries at most one media, an album being several
+// messages that each keep their own type.
+func messageType(attachments []telegram.MediaAttachment) string {
+	if len(attachments) == 0 {
+		return "text"
+	}
+	return attachments[0].Type
+}
+
+// messageText is what the sender wrote: text on a plain message, caption on a
+// media message. Telegram never fills both.
+func messageText(msg *telegram.Message) string {
+	if msg.Text != "" {
+		return msg.Text
+	}
+	return msg.Caption
 }
 
 // handleDeleted resolves the connection, loops over message_ids (constraint

@@ -23,16 +23,39 @@ type Repository struct {
 
 func NewRepository(db *storage.DB) *Repository { return &Repository{db: db} }
 
-// InsertTx adds a chunk in the transaction that marks deleted_at.
+// InsertTx adds a text chunk in the transaction that marks deleted_at.
 func InsertTx(ctx context.Context, tx pgx.Tx, ownerUserID, ownerTelegramUserID int64, businessConnectionID string, chatID, messageID int64, eventType string, chunkIndex int, text string) error {
+	return insertTx(ctx, tx, ownerUserID, ownerTelegramUserID, businessConnectionID,
+		chatID, messageID, eventType, chunkIndex, text, PayloadKindText, nil)
+}
+
+// InsertMediaTx adds the media entry of an alert, in the SAME transaction as
+// its text chunks: either the deletion is recorded with everything it takes to
+// notify it, or nothing is.
+//
+// text is the fallback: what the worker sends, followed by
+// telegram.MediaUnavailableNote, when the files cannot be delivered. It is
+// never sent on the nominal path.
+func InsertMediaTx(ctx context.Context, tx pgx.Tx, ownerUserID, ownerTelegramUserID int64, businessConnectionID string, chatID, messageID int64, eventType string, chunkIndex int, text string, payload MediaPayload) error {
+	raw, err := encodeMediaPayload(payload)
+	if err != nil {
+		return err
+	}
+	return insertTx(ctx, tx, ownerUserID, ownerTelegramUserID, businessConnectionID,
+		chatID, messageID, eventType, chunkIndex, text, PayloadKindMedia, raw)
+}
+
+func insertTx(ctx context.Context, tx pgx.Tx, ownerUserID, ownerTelegramUserID int64, businessConnectionID string, chatID, messageID int64, eventType string, chunkIndex int, text, payloadKind string, mediaPayload []byte) error {
 	_, err := tx.Exec(ctx, `
 		INSERT INTO notification_outbox (
 			owner_user_id, owner_telegram_user_id, business_connection_id,
-			chat_id, message_id, event_type, chunk_index, payload_text
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			chat_id, message_id, event_type, chunk_index, payload_text,
+			payload_kind, media_payload
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (owner_user_id, business_connection_id, chat_id, message_id, event_type, chunk_index)
 		DO NOTHING
-	`, ownerUserID, ownerTelegramUserID, businessConnectionID, chatID, messageID, eventType, chunkIndex, text)
+	`, ownerUserID, ownerTelegramUserID, businessConnectionID, chatID, messageID,
+		eventType, chunkIndex, text, payloadKind, mediaPayload)
 	if err != nil {
 		return fmt.Errorf("outbox insert: %w", err)
 	}
@@ -79,16 +102,25 @@ func (r *Repository) Claim(ctx context.Context, ownerUserID int64, lease time.Du
 			WHERE o.id = candidate.id
 			RETURNING o.id, o.owner_user_id, o.owner_telegram_user_id,
 			          o.business_connection_id, o.chat_id, o.message_id,
-			          o.event_type, o.payload_text, o.attempts, o.lease_token
+			          o.event_type, o.payload_text, o.attempts, o.lease_token,
+			          o.payload_kind, o.media_payload
 		`, lease.Seconds(), leaseToken)
 		var claimed Job
+		var mediaPayload []byte
 		if err := row.Scan(&claimed.ID, &claimed.OwnerUserID, &claimed.OwnerTelegramUserID,
 			&claimed.BusinessConnectionID, &claimed.ChatID, &claimed.MessageID,
-			&claimed.EventType, &claimed.Text, &claimed.Attempts, &claimed.LeaseToken); err != nil {
+			&claimed.EventType, &claimed.Text, &claimed.Attempts, &claimed.LeaseToken,
+			&claimed.PayloadKind, &mediaPayload); err != nil {
 			if err == pgx.ErrNoRows {
 				return nil
 			}
 			return fmt.Errorf("outbox claim: %w", err)
+		}
+		if claimed.PayloadKind == PayloadKindMedia {
+			// A payload that cannot be decoded must not strand the alert: the
+			// job then simply carries no media, and the worker delivers its
+			// fallback text -- the same outcome as a file missing from disk.
+			claimed.Media, _ = decodeMediaPayload(mediaPayload)
 		}
 		job = &claimed
 		return nil

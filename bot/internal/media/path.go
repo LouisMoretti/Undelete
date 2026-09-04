@@ -11,6 +11,11 @@ import (
 // tests identify the failure via errors.Is rather than by the message text.
 var ErrUnsafeRelativePath = errors.New("unsafe media relative path")
 
+// ErrInvalidSHA256 is returned (wrapped) by ValidateSHA256 for a hash the
+// sha256 CHECK of migration 0004 would refuse. Exported sentinel, same contract
+// as ErrUnsafeRelativePath.
+var ErrInvalidSHA256 = errors.New("invalid sha256")
+
 // ValidateRelativePath rejects any path that must never be joined to the media
 // base directory.
 //
@@ -51,6 +56,29 @@ func ValidateRelativePath(p string) error {
 			return fmt.Errorf("%w: empty component in %q", ErrUnsafeRelativePath, p)
 		case ".", "..":
 			return fmt.Errorf("%w: %q component in %q", ErrUnsafeRelativePath, component, p)
+		}
+	}
+	return nil
+}
+
+// ValidateSHA256 mirrors the sha256 CHECK of migration 0004: 64 lowercase hex
+// characters.
+//
+// Same reason to duplicate the constraint as ValidateRelativePath, and the same
+// ordering problem: MarkStored runs AFTER the blob was written under ./media, so
+// letting a malformed hash reach the server means the UPDATE fails, the row
+// stays pending and the file stays on disk with nothing pointing at it. Refusing
+// here names the offending field instead of returning an opaque 23514.
+//
+// Uppercase hex is rejected rather than lowercased: two spellings of one hash
+// would break any later deduplication by content.
+func ValidateSHA256(h string) error {
+	if len(h) != 64 {
+		return fmt.Errorf("%w: %d characters, want 64", ErrInvalidSHA256, len(h))
+	}
+	for _, c := range h {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return fmt.Errorf("%w: %q is not lowercase hex", ErrInvalidSHA256, h)
 		}
 	}
 	return nil

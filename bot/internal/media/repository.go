@@ -250,9 +250,11 @@ func (r *Repository) ListPending(ctx context.Context, ownerUserID int64, limit i
 // MarkStored records that the file is on disk: path, hash, real size, optional
 // thumbnail, status stored.
 //
-// Both paths are validated BEFORE the query. The CHECK constraints of migration
-// 0004 would catch them too, but only after the file has been written under
-// that same path: refusing here is what keeps the write inside ./media.
+// Both paths and the hash are validated BEFORE the query. The CHECK constraints
+// of migration 0004 would catch them too, but only after the file has been
+// written under that same path: refusing here is what keeps the write inside
+// ./media, and what stops a malformed hash from leaving the row pending while
+// the blob sits on disk with nothing pointing at it.
 func (r *Repository) MarkStored(ctx context.Context, ownerUserID, id int64, s StoredFile) error {
 	if err := ValidateRelativePath(s.RelativePath); err != nil {
 		return fmt.Errorf("media %d: %w", id, err)
@@ -261,6 +263,9 @@ func (r *Repository) MarkStored(ctx context.Context, ownerUserID, id int64, s St
 		if err := ValidateRelativePath(s.ThumbnailRelativePath); err != nil {
 			return fmt.Errorf("media %d thumbnail: %w", id, err)
 		}
+	}
+	if err := ValidateSHA256(s.SHA256); err != nil {
+		return fmt.Errorf("media %d: %w", id, err)
 	}
 	return r.update(ctx, ownerUserID, id, `
 		UPDATE media_files

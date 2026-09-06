@@ -17,21 +17,43 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
 )
 
+// businessService is the subset of business.Service used by Handler: resolving
+// a connection for save/delete, and processing connection updates. An
+// interface (rather than the concrete type) so unit tests can substitute a
+// fake without a database.
+type businessService interface {
+	Resolve(ctx context.Context, connectionID string) (*business.Connection, error)
+	HandleBusinessConnection(ctx context.Context, tc telegram.BusinessConnection) error
+}
+
+// messageStore is the subset of messages.Repository used by Handler.
+type messageStore interface {
+	Save(ctx context.Context, ownerUserID int64, m messages.Record, edited bool) error
+	MarkDeleted(ctx context.Context, ownerUserID, ownerTelegramUserID int64, businessConnectionID string, chatID int64, messageIDs []int64) ([]messages.DeletedRecord, error)
+}
+
+// mediaCatalogue is the subset of media.Repository used by Handler: the
+// pending-row catalogue written at save time (the download itself belongs to
+// the fetch loop). Nil disables the capture entirely (text-only mode).
+type mediaCatalogue interface {
+	Save(ctx context.Context, ownerUserID int64, m media.Record) (int64, error)
+}
+
 // Handler routes Telegram Business updates to business handling. Its
 // methods are called strictly sequentially by telegram.Poller (constraint
 // #5): no mutex protection is needed here, the call order IS the
 // consistency guarantee.
 type Handler struct {
-	business *business.Service
-	messages *messages.Repository
+	business businessService
+	messages messageStore
 	// media catalogues the attachments of every saved message. Nil disables
 	// the capture entirely (text-only mode): the messages keep being saved,
 	// and no deletion alert will carry a file.
-	media  *media.Repository
+	media  mediaCatalogue
 	logger *slog.Logger
 }
 
-func NewHandler(businessSvc *business.Service, messagesRepo *messages.Repository, mediaRepo *media.Repository, logger *slog.Logger) *Handler {
+func NewHandler(businessSvc businessService, messagesRepo messageStore, mediaRepo mediaCatalogue, logger *slog.Logger) *Handler {
 	return &Handler{
 		business: businessSvc,
 		messages: messagesRepo,
@@ -274,7 +296,10 @@ func chatTitle(c telegram.Chat) string {
 func displayName(u *telegram.User) string {
 	name := u.FirstName
 	if u.LastName != "" {
-		name += " " + u.LastName
+		if name != "" {
+			name += " "
+		}
+		name += u.LastName
 	}
 	if u.Username != "" {
 		name += " (@" + u.Username + ")"

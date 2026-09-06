@@ -39,9 +39,19 @@ type Downloader interface {
 	Download(ctx context.Context, token string, req store.Request) (store.StoredFile, error)
 }
 
+// catalogue is the subset of media.Repository used by Fetcher: listing the
+// pending rows, then flipping each of them to stored or purged. An interface
+// (rather than the concrete type) so unit tests can substitute a fake without
+// a database.
+type catalogue interface {
+	ListPending(ctx context.Context, ownerUserID int64, limit int) ([]media.File, error)
+	MarkStored(ctx context.Context, ownerUserID, id int64, s media.StoredFile) error
+	MarkPurged(ctx context.Context, ownerUserID, id int64) error
+}
+
 // Fetcher downloads the attachments catalogued as pending.
 type Fetcher struct {
-	repo       *media.Repository
+	repo       catalogue
 	resolver   Resolver
 	downloader Downloader
 	// token never leaves this field except as an argument to Download, which
@@ -51,7 +61,7 @@ type Fetcher struct {
 	batch  int
 }
 
-func New(repo *media.Repository, resolver Resolver, downloader Downloader, token string, logger *slog.Logger) *Fetcher {
+func New(repo catalogue, resolver Resolver, downloader Downloader, token string, logger *slog.Logger) *Fetcher {
 	return &Fetcher{
 		repo:       repo,
 		resolver:   resolver,

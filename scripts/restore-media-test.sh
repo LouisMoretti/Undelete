@@ -152,7 +152,7 @@ query() {
     name="$1"
     dbname="$2"
     sql="$3"
-    psql_in "$name" "$dbname" -tAc "$sql"
+    psql_in "$name" "$dbname" -q -tAc "$sql"
 }
 
 create_app_role() {
@@ -301,6 +301,50 @@ for archive in "$full_archive" "$incr_archive"; do
     fi
 done
 
+# --- BusyBox tar edge case: an incremental with ZERO new files ---------------
+# Everything above ran scripts/backup-media.sh under the HOST's /bin/sh
+# (dash on Debian/Ubuntu, with GNU tar), which never exercises the tar
+# actually used in production: the compose `backup` service runs this same
+# script inside postgres:16-alpine, i.e. under BusyBox tar. GNU tar writes a
+# normal empty archive for `-T` on an empty member list; BusyBox tar instead
+# exits non-zero with "tar: empty archive" -- which, on any day with no new
+# media, would make the daily loop log a spurious failure instead of
+# producing the empty-but-valid incremental the design calls for (see the
+# comment on that branch in backup-media.sh). This is checked here, in the
+# actual runtime image, rather than assumed from the host's tar behaving.
+echo "restore-media-test: BusyBox tar edge case (0 new files) in postgres:16-alpine"
+mkdir -p "$workdir/busybox-check/media" "$workdir/busybox-check/backups"
+chmod 0777 "$workdir/busybox-check/backups"
+printf 'seed\n' > "$workdir/busybox-check/media/seed-file"
+docker run --rm \
+    --volume "$workdir/busybox-check:/work" \
+    --volume "$ROOT/scripts:/scripts:ro" \
+    --env MEDIA_DIR=/work/media --env BACKUP_DIR=/work/backups --env MEDIA_BACKUP_MODE=full \
+    postgres:16-alpine sh /scripts/backup-media.sh >/dev/null
+if docker run --rm \
+    --volume "$workdir/busybox-check:/work" \
+    --volume "$ROOT/scripts:/scripts:ro" \
+    --env MEDIA_DIR=/work/media --env BACKUP_DIR=/work/backups --env MEDIA_BACKUP_MODE=incremental \
+    postgres:16-alpine sh /scripts/backup-media.sh >/dev/null 2>&1
+then
+    ok "backup-media.sh on BusyBox tar: 0-file incremental exits 0"
+else
+    ko "backup-media.sh on BusyBox tar: 0-file incremental exits 0"
+fi
+empty_incr=$(find "$workdir/busybox-check/backups" -maxdepth 1 -name '*-incremental.tar.gz' -type f)
+# The archive is root:0600 by design (umask 077 in backup-media.sh, same as
+# in production -- see the comment on `umask` there): read it back the way an
+# operator would, as root inside a throwaway container, not as this script's
+# own host user.
+if [ -n "$empty_incr" ] && docker run --rm \
+    --volume "$workdir/busybox-check/backups:/backups:ro" \
+    postgres:16-alpine sh -c "gzip -t /backups/$(basename "$empty_incr")" 2>/dev/null
+then
+    ok "BusyBox-produced empty incremental is a valid, extractable archive"
+else
+    ko "BusyBox-produced empty incremental is a valid, extractable archive"
+fi
+
 # --- Restore, in the documented order ----------------------------------------
 # 1. the database, into a distinct and empty target;
 # 2. the media, full then incrementals in chronological order;
@@ -323,7 +367,9 @@ echo "restore-media-test: restoring the database"
 gunzip -c "$dump" > "$workdir/restore.sql"
 psql_in "$dst_container" "$dst_db" -q < "$workdir/restore.sql"
 
-expect_eq "media_files rows restored" "4" \
+# 3, not 4: AgACincrone is registered AFTER scripts/backup.sh ran above, so the
+# dump being restored here only ever held fullone, fulltwo and neverarchived.
+expect_eq "media_files rows restored" "3" \
     "$(query "$dst_container" "$dst_db" "SELECT count(*) FROM media_files")"
 
 # The restore target for the media is an EMPTY directory, never the source

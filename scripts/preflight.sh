@@ -17,6 +17,14 @@
 set -eu
 
 # Free disk space threshold, in gigabytes (overridable).
+#
+# Sized for the database dumps alone. Since #13, ./backups also holds media
+# archives (scripts/backup-media.sh) that are NEVER purged automatically (a
+# chain is only restorable as long as its base full still exists -- see
+# docs/backup-restore.md): a retention window's worth of full + incrementals
+# costs roughly 4x the size of ./media, on top of the dump budget already
+# covered here. Revisit this default once ./media holds a real volume of
+# attachments instead of the near-empty directory it is at the time of #13.
 PREFLIGHT_MIN_DISK_GB="${PREFLIGHT_MIN_DISK_GB:-2}"
 
 # Repository root: the script can be invoked from any directory.

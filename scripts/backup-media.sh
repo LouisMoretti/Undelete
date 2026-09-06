@@ -332,9 +332,21 @@ manifest_count=$(wc -l < "$manifest" | tr -d ' ')
 # -T reads the member list from a file (supported by GNU tar and by the
 # BusyBox tar of postgres:16-alpine). -C makes every member path relative to
 # the media root. An empty input is a legitimate case (an incremental on a day
-# with no new media): tar then writes a valid, empty archive, which is the
-# proof the run happened -- more useful than no file at all.
-tar -czf "$archive" -C "$MEDIA_DIR" -T "$workdir/tar-input"
+# with no new media): a valid, empty archive is the proof the run happened --
+# more useful than no file at all.
+#
+# GNU tar handles `-T` on an empty file by writing a normal (empty) archive.
+# BusyBox tar -- the one actually in postgres:16-alpine, where this script
+# runs in production -- refuses with "tar: empty archive" and a non-zero
+# status instead, which would make every single quiet day look like a backup
+# failure. A tar archive with zero members is, by the POSIX format, exactly
+# two consecutive 512-byte zero-filled blocks: writing that directly sidesteps
+# the BusyBox behaviour instead of relying on it.
+if [ "$manifest_count" -eq 0 ]; then
+    dd if=/dev/zero bs=512 count=2 2>/dev/null | gzip > "$archive"
+else
+    tar -czf "$archive" -C "$MEDIA_DIR" -T "$workdir/tar-input"
+fi
 
 archive_sha=$(sha256_of "$archive")
 printf '%s  %s\n' "$archive_sha" "$(basename "$archive")" > "$checksum"

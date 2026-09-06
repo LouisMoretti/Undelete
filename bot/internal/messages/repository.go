@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/jackc/pgx/v5"
 
@@ -188,6 +189,16 @@ func (r *Repository) MarkDeleted(ctx context.Context, ownerUserID, ownerTelegram
 		}
 		rows.Close()
 
+		// Sorted by message_id: the outbox delivers the rows of one batch in
+		// insertion order, so a deterministic order here is what makes a
+		// multi-message deletion (an album is exactly that) arrive in the order
+		// it was sent, rather than in the order PostgreSQL happened to return.
+		sort.Slice(found, func(i, j int) bool { return found[i].MessageID < found[j].MessageID })
+
+		// chunkCount tracks, per message, how many outbox chunks were written:
+		// the media entry takes the next index, and chunk_index is part of the
+		// anti-duplicate unique key.
+		chunkCount := make(map[int64]int, len(found))
 		for _, d := range found {
 			// telegram.BuildDeletionMessageRequests is the single source of the
 			// format and UTF-16 splitting of deletion alerts (the bot-api-10.3
@@ -211,9 +222,19 @@ func (r *Repository) MarkDeleted(ctx context.Context, ownerUserID, ownerTelegram
 					chunkIndex, request.Text); err != nil {
 					return err
 				}
+				chunkCount[d.MessageID] = chunkIndex + 1
 			}
 		}
-		return nil
+
+		// Media entries LAST, in the same transaction: the text context of the
+		// whole batch reaches the owner first (the outbox delivers a message's
+		// chunks in order, and the batch in insertion order), then the files.
+		return enqueueMediaAlerts(ctx, tx, mediaAlertScope{
+			ownerUserID:          ownerUserID,
+			ownerTelegramUserID:  ownerTelegramUserID,
+			businessConnectionID: businessConnectionID,
+			chatID:               chatID,
+		}, found, chunkCount)
 	})
 	if err != nil {
 		return nil, err

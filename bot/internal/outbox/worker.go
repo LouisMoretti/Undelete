@@ -8,8 +8,11 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/LouisMoretti/Undelete/bot/internal/media"
 	"github.com/LouisMoretti/Undelete/bot/internal/metrics"
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
 )
@@ -37,6 +40,11 @@ type Job struct {
 	Text                 string
 	Attempts             int
 	LeaseToken           string
+	// PayloadKind is PayloadKindText (default) or PayloadKindMedia. A media
+	// job whose Media is nil -- unreadable payload -- still delivers Text,
+	// followed by the unavailability note.
+	PayloadKind string
+	Media       *MediaPayload
 }
 
 // Store owns the clock: all timestamps written or compared are on the
@@ -52,18 +60,41 @@ type Sender interface {
 	SendMessageOnce(context.Context, telegram.SendMessageRequest) error
 }
 
+// MediaSender is the OPTIONAL half of Sender: a sender that also knows how to
+// upload the restored files. It is a separate interface on purpose -- a sender
+// that does not implement it (or a worker without a media root) still delivers
+// every media alert, as text plus the unavailability note.
+type MediaSender interface {
+	SendMediaOnce(context.Context, telegram.MediaAlert) error
+}
+
 // Worker reserves then delivers one alert at a time. The lease makes a job
 // available again if the process stops between Claim and acknowledgement:
 // delivery is therefore at-least-once, a duplicate alert remains possible.
 type Worker struct {
-	store  Store
-	sender Sender
-	logger *slog.Logger
-	lease  time.Duration
+	store    Store
+	sender   Sender
+	logger   *slog.Logger
+	lease    time.Duration
+	mediaDir string
 }
 
-func NewWorker(store Store, sender Sender, logger *slog.Logger) *Worker {
-	return &Worker{store: store, sender: sender, logger: logger, lease: defaultLease}
+// WorkerOption tweaks a Worker at construction time.
+type WorkerOption func(*Worker)
+
+// WithMediaDir gives the worker the storage root the media relative paths are
+// resolved against (./media in production). Without it, media alerts fall back
+// to text: better a text alert than an upload from a path we cannot vouch for.
+func WithMediaDir(dir string) WorkerOption {
+	return func(w *Worker) { w.mediaDir = dir }
+}
+
+func NewWorker(store Store, sender Sender, logger *slog.Logger, opts ...WorkerOption) *Worker {
+	w := &Worker{store: store, sender: sender, logger: logger, lease: defaultLease}
+	for _, opt := range opts {
+		opt(w)
+	}
+	return w
 }
 
 // ProcessOne processes at most one alert for the tenant. The content, the
@@ -80,11 +111,7 @@ func (w *Worker) ProcessOne(ctx context.Context, ownerUserID int64) (bool, error
 		return false, nil
 	}
 
-	err = w.sender.SendMessageOnce(ctx, telegram.SendMessageRequest{
-		ChatID: job.OwnerTelegramUserID,
-		Text:   job.Text,
-		// BusinessConnectionID is intentionally left empty: the alert comes from the bot.
-	})
+	err = w.deliver(ctx, job)
 	if err == nil {
 		if err := w.store.MarkSent(ctx, ownerUserID, job.ID, job.LeaseToken); err != nil {
 			if isShutdown(ctx, err) {
@@ -95,7 +122,10 @@ func (w *Worker) ProcessOne(ctx context.Context, ownerUserID int64) (bool, error
 			}
 			return true, fmt.Errorf("outbox acknowledgement: %w", err)
 		}
-		w.logger.Info("outbox alert sent", slog.Int64("outbox_id", job.ID), slog.Int("attempt", job.Attempts+1))
+		w.logger.Info("outbox alert sent",
+			slog.Int64("outbox_id", job.ID),
+			slog.Int("attempt", job.Attempts+1),
+			slog.String("payload_kind", payloadKind(job)))
 		return true, nil
 	}
 
@@ -140,6 +170,144 @@ func (w *Worker) ProcessOne(ctx context.Context, ownerUserID int64) (bool, error
 	metrics.AddOutboxRetries(1)
 	w.logger.Warn("outbox alert rescheduled", slog.Int64("outbox_id", job.ID), slog.String("error_class", code), slog.Duration("retry_in", wait))
 	return true, nil
+}
+
+// payloadKind normalises the kind for the logs: a job read from an older row
+// (or built by a test) carries an empty kind, which is a text alert.
+func payloadKind(job *Job) string {
+	if job.PayloadKind == PayloadKindMedia {
+		return PayloadKindMedia
+	}
+	return PayloadKindText
+}
+
+// errNoMediaDelivery means this worker cannot upload files at all for this job
+// (sender without media support, no media root configured, unreadable
+// payload). Not a Telegram failure: the text fallback applies immediately,
+// without a single request.
+var errNoMediaDelivery = errors.New("outbox: media delivery unavailable")
+
+// deliver sends one job. A media job tries its files first and falls back to
+// its text when they can never go out; a text job is unchanged.
+//
+// The invariant this function protects: an alert is NEVER lost. Every path
+// either delivers something to the owner, or returns an error that leaves the
+// job replayable.
+func (w *Worker) deliver(ctx context.Context, job *Job) error {
+	if job.PayloadKind != PayloadKindMedia {
+		return w.sendText(ctx, job, false)
+	}
+
+	err := w.sendMedia(ctx, job)
+	if err == nil {
+		return nil
+	}
+	if !mediaIsHopeless(ctx, err) {
+		// 429, 5xx, transport error, shutdown: the media can still go out
+		// later, so the job keeps the existing backoff instead of degrading to
+		// text on the first hiccup.
+		return err
+	}
+	w.logger.Warn("media alert falling back to text",
+		slog.Int64("outbox_id", job.ID), slog.String("error_class", mediaErrorClass(err)))
+	return w.sendText(ctx, job, true)
+}
+
+// sendText delivers the textual alert. withNote appends the unavailability
+// note, so the owner knows a media existed and is not left with a silent hole.
+func (w *Worker) sendText(ctx context.Context, job *Job, withNote bool) error {
+	text := job.Text
+	if withNote {
+		text = strings.TrimRight(text, "\n") + "\n\n" + telegram.MediaUnavailableNote
+	}
+	return w.sender.SendMessageOnce(ctx, telegram.SendMessageRequest{
+		ChatID: job.OwnerTelegramUserID,
+		Text:   text,
+		// BusinessConnectionID is intentionally left empty: the alert comes from the bot.
+	})
+}
+
+// sendMedia uploads the files of a media job, in the payload order (which is
+// the album order: message_id then file_index).
+func (w *Worker) sendMedia(ctx context.Context, job *Job) error {
+	mediaSender, ok := w.sender.(MediaSender)
+	if !ok || w.mediaDir == "" || job.Media == nil {
+		return errNoMediaDelivery
+	}
+
+	items := make([]telegram.MediaAlertItem, 0, len(job.Media.Items))
+	for _, item := range job.Media.Items {
+		path, err := w.mediaPath(item.RelativePath)
+		if err != nil {
+			return err
+		}
+		items = append(items, telegram.MediaAlertItem{
+			Type:     item.MediaType,
+			Path:     path,
+			FileName: item.FileName,
+			Caption:  item.Caption,
+		})
+	}
+	return mediaSender.SendMediaOnce(ctx, telegram.MediaAlert{
+		ChatID: job.OwnerTelegramUserID,
+		Items:  items,
+	})
+}
+
+// mediaPath resolves a stored relative path against the media root. The path
+// was generated server-side and validated before being written to the
+// database; it is validated AGAIN here, because this is the point where it
+// becomes a file the bot opens and uploads to a chat.
+func (w *Worker) mediaPath(relative string) (string, error) {
+	if err := media.ValidateRelativePath(relative); err != nil {
+		return "", err
+	}
+	return filepath.Join(w.mediaDir, relative), nil
+}
+
+// mediaIsHopeless reports an error that retrying could never clear, and that
+// must therefore degrade to the text alert rather than consume the backoff.
+func mediaIsHopeless(ctx context.Context, err error) bool {
+	if isShutdown(ctx, err) {
+		return false
+	}
+	switch {
+	case errors.Is(err, errNoMediaDelivery),
+		errors.Is(err, telegram.ErrMediaUnavailable),
+		errors.Is(err, telegram.ErrMediaTooLarge),
+		errors.Is(err, media.ErrUnsafeRelativePath):
+		return true
+	}
+	var apiErr *telegram.APIError
+	if errors.As(err, &apiErr) {
+		// A 4xx on an upload is a definitive refusal (unsupported format,
+		// file too big for the type, chat unreachable) -- except 429, which is
+		// exactly what the outbox backoff exists for.
+		return apiErr.Code >= http.StatusBadRequest &&
+			apiErr.Code < http.StatusInternalServerError &&
+			apiErr.Code != http.StatusTooManyRequests
+	}
+	return false
+}
+
+// mediaErrorClass names the cause for the logs. Like every other log in this
+// package it exposes a CLASS, never a path, an id or a Telegram message.
+func mediaErrorClass(err error) string {
+	switch {
+	case errors.Is(err, errNoMediaDelivery):
+		return "media_unsupported"
+	case errors.Is(err, telegram.ErrMediaUnavailable):
+		return "media_missing"
+	case errors.Is(err, telegram.ErrMediaTooLarge):
+		return "media_too_large"
+	case errors.Is(err, media.ErrUnsafeRelativePath):
+		return "media_unsafe_path"
+	}
+	var apiErr *telegram.APIError
+	if errors.As(err, &apiErr) {
+		return fmt.Sprintf("telegram_%d", apiErr.Code)
+	}
+	return "media_error"
 }
 
 // isShutdown distinguishes worker context cancellation (process shutdown) from

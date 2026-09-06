@@ -15,7 +15,7 @@
 //
 // Crash-safety follows from that ordering: a process killed at any point
 // leaves either nothing at all, or a leftover temporary file (prefixed with
-// tempPrefix, never a valid media path), but NEVER a final path holding
+// TempPrefix, never a valid media path), but NEVER a final path holding
 // truncated or corrupted content. A reader that sees the final path can
 // therefore assume the content is complete and matches its hash, without any
 // lock or journal. Conversely, a hash mismatch or a size overrun aborts
@@ -62,9 +62,9 @@ import (
 // defaultBaseURL is the Bot API file endpoint prefix, token excluded.
 const defaultBaseURL = "https://api.telegram.org/file/bot"
 
-// tempPrefix marks in-flight downloads. It starts with a dot and can never
+// TempPrefix marks in-flight downloads. It starts with a dot and can never
 // collide with a storage key, which is validated as a safe token.
-const tempPrefix = ".dl-"
+const TempPrefix = ".dl-"
 
 // Sentinel errors. Callers match them with errors.Is; the wrapping message
 // never contains the bot token nor the download URL.
@@ -377,7 +377,7 @@ func (d *Downloader) writeAtomically(ctx, reqCtx context.Context, full string, b
 	dir := filepath.Dir(full)
 	// Same directory as the target, hence the same filesystem: os.Rename
 	// stays atomic (a cross-device rename would fail with EXDEV).
-	tmp, err := os.CreateTemp(dir, tempPrefix+"*")
+	tmp, err := os.CreateTemp(dir, TempPrefix+"*")
 	if err != nil {
 		return "", 0, fmt.Errorf("media: creating temp file: %w", redactErr(err, token))
 	}

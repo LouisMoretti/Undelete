@@ -75,8 +75,14 @@ services:
     environment:
       MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL}
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS}
+      MEDIA_BACKUP_MODE: ${MEDIA_BACKUP_MODE-auto}
+      MEDIA_BACKUP_FULL_INTERVAL_DAYS: ${MEDIA_BACKUP_FULL_INTERVAL_DAYS-7}
     volumes:
       - ./scripts:/scripts:ro
+      # Media are read here, never written: this service backs the directory
+      # up, and nothing in scripts/backup-media.sh deletes or modifies a media
+      # file. `:ro` makes that structural rather than a promise.
+      - ./media:/media:ro
       - ./backups:/backups
     working_dir: /backups
     entrypoint:
@@ -87,8 +93,15 @@ services:
         # between each pass. No cron to keep things simple and avoid an
         # extra dependency in the image.
         export BACKUP_DIR=/backups
+        export MEDIA_DIR=/media
         while true; do
           sh /scripts/backup.sh
+          # Media AFTER the dump, never before: backup-media.sh couples its
+          # archive to the most recent dump present, so running it first would
+          # tie today's media to yesterday's database. A media failure must
+          # not abort the loop -- the dump of the next window still has to be
+          # taken -- so it is reported and the loop goes on.
+          sh /scripts/backup-media.sh || echo "backup: media backup FAILED (exit $?)" >&2
           sleep 86400
         done
 

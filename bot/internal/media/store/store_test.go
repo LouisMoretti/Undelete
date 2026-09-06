@@ -656,7 +656,7 @@ func TestFinalPathAppearsOnlyAfterCompleteTransfer(t *testing.T) {
 	// What is on disk at that point is a temporary file, recognisable as
 	// such and never mistakable for a storage key.
 	for _, name := range listFiles(t, root) {
-		if !strings.HasPrefix(filepath.Base(name), tempPrefix) {
+		if !strings.HasPrefix(filepath.Base(name), TempPrefix) {
 			t.Fatalf("non-temporary file %q visible mid-transfer", name)
 		}
 	}

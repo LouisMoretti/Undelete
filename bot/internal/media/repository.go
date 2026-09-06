@@ -8,15 +8,18 @@
 // and validated by ValidateRelativePath before it ever reaches the database
 // (see migration 0004 for the rationale and the mirrored CHECK constraints).
 //
-// Downloading the files (writing them under ./media), backing them up (#13)
-// and purging them from disk (#12) live outside this package: here we only
-// carry the metadata and the status those workflows drive.
+// Downloading the files (writing them under ./media, see media/store and
+// media/fetch), backing them up (#13) and purging them from disk (media/purge)
+// live outside this package: here we only carry the metadata and the status
+// those workflows drive. The queries the purge needs are still here, for the
+// same reason as every other one: InTenant is the only way to the table.
 package media
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -74,7 +77,10 @@ type Record struct {
 	// Optional metadata: empty strings and nil pointers are stored as NULL
 	// rather than as a zero value, so "unknown size" stays distinguishable
 	// from "empty file".
-	MimeType     string
+	MimeType string
+	// FileName is the name chosen by the sender, when Telegram carries one. It
+	// is display metadata only: it never contributes to a storage path.
+	FileName     string
 	ByteSize     *int64
 	Width        *int
 	Height       *int
@@ -93,6 +99,7 @@ type File struct {
 	TelegramFileUniqueID string
 	MediaType            string
 	MimeType             string
+	FileName             string
 	ByteSize             *int64
 	Width                *int
 	Height               *int
@@ -104,6 +111,12 @@ type File struct {
 	SHA256                string
 	Status                string
 	MediaGroupID          string
+	// CreatedAt is the capture time of the attachment, the instant retention
+	// counts from -- the media equivalent of messages.saved_at. It is read
+	// back because the disk purge decides on it: a 'stored' row whose file
+	// vanished is re-downloaded while it is still within retention, and
+	// written off as purged once it is not.
+	CreatedAt time.Time
 }
 
 // StoredFile describes a file that has just been written under ./media.
@@ -133,9 +146,10 @@ func NewRepository(db *storage.DB) *Repository {
 const selectColumns = `
 	id, business_connection_id, chat_id, message_id, file_index,
 	telegram_file_id, telegram_file_unique_id, media_type,
-	COALESCE(mime_type, ''), byte_size, width, height, duration_sec,
+	COALESCE(mime_type, ''), COALESCE(file_name, ''),
+	byte_size, width, height, duration_sec,
 	COALESCE(relative_path, ''), COALESCE(thumbnail_relative_path, ''),
-	COALESCE(sha256, ''), status, COALESCE(media_group_id, '')
+	COALESCE(sha256, ''), status, COALESCE(media_group_id, ''), created_at
 `
 
 // Save inserts or refreshes the metadata of one attachment and returns its id.
@@ -165,9 +179,9 @@ func (r *Repository) Save(ctx context.Context, ownerUserID int64, m Record) (int
 			INSERT INTO media_files (
 				owner_user_id, business_connection_id, chat_id, message_id, file_index,
 				telegram_file_id, telegram_file_unique_id, media_type,
-				mime_type, byte_size, width, height, duration_sec, media_group_id
+				mime_type, file_name, byte_size, width, height, duration_sec, media_group_id
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10, $11, $12, $13, NULLIF($14, ''))
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), NULLIF($10, ''), $11, $12, $13, $14, NULLIF($15, ''))
 			ON CONFLICT (owner_user_id, business_connection_id, chat_id, message_id, file_index)
 			DO UPDATE SET
 				telegram_file_id        = EXCLUDED.telegram_file_id,
@@ -182,6 +196,7 @@ func (r *Repository) Save(ctx context.Context, ownerUserID int64, m Record) (int
 				-- with NULL. A richer redelivery still wins, since a non-NULL
 				-- EXCLUDED value takes precedence.
 				mime_type               = COALESCE(EXCLUDED.mime_type, media_files.mime_type),
+				file_name               = COALESCE(EXCLUDED.file_name, media_files.file_name),
 				-- byte_size carries two different facts: the size DECLARED by
 				-- Telegram while the row is pending, then the size actually
 				-- MEASURED on disk once MarkStored ran. A redelivery must not
@@ -200,7 +215,7 @@ func (r *Repository) Save(ctx context.Context, ownerUserID int64, m Record) (int
 		`,
 			ownerUserID, m.BusinessConnectionID, m.ChatID, m.MessageID, m.FileIndex,
 			m.TelegramFileID, m.TelegramFileUniqueID, m.MediaType,
-			m.MimeType, m.ByteSize, m.Width, m.Height, m.DurationSec, m.MediaGroupID,
+			m.MimeType, m.FileName, m.ByteSize, m.Width, m.Height, m.DurationSec, m.MediaGroupID,
 		).Scan(&id)
 	})
 	if err != nil {
@@ -231,6 +246,84 @@ func (r *Repository) GetByMessage(ctx context.Context, ownerUserID int64, busine
 		return nil, fmt.Errorf("reading media of message %d: %w", messageID, err)
 	}
 	return files, nil
+}
+
+// SelectStoredTx returns the attachments of the given messages that are
+// actually ON DISK, ordered by (message_id, file_index) -- the order the sender
+// saw, and the one an album must be restored in.
+//
+// It takes the caller's transaction instead of opening its own: the deletion
+// alert is written by messages.MarkDeleted inside a single InTenant
+// transaction, and the media entry must be enqueued atomically with the
+// deleted_at it belongs to. The tenant context is therefore already set by the
+// caller, and RLS applies exactly as it does everywhere else in this package.
+//
+// Only 'stored' rows are returned: a pending row has no path yet, and a purged
+// one no longer has a file. Both leave the alert to its text, which already
+// states the message type.
+func SelectStoredTx(ctx context.Context, tx pgx.Tx, businessConnectionID string, chatID int64, messageIDs []int64) ([]File, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT`+selectColumns+`
+		FROM media_files
+		WHERE business_connection_id = $1
+		  AND chat_id = $2
+		  AND message_id = ANY($3)
+		  AND status = 'stored'
+		  AND relative_path IS NOT NULL
+		ORDER BY message_id, file_index
+	`, businessConnectionID, chatID, messageIDs)
+	if err != nil {
+		return nil, fmt.Errorf("reading stored media: %w", err)
+	}
+	defer rows.Close()
+	files, err := scanFiles(rows)
+	if err != nil {
+		return nil, fmt.Errorf("reading stored media: %w", err)
+	}
+	return files, nil
+}
+
+// SelectAlbumAnchorsTx returns, for each album touched by the given messages,
+// the SMALLEST message_id it is made of -- whatever the status of its files.
+//
+// Status-independent on purpose, and that is the whole point of this query: the
+// set of 'stored' rows moves under our feet (the fetch loop turns pending into
+// stored, and a failed download into purged), so an anchor derived from the
+// stored subset would shift between two deliveries of the SAME deletion. The
+// outbox anti-duplicate key contains the message_id, so a shifting anchor lets
+// the same album through twice. Catalogued membership, itself written once at
+// capture time, does not move.
+//
+// Same transaction contract as SelectStoredTx: the tenant context is set by the
+// caller, RLS applies unchanged.
+func SelectAlbumAnchorsTx(ctx context.Context, tx pgx.Tx, businessConnectionID string, chatID int64, messageIDs []int64) (map[string]int64, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT media_group_id, MIN(message_id)
+		FROM media_files
+		WHERE business_connection_id = $1
+		  AND chat_id = $2
+		  AND message_id = ANY($3)
+		  AND media_group_id IS NOT NULL
+		GROUP BY media_group_id
+	`, businessConnectionID, chatID, messageIDs)
+	if err != nil {
+		return nil, fmt.Errorf("reading album anchors: %w", err)
+	}
+	defer rows.Close()
+
+	anchors := make(map[string]int64)
+	for rows.Next() {
+		var groupID string
+		var anchor int64
+		if err := rows.Scan(&groupID, &anchor); err != nil {
+			return nil, fmt.Errorf("reading album anchors: %w", err)
+		}
+		anchors[groupID] = anchor
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading album anchors: %w", err)
+	}
+	return anchors, nil
 }
 
 // ListPending returns at most limit attachments still awaiting download, oldest
@@ -307,6 +400,222 @@ func (r *Repository) MarkPurged(ctx context.Context, ownerUserID, id int64) erro
 	`)
 }
 
+// MarkPendingRetry sends a row back to the download queue: the file it claimed
+// to have on disk is not there any more.
+//
+// The reverse of MarkStored, and the reconciliation half of the disk purge. It
+// only makes sense while the attachment is still within retention -- past that
+// point there is nothing left to download for, and MarkPurged is the right
+// answer. The path and the hash are cleared, so nothing keeps pointing at a
+// file that does not exist and the fetch loop recomputes both.
+func (r *Repository) MarkPendingRetry(ctx context.Context, ownerUserID, id int64) error {
+	return r.update(ctx, ownerUserID, id, `
+		UPDATE media_files
+		SET status                  = 'pending',
+		    relative_path           = NULL,
+		    thumbnail_relative_path = NULL,
+		    sha256                  = NULL,
+		    updated_at              = now()
+		WHERE id = $1
+	`)
+}
+
+// ListExpiredStored returns at most limit attachments whose file is on disk,
+// whose retention has elapsed and whose id is strictly greater than afterID,
+// oldest first. The caller deletes the blob then calls MarkPurged; the batch is
+// bounded so one pass can never turn into an unbounded scan-and-delete.
+//
+// The cursor is what keeps a batch from being filled by rows that cannot
+// advance. A row leaves this result set by becoming 'purged', and a REFUSED
+// row (a symlink at the storage path, anything that is not a plain file) is
+// deliberately left 'stored': without a cursor it would come back at the head
+// of every following batch, and enough of them would fill the whole batch and
+// stall the retention of everything behind them.
+func (r *Repository) ListExpiredStored(ctx context.Context, ownerUserID, afterID int64, retentionDays, limit int) ([]File, error) {
+	var files []File
+	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT`+selectColumns+`
+			FROM media_files
+			WHERE status = 'stored'
+			  AND id > $1
+			  AND created_at < now() - make_interval(days => $2)
+			ORDER BY id
+			LIMIT $3
+		`, afterID, retentionDays, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		files, err = scanFiles(rows)
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing expired media: %w", err)
+	}
+	return files, nil
+}
+
+// ListStoredPage returns at most limit stored attachments with an id strictly
+// greater than afterID, ordered by id.
+//
+// Keyset pagination rather than OFFSET: the reconciliation sweeps the whole
+// catalogue a page at a time across successive runs, and rows disappear under
+// it (that is precisely what it is there for). A cursor on the primary key
+// keeps the sweep total, where an offset would skip rows every time an earlier
+// one is deleted.
+func (r *Repository) ListStoredPage(ctx context.Context, ownerUserID, afterID int64, limit int) ([]File, error) {
+	var files []File
+	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT`+selectColumns+`
+			FROM media_files
+			WHERE status = 'stored' AND id > $1
+			ORDER BY id
+			LIMIT $2
+		`, afterID, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		files, err = scanFiles(rows)
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing stored media: %w", err)
+	}
+	return files, nil
+}
+
+// KnownPaths returns the subset of relPaths that a row of THIS tenant still
+// references, either as a file or as a thumbnail.
+//
+// The question the disk side of the reconciliation asks: "does anything still
+// point at what I just found on disk?". Answering it with the paths in hand,
+// rather than by loading the catalogue, is what bounds the query by the size of
+// the batch the caller scanned.
+func (r *Repository) KnownPaths(ctx context.Context, ownerUserID int64, relPaths []string) (map[string]struct{}, error) {
+	known := make(map[string]struct{}, len(relPaths))
+	if len(relPaths) == 0 {
+		return known, nil
+	}
+	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT relative_path FROM media_files WHERE relative_path = ANY($1)
+			UNION
+			SELECT thumbnail_relative_path FROM media_files WHERE thumbnail_relative_path = ANY($1)
+		`, relPaths)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var path string
+			if err := rows.Scan(&path); err != nil {
+				return err
+			}
+			known[path] = struct{}{}
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("resolving media paths: %w", err)
+	}
+	return known, nil
+}
+
+// DeleteStalePending removes the rows that have been waiting for a download
+// that is never coming, and returns how many went.
+//
+// The row is deleted rather than marked purged: 'purged' means "we had the
+// file and retention took it", and a pending row never had one -- keeping it
+// would only make the fetch loop ask Telegram for it forever.
+//
+// Two independent deadlines, whichever comes first: maxAge, past which no
+// retry can succeed any more (a Telegram file_id does not stay downloadable
+// indefinitely), and the tenant's own retention, which no metadata may
+// outlive.
+//
+// The two are NOT symmetrical, which is why they are not a LEAST any more.
+// Retention is absolute: past it the row goes, whatever happened to it since.
+// maxAge, on the other hand, measures a wait, and a wait starts over when the
+// row is requeued -- MarkPendingRetry sends a row whose file vanished back to
+// the download queue while leaving created_at at the capture time, so on
+// created_at alone a row requeued from an older crash would be deleted at the
+// very next daily pass instead of getting the retry window it was just
+// granted. It is therefore counted from created_at AND updated_at, which are
+// equal for a row that was never downloaded.
+//
+// DELETE ... WHERE id IN (SELECT ... LIMIT): PostgreSQL has no LIMIT on
+// DELETE, and the bound is the point.
+func (r *Repository) DeleteStalePending(ctx context.Context, ownerUserID int64, maxAge time.Duration, retentionDays, limit int) (int64, error) {
+	var deleted int64
+	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			DELETE FROM media_files
+			WHERE id IN (
+				SELECT id FROM media_files
+				WHERE status = 'pending'
+				  AND (
+				        -- Retention is absolute: no metadata outlives it,
+				        -- requeued or not.
+				        created_at < now() - make_interval(days => $2)
+				        -- Staleness, which a requeue resets.
+				        OR (created_at < now() - make_interval(secs => $1)
+				            AND updated_at < now() - make_interval(secs => $1))
+				      )
+				ORDER BY id
+				LIMIT $3
+			)
+		`, maxAge.Seconds(), retentionDays, limit)
+		if err != nil {
+			return err
+		}
+		deleted = tag.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("deleting stale pending media: %w", err)
+	}
+	return deleted, nil
+}
+
+// DeletePurged removes the rows whose file is long gone, and returns how many
+// went.
+//
+// Two conditions, and the first one is the one that is easy to forget: a
+// 'purged' row is not necessarily a purged FILE. The fetch loop also marks
+// purged what Telegram will never hand over (over the 20 MB ceiling, expired
+// handle), and that row is the only remaining trace that an attachment
+// existed -- a deletion alert within retention still needs it. So retention
+// gates the deletion, and grace (counted from updated_at, the instant the row
+// became purged) only adds a margin on top of it.
+func (r *Repository) DeletePurged(ctx context.Context, ownerUserID int64, grace time.Duration, retentionDays, limit int) (int64, error) {
+	var deleted int64
+	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			DELETE FROM media_files
+			WHERE id IN (
+				SELECT id FROM media_files
+				WHERE status = 'purged'
+				  AND created_at < now() - make_interval(days => $1)
+				  AND updated_at < now() - make_interval(secs => $2)
+				ORDER BY id
+				LIMIT $3
+			)
+		`, retentionDays, grace.Seconds(), limit)
+		if err != nil {
+			return err
+		}
+		deleted = tag.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("deleting purged media rows: %w", err)
+	}
+	return deleted, nil
+}
+
 // update runs a single-row UPDATE inside the tenant context and turns "no row
 // affected" into ErrNotFound. Without this check the call would silently
 // succeed against another tenant's row hidden by RLS -- the same fail-closed
@@ -331,9 +640,9 @@ func scanFiles(rows pgx.Rows) ([]File, error) {
 		if err := rows.Scan(
 			&f.ID, &f.BusinessConnectionID, &f.ChatID, &f.MessageID, &f.FileIndex,
 			&f.TelegramFileID, &f.TelegramFileUniqueID, &f.MediaType,
-			&f.MimeType, &f.ByteSize, &f.Width, &f.Height, &f.DurationSec,
+			&f.MimeType, &f.FileName, &f.ByteSize, &f.Width, &f.Height, &f.DurationSec,
 			&f.RelativePath, &f.ThumbnailRelativePath,
-			&f.SHA256, &f.Status, &f.MediaGroupID,
+			&f.SHA256, &f.Status, &f.MediaGroupID, &f.CreatedAt,
 		); err != nil {
 			return nil, err
 		}

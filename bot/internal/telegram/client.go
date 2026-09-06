@@ -63,7 +63,13 @@ func (c *Client) call(ctx context.Context, method string, params any, out any) e
 		return fmt.Errorf("building request %s: %w", method, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	return c.do(req, method, out)
+}
 
+// do performs the request and decodes the Bot API envelope. Shared with the
+// multipart sends (sendmedia.go), which build their own request but must
+// surface errors -- 429 retry_after included -- exactly like a JSON call.
+func (c *Client) do(req *http.Request, method string, out any) error {
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		// net/http wraps transport errors in *url.Error, whose Error()

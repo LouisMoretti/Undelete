@@ -151,7 +151,7 @@ func TestPrivacyCommandAnswersOnlyTheConnectionOwner(t *testing.T) {
 		t.Fatal("the delivered answer is not the policy document, whole and in order")
 	}
 
-	// Constraint #8: a command is a message like any other, and both of them
+	// The exhaustive-and-automatic-saving constraint: a command is a message like any other, and both of them
 	// were saved -- withholding the answer never withholds the capture.
 	t.Run("both commands were saved like ordinary messages", func(t *testing.T) {
 		ctx := phaseContext(t)

@@ -279,13 +279,16 @@ branch ruleset* / *Add rule* on `main`) — not automatable from this repository
 | `/retention` | the account holder only | the current retention period, as a direct message from the bot |
 | `/retention <days>` | the account holder only | the new retention period (1 to 365 days), as a direct message from the bot |
 | `/delete_my_data` | the account holder only | a single-use confirmation code, as a direct message from the bot |
-| `/delete_my_data <code>` | the account holder only | the erasure of everything this instance holds about them, then a confirmation |
+| `/delete_my_data <code>` | the account holder only | the erasure of this account's live data (three tombstones kept, see Privacy), then a confirmation |
 
 **Where to type them.** `allowed_updates` requests the four `business_*`
 types and nothing else (the explicit `allowed_updates` constraint), so a plain
 `message` sent to the bot is never delivered to it. Commands are therefore typed **inside a chat covered by
 the Business connection**, where they arrive as `business_message` like any
-other message — the holder's own outgoing messages included.
+other message — the holder's own outgoing messages included. That the
+holder's own outgoing messages arrive this way is read from the Bot API
+contract and has not been exercised against a real Business account in this
+repository — verify it manually on a real account before relying on it.
 
 **Who gets answered.** Only the holder of the connection the command arrived
 through: the sender's `telegram_user_id` is compared against the owner
@@ -298,7 +301,7 @@ itself is saved like any other message (the exhaustive-and-automatic-saving
 constraint), and it stays visible in the conversation it was typed in: the
 answer is private, the command is not.
 
-The answer is labelled `Privacy policy (1/2)`, `(2/2)`: the document does not
+The answer is labelled `Privacy policy (i/n)`: the document does not
 fit in one Telegram message, and a delivery that stops short must be readable
 as incomplete rather than pass for the whole policy.
 

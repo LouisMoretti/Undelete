@@ -467,9 +467,15 @@ func splitPolicyText(text string, limit int) []string {
 			currentUnits = 0
 		}
 		if units > limit {
-			// current was just flushed (or was empty), so appending the
-			// sub-chunks here keeps the document in order.
-			chunks = append(chunks, splitTelegramText(paragraph, limit)...)
+			// current was just flushed (or was empty), so the sub-chunks
+			// belong here in order -- except the last one, which primes
+			// current instead of opening a message of its own: the next
+			// paragraph then fills its leftover room rather than starting
+			// a new message while thousands of units stand free.
+			subs := splitTelegramText(paragraph, limit)
+			chunks = append(chunks, subs[:len(subs)-1]...)
+			current.WriteString(subs[len(subs)-1])
+			currentUnits = utf16Units(subs[len(subs)-1])
 			continue
 		}
 		current.WriteString(paragraph)

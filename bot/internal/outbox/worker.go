@@ -9,7 +9,6 @@ import (
 	"math"
 	"net/http"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/LouisMoretti/Undelete/bot/internal/media"
@@ -163,6 +162,9 @@ func (w *Worker) ProcessOne(ctx context.Context, ownerUserID int64) (bool, error
 	wait := retryDelay(job.Attempts)
 	if apiErr != nil && apiErr.IsRateLimited() {
 		wait = time.Duration(apiErr.RetryAfter) * time.Second
+		if wait > maxBackoff {
+			wait = maxBackoff
+		}
 	}
 	if markErr := w.store.MarkRetry(ctx, ownerUserID, job.ID, job.LeaseToken, wait, code); markErr != nil {
 		return true, fmt.Errorf("outbox retry scheduling: %w", markErr)
@@ -218,7 +220,7 @@ func (w *Worker) deliver(ctx context.Context, job *Job) error {
 func (w *Worker) sendText(ctx context.Context, job *Job, withNote bool) error {
 	text := job.Text
 	if withNote {
-		text = strings.TrimRight(text, "\n") + "\n\n" + telegram.MediaUnavailableNote
+		text = telegram.WithMediaUnavailableNote(text)
 	}
 	return w.sender.SendMessageOnce(ctx, telegram.SendMessageRequest{
 		ChatID: job.OwnerTelegramUserID,

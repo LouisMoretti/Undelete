@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // captionLimit is the Bot API ceiling for a media caption, in UTF-16 units.
@@ -377,9 +378,15 @@ func sanitizeFileName(name string) string {
 		return ""
 	}
 	// Telegram truncates long names anyway; bounding it here keeps the header
-	// small and predictable.
+	// small and predictable. Truncation is on a rune boundary so a multibyte
+	// UTF-8 name is never cut into an invalid sequence: at most 128 bytes,
+	// possibly fewer when the boundary falls inside a rune.
 	if len(cleaned) > 128 {
-		cleaned = cleaned[:128]
+		cut := 128
+		for cut > 0 && !utf8.ValidString(cleaned[:cut]) {
+			cut--
+		}
+		cleaned = cleaned[:cut]
 	}
 	return cleaned
 }

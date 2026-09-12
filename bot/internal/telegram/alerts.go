@@ -126,6 +126,33 @@ func privacyLabelUnits(total int) int {
 // than being left with a silent hole -- an alert is never dropped.
 const MediaUnavailableNote = "[media unavailable]"
 
+// WithMediaUnavailableNote appends MediaUnavailableNote to text without ever
+// exceeding the Bot API text limit (counted in UTF-16 units like every other
+// Telegram length). Without this, a text already at 4096 units plus the note
+// would be refused with a 400 that the outbox turns into a permanent failure:
+// the alert would be lost exactly when it carries the most content.
+func WithMediaUnavailableNote(text string) string {
+	suffix := "\n\n" + MediaUnavailableNote
+	if utf16Units(text)+utf16Units(suffix) <= telegramTextLimit {
+		return strings.TrimRight(text, "\n") + suffix
+	}
+	budget := telegramTextLimit - utf16Units(suffix)
+	units := 0
+	kept := make([]rune, 0, budget)
+	for _, r := range strings.TrimRight(text, "\n") {
+		size := utf16.RuneLen(r)
+		if size < 1 {
+			size = 1
+		}
+		if units+size > budget {
+			break
+		}
+		kept = append(kept, r)
+		units += size
+	}
+	return string(kept) + suffix
+}
+
 // BuildMediaAlertText is the text that travels WITH the media entry of an
 // alert: the one-line summary of what is attached. It is written to the outbox
 // at deletion time and is what the worker sends, plus MediaUnavailableNote,

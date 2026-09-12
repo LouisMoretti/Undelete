@@ -47,9 +47,20 @@ jobs:
 
       # The suites gated by env (integration, outbox) skip themselves here for
       # lack of DSNs: they run in the integration job.
-      - name: go test
+      # Coverage gate: the unit run must keep the total statement coverage
+      # above the floor. DB-bound packages (business, messages, storage,
+      # users) score low here by design; they are covered by the integration
+      # job instead, so the floor only guards the total against regressions
+      # that delete tests.
+      - name: go test with coverage
         working-directory: bot
-        run: go test ./...
+        run: |
+          go test -coverprofile=coverage.out -covermode=atomic ./...
+          go tool cover -func=coverage.out | tee coverage.txt
+          total=$(awk '/^total:/ {gsub(/%/, "", $3); print $3}' coverage.txt)
+          echo "total coverage: ${total}% (floor 60%)"
+          echo "### Coverage: ${total}% (floor 60%)" >> "$GITHUB_STEP_SUMMARY"
+          awk '/^total:/ {gsub(/%/, "", $3); if ($3 + 0 < 60) {print "coverage " $3 "% below floor 60%"; exit 1}}' coverage.txt
 
   integration:
     name: PostgreSQL 16 integration
@@ -72,3 +83,23 @@ jobs:
       # restricted role created by db/init/01-app-role.sh.
       - name: make test-integration
         run: make test-integration
+
+  coverage:
+    name: combined coverage (unit + integration)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: bot/go.mod
+          cache-dependency-path: bot/go.sum
+
+      # Unit + integration statement coverage with a 75% floor gate
+      # (measured ~78%): the unit gate cannot see the DB-bound packages,
+      # this one can. Disposable container like the integration job.
+      - name: make test-coverage
+        run: make test-coverage

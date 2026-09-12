@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 	"unicode/utf16"
+	"unicode/utf8"
 )
 
 const telegramTextLimit = 4096
@@ -336,20 +337,30 @@ func splitTelegramText(text string, limit int) []string {
 	}
 
 	var chunks []string
-	current := make([]rune, 0, limit)
+	var current strings.Builder
 	units := 0
-	for _, r := range text {
+	// Decode explicitly and carry the original bytes through instead of
+	// ranging over runes and re-encoding them: range yields U+FFFD for an
+	// invalid byte, and re-encoding would emit the 3-byte replacement
+	// character in its place, so the chunks would no longer partition the
+	// input byte for byte. On valid UTF-8 (everything this splitter ever
+	// receives: JSON-decoded message text and the embedded policy) both
+	// spellings are identical; on invalid input this one stays lossless.
+	for rest := text; len(rest) > 0; {
+		r, size := utf8.DecodeRuneInString(rest)
+		segment := rest[:size]
+		rest = rest[size:]
 		runeUnits := runeUTF16Units(r)
-		if units+runeUnits > limit && len(current) > 0 {
-			chunks = append(chunks, string(current))
-			current = current[:0]
+		if units+runeUnits > limit && current.Len() > 0 {
+			chunks = append(chunks, current.String())
+			current.Reset()
 			units = 0
 		}
-		current = append(current, r)
+		current.WriteString(segment)
 		units += runeUnits
 	}
-	if len(current) > 0 {
-		chunks = append(chunks, string(current))
+	if current.Len() > 0 {
+		chunks = append(chunks, current.String())
 	}
 	return chunks
 }

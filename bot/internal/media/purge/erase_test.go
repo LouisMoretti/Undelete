@@ -3,6 +3,7 @@ package purge
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/LouisMoretti/Undelete/bot/internal/media"
 	"github.com/LouisMoretti/Undelete/bot/internal/media/store"
+	"github.com/LouisMoretti/Undelete/bot/internal/users"
 )
 
 // TestEraseTenantRemovesEveryBlobAndRow: /delete_my_data does not care about
@@ -193,5 +195,180 @@ func TestEraseTenantRefusesAnUnreachableRoot(t *testing.T) {
 
 	if _, _, err := p.EraseTenant(context.Background(), testOwner); err == nil {
 		t.Fatal("EraseTenant accepted an unreachable media root")
+	}
+}
+
+// plantParentSymlink builds the F3 shape: media/42/linked points at an
+// outside directory holding a victim file, and the catalogue names a blob
+// THROUGH that link (42/linked/victim). The old code resolved the string
+// lexically, Lstat saw a regular file at the end, and os.Remove unlinked a
+// file outside the media root.
+func plantParentSymlink(t *testing.T, root string) (outsideVictim string) {
+	t.Helper()
+	outside := t.TempDir()
+	outsideVictim = filepath.Join(outside, "victim")
+	if err := os.WriteFile(outsideVictim, []byte("not ours"), 0o600); err != nil {
+		t.Fatalf("write bait: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "42"), 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "42", "linked")); err != nil {
+		t.Skipf("symlinks unavailable on this filesystem: %v", err)
+	}
+	return outsideVictim
+}
+
+// TestEraseTenantMustNotFollowAParentSymlink: a symlink at an INTERMEDIATE
+// component of a catalogued path -- not just at the final one the old test
+// covers -- must be refused, and the file outside the media root must
+// survive. The row stays stored so an operator can see what happened, and the
+// erasure reports instead of claiming completeness.
+func TestEraseTenantMustNotFollowAParentSymlink(t *testing.T) {
+	root := t.TempDir()
+	cat := newCatalogue(fixedNow)
+	victim := plantParentSymlink(t, root)
+	cat.add(1, media.StatusStored, "42/linked/victim", fixedNow())
+
+	p := newPurger(t, root, cat, false)
+	_, _, err := p.EraseTenant(context.Background(), testOwner)
+	if err == nil {
+		t.Fatal("EraseTenant reported success over a path it must refuse to touch")
+	}
+	if !errors.Is(err, ErrUnsafeTarget) && !strings.Contains(err.Error(), ErrUnsafeTarget.Error()) {
+		t.Fatalf("error = %v, want an ErrUnsafeTarget refusal", err)
+	}
+	if content, readErr := os.ReadFile(victim); readErr != nil || string(content) != "not ours" {
+		t.Fatalf("the file outside the media root was touched: content=%q err=%v", content, readErr)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "42", "linked")); err != nil {
+		t.Fatalf("the parent symlink was removed: %v", err)
+	}
+	if cat.rows[1].file.Status != media.StatusStored {
+		t.Fatalf("status = %q: a refused target must not be written off", cat.rows[1].file.Status)
+	}
+}
+
+// TestRetentionMustNotFollowAParentSymlink: the same shape on the daily
+// retention path. Retention counts the refusal and leaves the row stored
+// rather than failing the run -- unlike the erasure, which must not claim
+// completeness over anything it declined to touch.
+func TestRetentionMustNotFollowAParentSymlink(t *testing.T) {
+	root := t.TempDir()
+	cat := newCatalogue(fixedNow)
+	victim := plantParentSymlink(t, root)
+	cat.add(1, media.StatusStored, "42/linked/victim", fixedNow().AddDate(0, 0, -30))
+
+	stats, err := newPurger(t, root, cat, false).Run(context.Background(), []users.TenantRetention{testTenant})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if content, readErr := os.ReadFile(victim); readErr != nil || string(content) != "not ours" {
+		t.Fatalf("the file outside the media root was touched: content=%q err=%v", content, readErr)
+	}
+	if cat.rows[1].file.Status != media.StatusStored {
+		t.Fatalf("status = %q, want the row left stored", cat.rows[1].file.Status)
+	}
+	if stats.Refused == 0 || stats.FilesDeleted != 0 {
+		t.Fatalf("stats = %+v, want refusals and no deletion", stats)
+	}
+}
+
+// TestEraseTenantRefusesAnotherTenantsSubtree: a catalogued path outside the
+// tenant's own subtree -- here another tenant's file -- is refused even
+// though it is lexically inside the media root.
+func TestEraseTenantRefusesAnotherTenantsSubtree(t *testing.T) {
+	root := t.TempDir()
+	cat := newCatalogue(fixedNow)
+	theirs := writeMedia(t, root, "99/2026-03/01/theirs", 0)
+	cat.add(1, media.StatusStored, theirs, fixedNow())
+
+	p := newPurger(t, root, cat, false)
+	_, _, err := p.EraseTenant(context.Background(), testOwner)
+	if err == nil {
+		t.Fatal("EraseTenant deleted outside the tenant's subtree without an error")
+	}
+	if !errors.Is(err, ErrUnsafeTarget) && !strings.Contains(err.Error(), ErrUnsafeTarget.Error()) {
+		t.Fatalf("error = %v, want an ErrUnsafeTarget refusal", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, theirs)); statErr != nil {
+		t.Fatalf("another tenant's file was deleted: %v", statErr)
+	}
+}
+
+// TestEraseTenantRefusesASymlinkedTenantSubtree: when the tenant directory
+// itself is a symlink, descending through it would operate outside the media
+// root from the very first step.
+func TestEraseTenantRefusesASymlinkedTenantSubtree(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim")
+	if err := os.WriteFile(victim, []byte("not ours"), 0o600); err != nil {
+		t.Fatalf("write bait: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "42")); err != nil {
+		t.Skipf("symlinks unavailable on this filesystem: %v", err)
+	}
+
+	p := newPurger(t, root, newCatalogue(fixedNow), false)
+	if _, _, err := p.EraseTenant(context.Background(), testOwner); err == nil {
+		t.Fatal("EraseTenant descended through a symlinked tenant subtree")
+	}
+	if content, readErr := os.ReadFile(victim); readErr != nil || string(content) != "not ours" {
+		t.Fatalf("the file outside the media root was touched: content=%q err=%v", content, readErr)
+	}
+}
+
+// TestEraseTenantHonoursCancellation: the disk sweep runs under the caller's
+// context, so a tenant tree larger than the poller's erasure budget aborts
+// instead of immobilising it -- and the aborted run is resumed by rerunning,
+// because every step is idempotent.
+func TestEraseTenantHonoursCancellation(t *testing.T) {
+	root := t.TempDir()
+	cat := newCatalogue(fixedNow)
+	stored := writeMedia(t, root, "42/2026-03/01/stored", 0)
+	cat.add(1, media.StatusStored, stored, fixedNow())
+
+	p := newPurger(t, root, cat, false)
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := p.EraseTenant(cancelled, testOwner); err == nil {
+		t.Fatal("EraseTenant ignored a cancelled context")
+	}
+
+	files, rows, err := p.EraseTenant(context.Background(), testOwner)
+	if err != nil {
+		t.Fatalf("resumed EraseTenant: %v", err)
+	}
+	if files != 1 || rows != 1 {
+		t.Fatalf("resumed run deleted files=%d rows=%d, want 1 and 1", files, rows)
+	}
+	if _, err := os.Lstat(filepath.Join(root, stored)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the blob survived the resumed erasure: %v", err)
+	}
+}
+
+// TestEraseTenantTreeHonoursCancellationMidSweep: cancelling the tree walk
+// itself stops it promptly with an error, and a rerun finishes the sweep.
+func TestEraseTenantTreeHonoursCancellationMidSweep(t *testing.T) {
+	root := t.TempDir()
+	cat := newCatalogue(fixedNow)
+	const total = 50
+	for id := 0; id < total; id++ {
+		writeMedia(t, root, fmt.Sprintf("42/2026-03/01/file-%02d", id), 0)
+	}
+
+	p := newPurger(t, root, cat, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := p.eraseTenantTree(ctx, testOwner); err == nil {
+		t.Fatal("eraseTenantTree ignored a cancelled context")
+	}
+	deleted, err := p.eraseTenantTree(context.Background(), testOwner)
+	if err != nil {
+		t.Fatalf("resumed sweep: %v", err)
+	}
+	if deleted != total {
+		t.Fatalf("resumed sweep deleted %d files, want %d", deleted, total)
 	}
 }

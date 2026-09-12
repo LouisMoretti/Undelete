@@ -63,6 +63,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/LouisMoretti/Undelete/bot/internal/media"
@@ -397,7 +398,7 @@ func (p *Purger) EraseTenant(ctx context.Context, ownerUserID int64) (int64, int
 		}
 		for _, file := range batch {
 			cursor = file.ID
-			removed, err := p.removeFiles(file, "erasure", false)
+			removed, err := p.removeFiles(ownerUserID, file, "erasure", false)
 			files += removed.FilesDeleted
 			if err != nil {
 				return files, rows, fmt.Errorf("media erasure: tenant %d: %w", ownerUserID, err)
@@ -422,7 +423,7 @@ func (p *Purger) EraseTenant(ctx context.Context, ownerUserID int64) (int64, int
 		}
 	}
 
-	swept, err := p.eraseTenantTree(ownerUserID)
+	swept, err := p.eraseTenantTree(ctx, ownerUserID)
 	files += swept
 	return files, rows, err
 }
@@ -430,71 +431,129 @@ func (p *Purger) EraseTenant(ctx context.Context, ownerUserID int64) (int64, int
 // eraseTenantTree removes whatever is left under the tenant's own storage
 // subtree, then the directories that held it.
 //
-// Rooted at <root>/<ownerUserID>, the same scope reconcileDisk uses: one
-// tenant's erasure can never look at, let alone delete, another tenant's files.
-// Nothing outside that subtree is examined, and every unlink still goes through
-// the same path revalidation as the rest of the package.
+// Rooted at the open file descriptor of <root>/<ownerUserID>, the same scope
+// reconcileDisk uses: one tenant's erasure can never look at, let alone
+// delete, another tenant's files. Every descent opens the child relative to
+// its parent's descriptor with O_NOFOLLOW, and every unlink is verified by
+// fstatat and issued by unlinkat against the parent descriptor -- a symlink
+// at any level is refused, never traversed (see saferemove.go). Nothing
+// outside that subtree is examined.
+//
+// The walk honours ctx: a tenant tree larger than the poller's erasure
+// budget does not immobilise it past the deadline. Cancellation aborts with
+// an error, and the erasure stays resumable -- rerunning it re-visits what
+// is left, because every step of EraseTenant is idempotent.
 //
 // The directories are removed deepest first and best effort: a directory that
 // refuses to go is one that still holds something the walk declined to delete,
 // which the returned error already reports.
-func (p *Purger) eraseTenantTree(ownerUserID int64) (int64, error) {
-	tenantRoot := filepath.Join(p.root, strconv.FormatInt(ownerUserID, 10))
+func (p *Purger) eraseTenantTree(ctx context.Context, ownerUserID int64) (int64, error) {
+	tenantName := strconv.FormatInt(ownerUserID, 10)
 
+	root, err := openDirNofollow(p.root)
+	if err != nil {
+		return 0, fmt.Errorf("media erasure: opening the media root: %w", err)
+	}
+	defer root.Close()
+
+	tenant, err := openChildDir(root, tenantName)
+	if err != nil {
+		if errors.Is(err, syscall.ENOENT) {
+			// A tenant that never stored anything has no subtree.
+			return 0, nil
+		}
+		if errors.Is(err, syscall.ELOOP) {
+			return 0, fmt.Errorf("%w: tenant subtree %q is a symlink", ErrUnsafeTarget, tenantName)
+		}
+		return 0, fmt.Errorf("media erasure: opening the media of tenant %d: %w", ownerUserID, err)
+	}
+	deleted, errs := p.eraseTreeFD(ctx, tenant, tenantName)
+	tenant.Close()
+	if len(errs) > 0 {
+		return deleted, errors.Join(errs...)
+	}
+
+	// The subtree itself goes too: an empty <root>/<owner> left behind would
+	// be the last trace that this tenant ever stored anything. Best effort
+	// and empty-only: rmdir refuses a symlink or a non-empty directory, and
+	// either failure is ignored exactly as before. The descriptor path keeps
+	// the removal relative to the verified root.
+	_ = os.Remove(procFDPath(root, tenantName))
+	return deleted, nil
+}
+
+// eraseTreeFD unlinks every regular file under the open directory dir,
+// recursing into genuine subdirectories and removing each once emptied.
+// Anything that is not a plain regular file or a genuine directory --
+// symlinks of any kind, fifos, sockets, devices -- is refused and reported,
+// never touched. Descents re-verify the child by opening it, so an entry
+// swapped for a symlink between the listing and the descent fails the open
+// instead of being followed.
+func (p *Purger) eraseTreeFD(ctx context.Context, dir *os.File, rel string) (int64, []error) {
 	var deleted int64
 	var refusals []error
-	var dirs []string
 
-	walkErr := filepath.WalkDir(tenantRoot, func(path string, entry fs.DirEntry, err error) error {
+	entries, err := dir.ReadDir(-1)
+	if err != nil {
+		return 0, []error{fmt.Errorf("listing %q: %w", rel, err)}
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return deleted, []error{err}
+		}
+		name := entry.Name()
+		childRel := rel + "/" + name
+
+		st, err := statChild(dir, name)
 		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				// A tenant that never stored anything has no subtree.
-				return nil
+			if errors.Is(err, syscall.ENOENT) {
+				// Vanished under the walk (a concurrent retention run, an
+				// operator): the outcome is the one wanted.
+				continue
 			}
-			return err
+			refusals = append(refusals, fmt.Errorf("inspecting %q: %w", childRel, err))
+			continue
 		}
-		if entry.IsDir() {
-			dirs = append(dirs, path)
-			return nil
+		if isDir(st) {
+			child, err := openChildDir(dir, name)
+			if err != nil {
+				refusal := fmt.Errorf("%w: cannot descend into %q: %v", ErrUnsafeTarget, childRel, err)
+				refusals = append(refusals, refusal)
+				p.refused(childRel, "erasure target refused", refusal)
+				continue
+			}
+			sub, subErr := p.eraseTreeFD(ctx, child, childRel)
+			child.Close()
+			deleted += sub
+			refusals = append(refusals, subErr...)
+			_ = os.Remove(procFDPath(dir, name))
+			continue
 		}
-
-		rel, relErr := filepath.Rel(p.root, path)
-		if relErr != nil {
-			refusals = append(refusals, fmt.Errorf("%w: %s", ErrUnsafeTarget, path))
-			return nil
-		}
-		// Covers symlinks as well: WalkDir reports one as an entry without
-		// descending into it, and it is refused rather than unlinked -- the
-		// package never decides on its own about something planted in the media
-		// tree, not even to delete it.
-		if !entry.Type().IsRegular() {
-			refusal := fmt.Errorf("%w: %s (%s)", ErrUnsafeTarget, rel, entry.Type())
+		if !isRegular(st) {
+			refusal := fmt.Errorf("%w: %s is not a regular file", ErrUnsafeTarget, childRel)
 			refusals = append(refusals, refusal)
-			p.refused(rel, "irregular entry left by an erasure", refusal)
-			return nil
+			p.refused(childRel, "irregular entry left by an erasure", refusal)
+			continue
 		}
-		removed, err := p.remove(rel, "erasure", false)
-		if err != nil {
-			refusals = append(refusals, err)
-			p.refused(rel, "erasure target refused", err)
-			return nil
+		if err := syscall.Unlinkat(int(dir.Fd()), name); err != nil {
+			if errors.Is(err, syscall.ENOENT) {
+				continue
+			}
+			refusals = append(refusals, fmt.Errorf("deleting %q: %w", childRel, err))
+			continue
 		}
-		if removed {
-			deleted++
-		}
-		return nil
-	})
-	if walkErr != nil {
-		return deleted, fmt.Errorf("media erasure: walking the media of tenant %d: %w", ownerUserID, walkErr)
+		deleted++
 	}
-	if len(refusals) > 0 {
-		return deleted, errors.Join(refusals...)
-	}
+	return deleted, refusals
+}
 
-	for index := len(dirs) - 1; index >= 0; index-- {
-		_ = os.Remove(dirs[index])
-	}
-	return deleted, nil
+// procFDPath names a direct child of an open directory through the process's
+// own descriptor table. Used only for rmdir, which has no unlinkat-with-flag
+// equivalent in the stdlib: removing an (already emptied) directory by this
+// path cannot escape the verified parent, and rmdir itself refuses symlinks
+// and non-empty directories.
+func procFDPath(dir *os.File, name string) string {
+	return "/proc/self/fd/" + strconv.Itoa(int(dir.Fd())) + "/" + name
 }
 
 // purgeExpired unlinks the blobs whose retention elapsed, then marks their row
@@ -527,7 +586,7 @@ func (p *Purger) purgeExpired(ctx context.Context, tenant users.TenantRetention)
 				return stats, nil
 			}
 			cursor = file.ID
-			unlinked, err := p.removeFiles(file, "retention", p.cfg.DryRun)
+			unlinked, err := p.removeFiles(tenant.OwnerUserID, file, "retention", p.cfg.DryRun)
 			stats.add(unlinked)
 			if err != nil {
 				// Refusals are already counted and logged; they must not abort
@@ -642,24 +701,23 @@ func (p *Purger) reconcileRows(ctx context.Context, tenant users.TenantRetention
 			cursor = file.ID
 			scanned++
 
-			full, err := p.resolve(file.RelativePath)
-			if err != nil {
-				stats.Refused++
-				p.refused(file.RelativePath, "row path refused", err)
-				continue
-			}
-			info, err := os.Lstat(full)
+			st, err := p.statRel(owner, file.RelativePath)
 			switch {
-			case err == nil && info.Mode().IsRegular():
+			case err == nil && isRegular(st):
 				continue
 			case err == nil:
 				// Not a regular file where a stored media should be. Never
 				// followed, never removed, never rewritten.
 				stats.Refused++
 				p.refused(file.RelativePath, "stored path is not a regular file",
-					fmt.Errorf("%w: %s", ErrUnsafeTarget, info.Mode().Type()))
+					fmt.Errorf("%w: not a regular file", ErrUnsafeTarget))
 				continue
 			case !errors.Is(err, fs.ErrNotExist):
+				if errors.Is(err, ErrUnsafeTarget) || errors.Is(err, media.ErrUnsafeRelativePath) {
+					stats.Refused++
+					p.refused(file.RelativePath, "row path refused", err)
+					continue
+				}
 				return stats, fmt.Errorf("inspecting stored media %d: %w", file.ID, err)
 			}
 
@@ -880,7 +938,7 @@ func (p *Purger) sweepBatch(ctx context.Context, owner int64, batch []candidate)
 			// Possibly a file whose MarkStored has not committed yet.
 			continue
 		}
-		removed, err := p.remove(c.rel, "unreferenced", p.cfg.DryRun)
+		removed, err := p.removeRel(owner, c.rel, "unreferenced", p.cfg.DryRun)
 		if err != nil {
 			stats.Refused++
 			p.refused(c.rel, "unreferenced entry refused", err)
@@ -905,13 +963,13 @@ func (p *Purger) sweepBatch(ctx context.Context, owner int64, batch []candidate)
 // callers do not mean the same thing by it: retention is what MEDIA_PURGE_DRY_RUN
 // exists to hold back, an erasure asked for by the owner is not (cf.
 // EraseTenant).
-func (p *Purger) removeFiles(file media.File, reason string, dryRun bool) (Stats, error) {
+func (p *Purger) removeFiles(ownerUserID int64, file media.File, reason string, dryRun bool) (Stats, error) {
 	var stats Stats
 	for _, rel := range []string{file.RelativePath, file.ThumbnailRelativePath} {
 		if rel == "" {
 			continue
 		}
-		removed, err := p.remove(rel, reason, dryRun)
+		removed, err := p.removeRel(ownerUserID, rel, reason, dryRun)
 		if err != nil {
 			stats.Refused++
 			p.cfg.Logger.Warn("media purge: refusing to delete",
@@ -924,73 +982,6 @@ func (p *Purger) removeFiles(file media.File, reason string, dryRun bool) (Stats
 		}
 	}
 	return stats, nil
-}
-
-// remove unlinks one file inside the media root, and reports whether there was
-// anything to unlink.
-//
-// Refuses, in this order: a relative path that is not a safe one (the same
-// validation the path passed before being written to the database, applied
-// again at the only point where it becomes a real unlink), a resolved path
-// outside the root, and anything that is not a plain regular file. os.Lstat
-// rather than os.Stat: a symlink must be seen as a symlink, not as the file it
-// points at -- following one would let anything planted in the media tree
-// delete an arbitrary file elsewhere on the host.
-//
-// An already absent file is a success, not an error: that is what makes the
-// whole purge replayable after a crash.
-func (p *Purger) remove(rel, reason string, dryRun bool) (bool, error) {
-	full, err := p.resolve(rel)
-	if err != nil {
-		return false, err
-	}
-	info, err := os.Lstat(full)
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		return false, nil
-	case err != nil:
-		return false, fmt.Errorf("inspecting media file: %w", err)
-	case !info.Mode().IsRegular():
-		return false, fmt.Errorf("%w: %s is not a regular file (%s)",
-			ErrUnsafeTarget, rel, info.Mode().Type())
-	}
-
-	if dryRun {
-		p.cfg.Logger.Info("media purge: dry run, would delete a file",
-			slog.String("reason", reason),
-			slog.Int64("bytes", info.Size()))
-		p.cfg.Logger.Debug("media purge: dry run target", slog.String("relative_path", rel))
-		return true, nil
-	}
-	if err := os.Remove(full); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			// Lost a race with a concurrent purge or an operator: the outcome
-			// is the one we wanted.
-			return false, nil
-		}
-		return false, fmt.Errorf("deleting media file: %w", err)
-	}
-	p.cfg.Logger.Debug("media purge: file deleted",
-		slog.String("reason", reason), slog.String("relative_path", rel))
-	return true, nil
-}
-
-// resolve turns a stored relative path into an absolute one, refusing anything
-// that would land outside the media root.
-//
-// media.ValidateRelativePath is the same check the path went through before
-// reaching the database (and that migration 0004 mirrors in a CHECK); the
-// containment test after the join is the defence in depth that would catch a
-// future regression in either.
-func (p *Purger) resolve(rel string) (string, error) {
-	if err := media.ValidateRelativePath(rel); err != nil {
-		return "", err
-	}
-	full := filepath.Join(p.root, rel)
-	if !strings.HasPrefix(full, p.root+string(os.PathSeparator)) {
-		return "", fmt.Errorf("%w: %q resolves outside the media root", ErrUnsafeTarget, rel)
-	}
-	return full, nil
 }
 
 // refused logs a refusal. The class of the problem at Warn (an operator has to

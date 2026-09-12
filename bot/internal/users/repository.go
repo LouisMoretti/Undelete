@@ -46,13 +46,25 @@ const (
 // Exactly one integer token between MinRetentionDays and MaxRetentionDays
 // (both inclusive) is accepted. Anything else -- empty, non-numeric, out of
 // bounds, or trailed by extra tokens -- is an error and the caller must change
-// nothing. Pure so the command can be exercised without a database.
+// nothing. The token must be in canonical decimal form: digits only, no sign,
+// no superfluous leading zero (^(0|[1-9][0-9]*)$); "+7", "007" or "00" are
+// refused like any other invalid form, before the bounds check. Pure so the
+// command can be exercised without a database.
 func ParseRetentionDays(argument string) (int, error) {
 	fields := strings.Fields(argument)
 	if len(fields) != 1 {
 		return 0, fmt.Errorf("expected a single number of days between %d and %d, got %q", MinRetentionDays, MaxRetentionDays, argument)
 	}
-	days, err := strconv.Atoi(fields[0])
+	token := fields[0]
+	if len(token) > 1 && token[0] == '0' {
+		return 0, fmt.Errorf("expected a single number of days between %d and %d, got %q", MinRetentionDays, MaxRetentionDays, argument)
+	}
+	for i := 0; i < len(token); i++ {
+		if token[i] < '0' || token[i] > '9' {
+			return 0, fmt.Errorf("expected a single number of days between %d and %d, got %q", MinRetentionDays, MaxRetentionDays, argument)
+		}
+	}
+	days, err := strconv.Atoi(token)
 	if err != nil {
 		return 0, fmt.Errorf("expected a single number of days between %d and %d, got %q", MinRetentionDays, MaxRetentionDays, argument)
 	}

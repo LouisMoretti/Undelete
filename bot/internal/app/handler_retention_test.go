@@ -162,6 +162,9 @@ func TestRetentionSetRefusesInvalidWithoutWriting(t *testing.T) {
 		"/retention 30 days",
 		"/retention 10 20",
 		"/retention 0x1E",
+		"/retention 007",
+		"/retention +7",
+		"/retention 00",
 	} {
 		t.Run(text, func(t *testing.T) {
 			sender := &fakeSender{}

@@ -16,7 +16,6 @@ func TestParseRetentionDays(t *testing.T) {
 		{argument: "7", want: 7},
 		{argument: "365", want: 365},
 		{argument: "  30  ", want: 30},
-		{argument: "007", want: 7},
 	}
 	for _, tt := range valid {
 		t.Run("accept "+tt.argument, func(t *testing.T) {
@@ -45,6 +44,10 @@ func TestParseRetentionDays(t *testing.T) {
 		"0x1E",
 		"30,",
 		"thirty",
+		"007",
+		"007 ",
+		"+7",
+		"00",
 	}
 	for _, argument := range invalid {
 		t.Run("refuse "+argument, func(t *testing.T) {

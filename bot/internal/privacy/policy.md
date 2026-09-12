@@ -1,6 +1,6 @@
 undelete — Privacy policy
 
-Version: 1.2
+Version: 1.3
 Effective date: 2026-09-12
 
 This document is the answer sent by the /privacy command, word for word.
@@ -125,9 +125,17 @@ offered by the bot.
   timestamps, without your Telegram identifier or connection identifier).
   Everything else this instance held about you is gone from its database and
   its disk.
+- /retention reads and sets the retention period of this account
+  (retention_days, 1 to 365 days, 7 by default). It is typed in the same
+  place and answered the same way as /privacy: typed alone it answers the
+  current period, typed with a number of days (for example "/retention 30")
+  it sets it. The new period applies from the next daily purge; lowering it
+  shortens how long everything is kept, but it never rewrites a backup
+  archive already written (see section 8). A contact who types it receives
+  nothing and changes nothing: only the holder of the connection is
+  answered.
 - Disabling the Business connection in your Telegram settings stops the
   capture immediately.
-- Lowering retention_days shortens how long everything is kept.
 
 An erasure covers the live data of this instance, and it is subject to section
 8 like every other deletion: what an archive already holds stays there until

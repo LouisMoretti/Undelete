@@ -13,6 +13,11 @@ const CommandPrivacy = "/privacy"
 // it (cf. internal/erasure).
 const CommandDeleteMyData = "/delete_my_data"
 
+// CommandRetention is the command that reads and sets the tenant's retention
+// period (users.retention_days, 1 to 365 days). Typed alone it answers the
+// current value; typed with a number of days it sets it (cf. internal/users).
+const CommandRetention = "/retention"
+
 // ParseCommand returns the normalised command a message starts with, and
 // whether the message is a command at all.
 //

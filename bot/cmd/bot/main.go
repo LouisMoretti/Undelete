@@ -146,9 +146,12 @@ func run(logger *slog.Logger) error {
 	// Without it the bot still saves everything, but /privacy stays silent.
 	// WithDataEraser adds /delete_my_data, and the number its confirmation
 	// quotes as the residual survival of the deleted data in the dumps.
+	// WithRetention adds /retention (read and set, 1 to 365 days), quoting the
+	// same number as the independence reference for the backups.
 	handler := app.NewHandler(businessSvc, messagesRepo, mediaRepo, logger,
 		app.WithCommandSender(client),
-		app.WithDataEraser(eraser, cfg.BackupRetentionDays))
+		app.WithDataEraser(eraser, cfg.BackupRetentionDays),
+		app.WithRetention(usersRepo, cfg.BackupRetentionDays))
 
 	poller := telegram.NewPoller(client, logger)
 

@@ -62,6 +62,26 @@ func BuildDeletionMessageRequests(alert DeletionAlert) []SendMessageRequest {
 	return requests
 }
 
+// BuildPrivacyMessageRequests builds the answer of the /privacy command and
+// splits it on the same Telegram limit as any other alert.
+//
+// ownerTelegramUserID is the ONLY recipient: the policy travels as a direct
+// message from the bot to the account holder, never with a
+// business_connection_id (constraint 7), which would post it as the holder
+// inside the monitored conversation the command was typed in.
+//
+// The policy is a long document that will not fit in a single message: the
+// split is not a defensive precaution here, it is the normal path, and the
+// chunks stay in order.
+func BuildPrivacyMessageRequests(ownerTelegramUserID int64, policyText string) []SendMessageRequest {
+	chunks := splitTelegramText(policyText, telegramTextLimit)
+	requests := make([]SendMessageRequest, 0, len(chunks))
+	for _, chunk := range chunks {
+		requests = append(requests, SendMessageRequest{ChatID: ownerTelegramUserID, Text: chunk})
+	}
+	return requests
+}
+
 // MediaUnavailableNote is appended to the text of a media alert that could not
 // carry its files (purged from disk, storage unmounted, file above the Bot API
 // limit, definitive Telegram refusal). The owner is told a media existed rather

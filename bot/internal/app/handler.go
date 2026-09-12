@@ -14,6 +14,7 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/media"
 	"github.com/LouisMoretti/Undelete/bot/internal/messages"
 	"github.com/LouisMoretti/Undelete/bot/internal/metrics"
+	"github.com/LouisMoretti/Undelete/bot/internal/privacy"
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
 )
 
@@ -39,6 +40,15 @@ type mediaCatalogue interface {
 	Save(ctx context.Context, ownerUserID int64, m media.Record) (int64, error)
 }
 
+// alertSender is the subset of telegram.Client used to answer a command. The
+// same method the welcome message goes through: a direct send to the account
+// holder, never durable delivery through the outbox -- a command answer that
+// is lost is retried by typing the command again, unlike a deletion alert
+// whose content no longer exists anywhere else.
+type alertSender interface {
+	SendMessage(ctx context.Context, req telegram.SendMessageRequest) error
+}
+
 // Handler routes Telegram Business updates to business handling. Its
 // methods are called strictly sequentially by telegram.Poller (constraint
 // #5): no mutex protection is needed here, the call order IS the
@@ -49,17 +59,33 @@ type Handler struct {
 	// media catalogues the attachments of every saved message. Nil disables
 	// the capture entirely (text-only mode): the messages keep being saved,
 	// and no deletion alert will carry a file.
-	media  mediaCatalogue
+	media mediaCatalogue
+	// sender answers the owner's commands. Nil disables command handling
+	// entirely: messages keep being saved, a /privacy simply gets no answer.
+	sender alertSender
 	logger *slog.Logger
 }
 
-func NewHandler(businessSvc businessService, messagesRepo messageStore, mediaRepo mediaCatalogue, logger *slog.Logger) *Handler {
-	return &Handler{
+// Option configures a Handler. Used for what is optional by construction (the
+// command answer), so the existing call sites keep compiling unchanged.
+type Option func(*Handler)
+
+// WithCommandSender enables the answers to the owner's commands (/privacy).
+func WithCommandSender(sender alertSender) Option {
+	return func(h *Handler) { h.sender = sender }
+}
+
+func NewHandler(businessSvc businessService, messagesRepo messageStore, mediaRepo mediaCatalogue, logger *slog.Logger, opts ...Option) *Handler {
+	h := &Handler{
 		business: businessSvc,
 		messages: messagesRepo,
 		media:    mediaRepo,
 		logger:   logger,
 	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 // HandleUpdate implements telegram.Handler.
@@ -69,10 +95,23 @@ func (h *Handler) HandleUpdate(ctx context.Context, u telegram.Update) error {
 		return h.business.HandleBusinessConnection(ctx, *u.BusinessConnection)
 
 	case u.BusinessMessage != nil:
-		return h.saveMessage(ctx, u.BusinessMessage, false)
+		conn, err := h.saveMessage(ctx, u.BusinessMessage, false)
+		if err != nil {
+			return err
+		}
+		if conn == nil {
+			// Message ignored upstream (unknown, refused or disabled
+			// connection): no context in which a command would be legitimate.
+			return nil
+		}
+		h.answerCommand(ctx, conn, u.BusinessMessage)
+		return nil
 
 	case u.EditedBusinessMessage != nil:
-		return h.saveMessage(ctx, u.EditedBusinessMessage, true)
+		// Deliberately no command handling on an edit: a command is an act,
+		// and rewriting an old message into "/privacy" is not one.
+		_, err := h.saveMessage(ctx, u.EditedBusinessMessage, true)
+		return err
 
 	case u.DeletedBusinessMessages != nil:
 		return h.handleDeleted(ctx, u.DeletedBusinessMessages)
@@ -86,27 +125,30 @@ func (h *Handler) HandleUpdate(ctx context.Context, u telegram.Update) error {
 	}
 }
 
-// saveMessage always saves the received message.
+// saveMessage always saves the received message. It returns the connection
+// the message belongs to, or nil when the message was ignored (unknown,
+// refused or disabled connection) -- the caller needs that distinction to
+// decide whether a command carried by this message deserves an answer.
 //
 // Constraint #8: NO chat_id condition here, and no consultation of any
 // preference table -- an active Business connection automatically covers
 // all chats Telegram exposes to it. The only filter applied is
 // business.Service.Resolve (does the connection exist and is_enabled),
 // never a per-conversation filter.
-func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited bool) error {
+func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited bool) (*business.Connection, error) {
 	conn, err := h.business.Resolve(ctx, msg.BusinessConnectionID)
 	if err != nil {
 		if errors.Is(err, business.ErrOwnerMismatch) {
 			h.logger.Debug("message ignored: connection refused by the mono-tenant guard",
 				slog.String("business_connection_id", msg.BusinessConnectionID))
-			return nil
+			return nil, nil
 		}
-		return fmt.Errorf("connection resolution for save: %w", err)
+		return nil, fmt.Errorf("connection resolution for save: %w", err)
 	}
 	if !conn.IsEnabled {
 		h.logger.Debug("message ignored: connection disabled",
 			slog.String("business_connection_id", conn.ID))
-		return nil
+		return nil, nil
 	}
 
 	var fromUserID *int64
@@ -138,11 +180,11 @@ func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited
 	}
 
 	if err := h.messages.Save(ctx, conn.OwnerUserID, record, edited); err != nil {
-		return fmt.Errorf("message save: %w", err)
+		return nil, fmt.Errorf("message save: %w", err)
 	}
 
 	if err := h.saveMedia(ctx, conn.OwnerUserID, msg, attachments); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Logs: ids, types, counters only. NEVER msg.Text nor any user
@@ -156,7 +198,81 @@ func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited
 		slog.Int("attachments", len(attachments)),
 		slog.Bool("edited", edited))
 
-	return nil
+	return conn, nil
+}
+
+// answerCommand answers the commands the account holder types in a chat
+// covered by the connection.
+//
+// Why a monitored chat and not a direct conversation with the bot: the
+// allowed_updates list is the four business_* types (constraint #2), so a
+// plain `message` addressed to the bot is never delivered. What the bot does
+// receive is every business_message, the holder's own outgoing messages
+// included -- that is where the command is read from.
+//
+// The answer goes out as a direct message from the bot to the holder, on
+// their own Telegram id, and NEVER carries a business_connection_id
+// (constraint #7, enforced by SendMessageRequest itself): the policy must not
+// appear, signed by the holder, in the conversation where it was typed.
+//
+// Only the holder is answered. A contact who writes /privacy in a monitored
+// chat gets nothing at all: not an answer in the chat, not an answer to
+// themselves, not a notification. Two independent checks stand in the way --
+// the connection resolution, which the mono-tenant guard already filters, and
+// the sender identity compared against the owner of that very connection.
+func (h *Handler) answerCommand(ctx context.Context, conn *business.Connection, msg *telegram.Message) {
+	if h.sender == nil {
+		return
+	}
+
+	command, ok := telegram.ParseCommand(messageText(msg))
+	if !ok {
+		return
+	}
+	if msg.From == nil || msg.From.ID != conn.OwnerTelegramUserID {
+		// A third party, or a message without a sender. Logged with ids only,
+		// never the command text.
+		h.logger.Debug("command ignored: sender is not the owner of the connection",
+			slog.String("business_connection_id", conn.ID),
+			slog.Int64("chat_id", msg.Chat.ID))
+		return
+	}
+
+	switch command {
+	case telegram.CommandPrivacy:
+		h.sendPrivacyPolicy(ctx, conn)
+	default:
+		h.logger.Debug("unknown command ignored",
+			slog.String("business_connection_id", conn.ID))
+	}
+}
+
+// sendPrivacyPolicy delivers the policy, split into chunks that respect the
+// Telegram limit in UTF-16 units.
+//
+// A failed send is logged and stops the remaining chunks: sending the rest
+// would leave the holder with a document missing its middle, and a command is
+// retried by typing it again. Nothing is returned to the poller either -- an
+// undelivered policy must never make an update look like it failed, still
+// less replay the message save that preceded it.
+func (h *Handler) sendPrivacyPolicy(ctx context.Context, conn *business.Connection) {
+	requests := telegram.BuildPrivacyMessageRequests(conn.OwnerTelegramUserID, privacy.Text())
+	for index, req := range requests {
+		if err := h.sender.SendMessage(ctx, req); err != nil {
+			h.logger.Error("failed to send the privacy policy",
+				slog.String("business_connection_id", conn.ID),
+				slog.Int("chunk", index+1),
+				slog.Int("chunks", len(requests)),
+				slog.String("error", err.Error()))
+			return
+		}
+	}
+
+	h.logger.Info("privacy policy sent",
+		slog.String("business_connection_id", conn.ID),
+		slog.String("policy_version", privacy.Version()),
+		slog.String("policy_effective_date", privacy.EffectiveDate()),
+		slog.Int("chunks", len(requests)))
 }
 
 // saveMedia catalogues the attachments of a message. The rows are created

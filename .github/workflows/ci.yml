@@ -105,36 +105,34 @@ jobs:
         run: make test-coverage
 
   fuzz:
-    name: short fuzz runs
+    name: fuzz packages touched by the PR
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
     steps:
+      # Full history: the script diffs HEAD against the base ref to find
+      # the touched packages.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: bot/go.mod
           cache-dependency-path: bot/go.sum
 
-      # Bounded engine runs beyond the seed corpus. The seeds (f.Add in the
-      # Fuzz* tests plus testdata/fuzz regression inputs) already run as
-      # ordinary unit tests in lint-unit; these short runs let the mutator
-      # explore further. One -fuzz invocation per target: Go refuses a
-      # regexp matching more than one fuzz test. Any property violation
-      # fails the job with a minimised reproducer under testdata/fuzz.
-      - name: fuzz telegram (parse, splits, decode)
-        working-directory: bot
+      # Bounded engine runs beyond the seed corpus, scoped to the touched
+      # packages (scripts/fuzz-touched.sh): the seeds (f.Add in the Fuzz*
+      # tests plus testdata/fuzz regression inputs) already run as ordinary
+      # unit tests in lint-unit on every package. One -fuzz invocation per
+      # target: Go refuses a regexp matching more than one fuzz test. Any
+      # property violation fails the job with a minimised reproducer under
+      # testdata/fuzz. Exits 0 when nothing fuzzable was touched.
+      - name: fuzz touched packages
         run: |
-          go test -run=NONE -fuzz=FuzzParseCommand -fuzztime=30s ./internal/telegram/
-          go test -run=NONE -fuzz=FuzzSplitTelegramText -fuzztime=60s ./internal/telegram/
-          go test -run=NONE -fuzz=FuzzSplitPolicyText -fuzztime=60s ./internal/telegram/
-          go test -run=NONE -fuzz=FuzzMessageUnmarshalJSON -fuzztime=30s ./internal/telegram/
-
-      - name: fuzz media guards
-        working-directory: bot
-        run: |
-          go test -run=NONE -fuzz=FuzzValidateFilePath -fuzztime=30s ./internal/media/store/
-          go test -run=NONE -fuzz=FuzzValidateRelativePath -fuzztime=30s ./internal/media/
-          go test -run=NONE -fuzz=FuzzValidateSHA256 -fuzztime=30s ./internal/media/
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            sh scripts/fuzz-touched.sh "origin/${{ github.base_ref }}" 60
+          else
+            sh scripts/fuzz-touched.sh "HEAD~1" 60
+          fi

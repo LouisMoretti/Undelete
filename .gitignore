@@ -3,6 +3,10 @@
 # Build Go
 bot/undelete-bot
 
+# Coverage artifacts (CI writes bot/coverage.out + bot/coverage.txt)
+bot/coverage.out
+bot/coverage.txt
+
 # Local data (docker-compose bind mounts)
 /media/*
 !/media/.gitkeep

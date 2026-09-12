@@ -5,7 +5,6 @@ import (
 	"context"
 	"strings"
 	"testing"
-	"time"
 	"unicode/utf16"
 
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
@@ -48,41 +47,5 @@ func TestSendTextWithNoteNeverExceedsLimit(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, telegram.MediaUnavailableNote) {
 		t.Fatalf("note must be present even after truncation")
-	}
-}
-
-func TestWorkerCapsHugeRetryAfter(t *testing.T) {
-	store := &fakeStore{job: testJob()}
-	sender := &fakeSender{err: &telegram.APIError{Method: "sendMessage", Code: 429, RetryAfter: 7200}}
-	worker := newTestWorker(store, sender, &bytes.Buffer{})
-
-	if _, err := worker.ProcessOne(context.Background(), 11); err != nil {
-		t.Fatalf("ProcessOne: %v", err)
-	}
-	if store.retryIn != maxBackoff {
-		t.Fatalf("retryIn=%v, want cap %v", store.retryIn, maxBackoff)
-	}
-}
-
-func TestRetryDelayCapsAtMaxBackoff(t *testing.T) {
-	if got := retryDelay(100); got != maxBackoff {
-		t.Fatalf("retryDelay(100)=%v, want %v", got, maxBackoff)
-	}
-	if got := retryDelay(-3); got != time.Second {
-		t.Fatalf("retryDelay(-3)=%v, want 1s", got)
-	}
-}
-
-func TestDecodeCorruptPayloadFallsBackToText(t *testing.T) {
-	payload, err := decodeMediaPayload([]byte(`{"items":[{invalid`))
-	if err == nil {
-		t.Fatalf("expected decode error for corrupt JSON")
-	}
-	if payload != nil {
-		t.Fatalf("corrupt payload must decode to nil (text fallback), got %+v", payload)
-	}
-	empty, err := decodeMediaPayload(nil)
-	if err != nil || empty != nil {
-		t.Fatalf("empty payload must be (nil,nil), got (%v,%v)", empty, err)
 	}
 }

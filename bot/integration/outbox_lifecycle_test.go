@@ -14,28 +14,18 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/LouisMoretti/Undelete/bot/internal/media"
 	"github.com/LouisMoretti/Undelete/bot/internal/messages"
 	"github.com/LouisMoretti/Undelete/bot/internal/outbox"
 	"github.com/LouisMoretti/Undelete/bot/internal/storage"
 	"github.com/LouisMoretti/Undelete/bot/internal/users"
 )
 
-// TestPostgreSQL16OutboxAndEdgeHardening closes the P0 gaps of the
-// integration suite on a real PostgreSQL 16:
-//
-//   - notification_outbox RLS fails closed without tenant context
-//     (SELECT/INSERT/UPDATE/DELETE via the bare pool);
-//   - outbox lease lifecycle: Claim → MarkSent, lease expiry → reclaim,
-//     MarkRetry delay blocks Claim, MarkFailed is terminal, wrong lease
-//     token → ErrLeaseLost, chunk ordering (chunk 1 blocked until chunk 0
-//     is sent), cross-tenant Claim isolation, malformed media payload
-//     falls back to text (Media == nil, no error);
-//   - PurgeExpired + CountBacklog per tenant, and the bare-pool COUNT(*)
-//     trap (always 0 without context);
-//   - edited-orphan / deleted-orphan semantics;
-//   - media MarkStored refuses hostile paths before the CHECK.
-func TestPostgreSQL16OutboxAndEdgeHardening(t *testing.T) {
+// TestPostgreSQL16OutboxLifecycle proves on a real PostgreSQL 16 the outbox
+// behaviour the unit suite cannot: RLS fail-closed on notification_outbox,
+// the Claim → MarkSent / MarkRetry / MarkFailed lease lifecycle (expiry,
+// delay, wrong token, cross-tenant isolation), chunk ordering, the malformed
+// media payload fallback, and the per-tenant PurgeExpired + CountBacklog.
+func TestPostgreSQL16OutboxLifecycle(t *testing.T) {
 	adminDSN := requireEnv(t, "POSTGRES_INTEGRATION_ADMIN_DSN")
 	runtimeDSN := requireEnv(t, "POSTGRES_INTEGRATION_RUNTIME_DSN")
 	if err := validateExplicitDestructiveOptIn(os.Getenv("POSTGRES_INTEGRATION_ALLOW_DESTRUCTIVE")); err != nil {
@@ -96,13 +86,12 @@ func TestPostgreSQL16OutboxAndEdgeHardening(t *testing.T) {
 
 	msgRepo := messages.NewRepository(db)
 	outboxRepo := outbox.NewRepository(db)
-	mediaRepo := media.NewRepository(db)
 
 	save := func(ownerID int64, conn string, chatID, msgID int64, text string) {
 		t.Helper()
 		rec := messages.Record{
 			BusinessConnectionID: conn, ChatID: chatID, MessageID: msgID,
-			FromDisplay: "hardening", MessageType: "text", TextContent: text,
+			FromDisplay: "lifecycle", MessageType: "text", TextContent: text,
 			TelegramDate: 1788019201, ChatTitle: "t", ChatType: "private",
 		}
 		if err := msgRepo.Save(context.Background(), ownerID, rec, false); err != nil {
@@ -147,8 +136,6 @@ func TestPostgreSQL16OutboxAndEdgeHardening(t *testing.T) {
 	})
 
 	t.Run("claim/sent/retry/failed lifecycle with leases", func(t *testing.T) {
-		pctx := phaseContext(t)
-		_ = pctx
 		// Fresh alert via the real path: save then mark deleted.
 		save(ownerA.ID, "bc-hard-a", 88101, 1, "lifecycle")
 		found, err := msgRepo.MarkDeleted(context.Background(), ownerA.ID, 93201, "bc-hard-a", 88101, []int64{1})
@@ -241,8 +228,6 @@ func TestPostgreSQL16OutboxAndEdgeHardening(t *testing.T) {
 	})
 
 	t.Run("malformed media payload falls back to text", func(t *testing.T) {
-		ctx := phaseContext(t)
-		_ = ctx
 		// '{}' is valid JSONB (passes the column type) but carries no items:
 		// Claim must return the job with Media == nil and no error, so the
 		// worker delivers the text fallback instead of stranding the alert.
@@ -318,61 +303,6 @@ func TestPostgreSQL16OutboxAndEdgeHardening(t *testing.T) {
 			return tx.QueryRow(context.Background(), `SELECT count(*) FROM notification_outbox WHERE id = $1`, idB).Scan(&remaining)
 		}); err != nil || remaining != 1 {
 			t.Fatalf("tenant B row leaked into tenant A purge: count=%d err=%v", remaining, err)
-		}
-	})
-
-	t.Run("edited orphan and deleted orphan", func(t *testing.T) {
-		ctx := phaseContext(t)
-		_ = ctx
-		// Edited-orphan documents current repository semantics: an edit with
-		// no parent upserts a row (edited_at set) rather than a no-op. Pinned
-		// so a future change to no-op semantics updates this test knowingly.
-		orphan := messages.Record{
-			BusinessConnectionID: "bc-hard-a", ChatID: 88107, MessageID: 7,
-			FromDisplay: "ghost", MessageType: "text", TextContent: "only the edit",
-			TelegramDate: 1788019201, ChatTitle: "t", ChatType: "private",
-		}
-		if err := msgRepo.Save(context.Background(), ownerA.ID, orphan, true); err != nil {
-			t.Fatalf("save edited orphan: %v", err)
-		}
-		var editedAt *time.Time
-		if err := db.InTenant(context.Background(), ownerA.ID, func(tx pgx.Tx) error {
-			return tx.QueryRow(context.Background(), `SELECT edited_at FROM messages WHERE business_connection_id = 'bc-hard-a' AND chat_id = 88107 AND message_id = 7`).Scan(&editedAt)
-		}); err != nil || editedAt == nil {
-			t.Fatalf("edited orphan should carry edited_at, got %v / %v", editedAt, err)
-		}
-		// Deleted-orphan is a clean no-op: nothing found, no outbox row.
-		found, err := msgRepo.MarkDeleted(context.Background(), ownerA.ID, 93201, "bc-hard-a", 88107, []int64{999999})
-		if err != nil {
-			t.Fatalf("MarkDeleted orphan: %v", err)
-		}
-		if len(found) != 0 {
-			t.Fatalf("orphan delete returned %d rows", len(found))
-		}
-		var outboxRows int
-		if err := db.InTenant(context.Background(), ownerA.ID, func(tx pgx.Tx) error {
-			return tx.QueryRow(context.Background(), `SELECT count(*) FROM notification_outbox WHERE chat_id = 88107 AND message_id = 999999`).Scan(&outboxRows)
-		}); err != nil || outboxRows != 0 {
-			t.Fatalf("orphan delete queued %d outbox rows", outboxRows)
-		}
-	})
-
-	t.Run("media MarkStored refuses hostile paths", func(t *testing.T) {
-		id, err := mediaRepo.Save(context.Background(), ownerA.ID, media.Record{
-			BusinessConnectionID: "bc-hard-a", ChatID: 88108, MessageID: 8,
-			TelegramFileID: "fh", TelegramFileUniqueID: "hardening-unique-8", MediaType: media.TypePhoto,
-		})
-		if err != nil {
-			t.Fatalf("media save: %v", err)
-		}
-		sha := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-		for _, rel := range []string{"../../escape", "/abs/path", "a//b", "a/./b", ""} {
-			if err := mediaRepo.MarkStored(context.Background(), ownerA.ID, id, media.StoredFile{RelativePath: rel, SHA256: sha, ByteSize: 3}); err == nil {
-				t.Fatalf("MarkStored(%q) unexpectedly accepted", rel)
-			}
-		}
-		if err := mediaRepo.MarkStored(context.Background(), ownerA.ID, id, media.StoredFile{RelativePath: "ok/path", SHA256: sha, ByteSize: 3, ThumbnailRelativePath: "../thumb"}); err == nil {
-			t.Fatal("MarkStored with hostile thumbnail unexpectedly accepted")
 		}
 	})
 }

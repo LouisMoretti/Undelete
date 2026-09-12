@@ -276,6 +276,8 @@ branch ruleset* / *Add rule* on `main`) — not automatable from this repository
 | Command | Who | Answer |
 |---|---|---|
 | `/privacy` | the account holder only | the privacy policy, as a direct message from the bot |
+| `/delete_my_data` | the account holder only | a single-use confirmation code, as a direct message from the bot |
+| `/delete_my_data <code>` | the account holder only | the erasure of everything this instance holds about them, then a confirmation |
 
 **Where to type them.** `allowed_updates` requests the four `business_*`
 types and nothing else (the explicit `allowed_updates` constraint), so a plain
@@ -298,6 +300,48 @@ The answer is labelled `Privacy policy (1/2)`, `(2/2)`: the document does not
 fit in one Telegram message, and a delivery that stops short must be readable
 as incomplete rather than pass for the whole policy.
 
+### `/delete_my_data`
+
+Two steps, because one would put the most destructive action of the product one
+typo away in a chat the holder types in all day. Typed alone, the command issues
+a random confirmation code (`crypto/rand`) that is valid for ten minutes and
+usable once; typed with that code, it runs the erasure. Only the SHA-256 of the
+code is stored, in `data_erasure_requests` (migration 0006, `FORCE ROW LEVEL
+SECURITY` like every other tenant table): the challenge survives a restart, and
+a dump hands its reader no spendable token. The code is spent by a single
+`UPDATE ... WHERE status = 'pending'`, so of two submissions exactly one is
+granted.
+
+The erasure runs in this order, and the order is what makes an interrupted one
+safe to rerun rather than a state nobody can name:
+
+1. **disable the tenant's Business connections** (database *and* the in-memory
+   resolution cache) — nothing new is captured while the rest runs;
+2. **`notification_outbox`**, every status included, leased rows as well: an
+   alert is content on its way out, and a worker must not deliver one from a
+   tenant that asked to disappear;
+3. **the attachments** — the blobs on disk first, then the `media_files` rows,
+   then a sweep of the tenant's own storage subtree for whatever an earlier
+   interrupted attempt left behind;
+4. **`messages` and `chats`**, in one transaction;
+5. **the tenant's other erasure requests**, and the spent one is marked
+   completed.
+
+Every step is idempotent (a `DELETE` that matches nothing succeeds, unlinking an
+absent file succeeds), so a crash leaves a strict prefix applied and the same
+code resubmitted replays it as no-ops before continuing. Submitting a code whose
+erasure already completed deletes nothing and says so. Every deletion is
+tenant-scoped and goes through `storage.DB.InTenant`; the disk sweep is rooted at
+`./media/<owner_user_id>`, so one tenant's erasure never even visits another's
+files. `MEDIA_PURGE_DRY_RUN` deliberately does not apply here: it holds back the
+deletions the bot decides on its own, not one the owner confirmed in writing.
+
+The final message states the **residual survival in the backups** as a
+conditional target — `BACKUP_RETENTION_DAYS` (14 by default) for the dumps,
+which holds only while the daily backup job runs, and the fact that media
+archives are not purged automatically. It never promises an erasure *of* the
+backups, which no deletion can deliver.
+
 ## Privacy
 
 The policy served by `/privacy` is
@@ -318,20 +362,28 @@ receives and the text reviewed here cannot describe two different policies.
   and counters only.
 - Retention configurable per user (`retention_days`, 1 to 365 days), purged
   daily.
+- `/delete_my_data` erases, on demand, this account's live data: messages,
+  chat labels, attachments (rows and files), queued alerts and the tenant's
+  other erasure requests, after disabling the Business connections. Three
+  things are deliberately kept, because the erasure needs them to stay erased
+  and answerable: the disabled connection records, the account row, and one
+  scrubbed receipt of the erasure (code hash and timestamps, no Telegram or
+  connection identifier) — see section 9 of the policy for the exact list.
 - Database backups (`scripts/backup.sh`) do not cover `./media` (Phase 2). The
   backup retention duration (`BACKUP_RETENTION_DAYS`) is, in effect, the
-  residual survival time of data after a future `/delete_my_data` command:
-  rows deleted in the database remain present in already-written archives
-  until their own purge. Section 8 of the policy states this explicitly, in
-  wording that stays true once content encryption (Phase 4) lands: an erasure
-  never rewrites an archive already written.
+  residual survival time of data after a `/delete_my_data`, as a conditional
+  target: rows deleted in the database remain present in already-written
+  archives until the daily job's own purge reaches them, and each day that job
+  misses moves every deletion by a day.
+  Section 8 of the policy states this explicitly, in wording that stays true
+  once content encryption (Phase 4) lands: an erasure never rewrites an archive
+  already written, and the confirmation message says so too.
 
 ## Roadmap by phases
 
 - **Phase 1 (this task)**: mono-tenant, plaintext text, RLS in place.
 - **Phase 2**: media (`media_files` table, backup of `./media` separately
-  from SQL dumps), GDPR commands (`/privacy` shipped, `/delete_my_data` still
-  to come).
+  from SQL dumps), GDPR commands (`/privacy` and `/delete_my_data` shipped).
 - **Phase 3**: real multi-tenancy (several simultaneous account holders,
   removal of the `OWNER_TELEGRAM_USER_ID` guard).
 - **Phase 4**: content encryption (`text_encrypted BYTEA`, AES-256-GCM,

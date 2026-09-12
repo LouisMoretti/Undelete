@@ -128,9 +128,14 @@ docker compose exec -T -e BACKUP_DIR=/backups backup sh /scripts/backup.sh
 ls -lh backups/ | tail -3
 ```
 
-The script writes `backups/undelete-<UTC timestamp>.sql.gz`, then purges
-archives older than `BACKUP_RETENTION_DAYS` days (files only). A failed
-`pg_dump` does not leave a truncated archive: the `trap` removes it.
+The script purges archives that reached `BACKUP_RETENTION_DAYS` days of age
+(files only) BEFORE dumping, then writes `backups/undelete-<UTC timestamp>.sql.gz`.
+A failed `pg_dump` neither leaves a truncated archive (the `trap` removes it)
+nor skips the purge -- with the purge first, a failed dump cannot silently
+extend every archive's life by a day. The number is a cleanup target of a job
+that must run to keep it: each day the job misses moves every deletion by a
+day, which is exactly the qualification the `/delete_my_data` confirmation
+states.
 
 > **`-e BACKUP_DIR=/backups` is not optional.** The service loop sets this
 > variable in its own `entrypoint`; an `exec` session is a fresh process that

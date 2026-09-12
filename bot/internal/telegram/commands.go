@@ -8,6 +8,11 @@ import (
 // CommandPrivacy is the command that returns the privacy policy.
 const CommandPrivacy = "/privacy"
 
+// CommandDeleteMyData is the command that erases the owner's data. Typed alone
+// it issues a confirmation code; typed with that code as its argument it spends
+// it (cf. internal/erasure).
+const CommandDeleteMyData = "/delete_my_data"
+
 // ParseCommand returns the normalised command a message starts with, and
 // whether the message is a command at all.
 //
@@ -43,4 +48,26 @@ func ParseCommand(text string) (string, bool) {
 		return "", false
 	}
 	return command, true
+}
+
+// CommandArgument returns what follows the command word, trimmed. Empty when
+// the message is not a command, or carries nothing after it.
+//
+// The split point is the same one ParseCommand uses -- the first whitespace
+// rune -- so "/delete_my_data ABCD2345" yields the command and its code, while
+// "/delete_my_data_extra" is a different command word with no argument at all,
+// never this command with a suffix.
+//
+// The argument is returned verbatim apart from the surrounding whitespace: what
+// it means belongs to the command that reads it, and normalising a confirmation
+// code here would hide that decision from the package that depends on it.
+func CommandArgument(text string) string {
+	if _, ok := ParseCommand(text); !ok {
+		return ""
+	}
+	index := strings.IndexFunc(text, unicode.IsSpace)
+	if index < 0 {
+		return ""
+	}
+	return strings.TrimSpace(text[index:])
 }

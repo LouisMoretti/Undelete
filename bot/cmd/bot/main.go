@@ -14,6 +14,7 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/app"
 	"github.com/LouisMoretti/Undelete/bot/internal/business"
 	"github.com/LouisMoretti/Undelete/bot/internal/config"
+	"github.com/LouisMoretti/Undelete/bot/internal/erasure"
 	"github.com/LouisMoretti/Undelete/bot/internal/health"
 	"github.com/LouisMoretti/Undelete/bot/internal/media"
 	"github.com/LouisMoretti/Undelete/bot/internal/media/fetch"
@@ -24,6 +25,7 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/outbox"
 	"github.com/LouisMoretti/Undelete/bot/internal/storage"
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
+	"github.com/LouisMoretti/Undelete/bot/internal/tenantexcl"
 	"github.com/LouisMoretti/Undelete/bot/internal/users"
 )
 
@@ -85,9 +87,6 @@ func run(logger *slog.Logger) error {
 	outboxRepo := outbox.NewRepository(db)
 	mediaRepo := media.NewRepository(db)
 	businessSvc := business.NewService(db.Pool, client, usersRepo, cfg.OwnerTelegramUserID, logger)
-	// WithCommandSender: the same client the welcome message goes through.
-	// Without it the bot still saves everything, but /privacy stays silent.
-	handler := app.NewHandler(businessSvc, messagesRepo, mediaRepo, logger, app.WithCommandSender(client))
 
 	// Dedicated HTTP client for the downloads: a media transfer must not share
 	// the connection pool of the long-polling client, whose timeout is sized
@@ -101,7 +100,13 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	fetcher := fetch.New(mediaRepo, client, downloader, cfg.TelegramBotToken, logger)
+	// One per-tenant exclusion for the whole process, shared by the erasure
+	// (exclusive side) and the two background writers (shared side): the
+	// media fetcher must not land a blob after the erasure swept the disk,
+	// and the outbox worker must not deliver an alert the erasure drained.
+	// It is also what serialises two concurrent erasures of one tenant.
+	guard := tenantexcl.New()
+	fetcher := fetch.New(mediaRepo, client, downloader, cfg.TelegramBotToken, logger, guard)
 
 	// Same root as the downloader and the outbox worker: the three of them
 	// resolve the paths of media_files against it, and a purger pointed
@@ -119,6 +124,32 @@ func run(logger *slog.Logger) error {
 		logger.Warn("media retention purge running in DRY RUN: no file will be deleted")
 	}
 
+	// The erasure reuses the very components the capture is built on -- the
+	// same connection service (whose in-memory cache it has to invalidate), the
+	// same repositories, the same media purger and therefore the same media
+	// root. A second path to any of them would be a second place for the
+	// tenant scope to be got wrong.
+	eraser, err := erasure.New(erasure.Config{
+		Challenges:  erasure.NewRepository(db),
+		Connections: businessSvc,
+		Outbox:      outboxRepo,
+		Media:       mediaPurger,
+		Messages:    messagesRepo,
+		Guard:       guard,
+		Logger:      logger,
+	})
+	if err != nil {
+		return err
+	}
+
+	// WithCommandSender: the same client the welcome message goes through.
+	// Without it the bot still saves everything, but /privacy stays silent.
+	// WithDataEraser adds /delete_my_data, and the number its confirmation
+	// quotes as the residual survival of the deleted data in the dumps.
+	handler := app.NewHandler(businessSvc, messagesRepo, mediaRepo, logger,
+		app.WithCommandSender(client),
+		app.WithDataEraser(eraser, cfg.BackupRetentionDays))
+
 	poller := telegram.NewPoller(client, logger)
 
 	var wg sync.WaitGroup
@@ -131,7 +162,7 @@ func run(logger *slog.Logger) error {
 		defer wg.Done()
 		// WithMediaDir: the same root the paths in media_files are relative
 		// to. Without it the worker would deliver every media alert as text.
-		worker := outbox.NewWorker(outboxRepo, client, logger, outbox.WithMediaDir(cfg.MediaDir))
+		worker := outbox.NewWorker(outboxRepo, client, logger, guard, outbox.WithMediaDir(cfg.MediaDir))
 		runOutboxLoop(ctx, usersRepo, worker, logger)
 	}()
 	go func() {

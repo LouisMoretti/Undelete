@@ -209,7 +209,7 @@ func TestWorker429WithoutRetryAfterUsesBackoff(t *testing.T) {
 	job.Media = &MediaPayload{Items: []MediaItem{{MediaType: "photo", RelativePath: "2026/01/01/u1/photo"}}}
 	store := &fakeStore{job: job}
 	sender := &fakeMediaSender{mediaErr: &telegram.APIError{Method: "sendPhoto", Code: 429}}
-	worker := NewWorker(store, sender, silentLogger(), WithMediaDir(t.TempDir()))
+	worker := NewWorker(store, sender, silentLogger(), nil, WithMediaDir(t.TempDir()))
 	processed, err := worker.ProcessOne(context.Background(), 11)
 	if err != nil || !processed {
 		t.Fatalf("ProcessOne = (%t, %v), want (true, nil)", processed, err)
@@ -230,7 +230,7 @@ func TestWorker408UsesBackoff(t *testing.T) {
 	job.Media = &MediaPayload{Items: []MediaItem{{MediaType: "photo", RelativePath: "2026/01/01/u1/photo"}}}
 	store := &fakeStore{job: job}
 	sender := &fakeMediaSender{mediaErr: &telegram.APIError{Method: "sendPhoto", Code: 408}}
-	worker := NewWorker(store, sender, silentLogger(), WithMediaDir(t.TempDir()))
+	worker := NewWorker(store, sender, silentLogger(), nil, WithMediaDir(t.TempDir()))
 	processed, err := worker.ProcessOne(context.Background(), 11)
 	if err != nil || !processed {
 		t.Fatalf("ProcessOne = (%t, %v), want (true, nil)", processed, err)

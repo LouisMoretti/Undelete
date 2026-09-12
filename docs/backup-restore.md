@@ -16,9 +16,12 @@ distinct target, never "over" the existing one.
 
 ## What is backed up
 
-`scripts/backup.sh` produces `backups/undelete-<UTC timestamp>.sql.gz` via
-`pg_dump "$MIGRATION_DATABASE_URL" | gzip`, then purges archives older than
-`BACKUP_RETENTION_DAYS` days (14 by default).
+`scripts/backup.sh` first purges the archives that reached
+`BACKUP_RETENTION_DAYS` days of age (14 by default -- the `-mtime` window is
+documented in the script itself), then produces
+`backups/undelete-<UTC timestamp>.sql.gz` via
+`pg_dump "$MIGRATION_DATABASE_URL" | gzip`. Purging first means a failed dump
+cannot skip the cleanup.
 
 `scripts/backup-media.sh` produces, next to it, the media archives
 (`backups/undelete-media-<UTC timestamp>-{full,incremental}.tar.gz` and their
@@ -52,10 +55,11 @@ to keep accordingly.
 
 Retention also has a "privacy" reading: `BACKUP_RETENTION_DAYS` is
 the residual survival time of a user's data after a deletion in the
-database, since already-written archives keep containing it until their own
-purge. Media archives extend that window further, and are **not** purged
-automatically (see [Media retention](#media-retention)): a `/delete_my_data`
-does not reach into them either.
+database, as a conditional target -- since already-written archives keep
+containing it until the daily job's own purge reaches them, each day that job
+misses moves every deletion by a day. Media archives extend that window
+further, and are **not** purged automatically (see [Media retention](#media-retention)):
+a `/delete_my_data` does not reach into them either.
 
 For media the RPO is the same 24 h — the incremental runs in the same daily
 pass, immediately after the dump. **That order is deliberate**: the archive is

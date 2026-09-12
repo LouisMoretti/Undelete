@@ -22,6 +22,7 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/media"
 	"github.com/LouisMoretti/Undelete/bot/internal/media/store"
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
+	"github.com/LouisMoretti/Undelete/bot/internal/tenantexcl"
 )
 
 // defaultBatch bounds one pass per tenant. Small on purpose: the loop comes
@@ -56,17 +57,26 @@ type Fetcher struct {
 	downloader Downloader
 	// token never leaves this field except as an argument to Download, which
 	// builds the URL in memory and never logs it.
-	token  string
+	token string
+	// guard is the per-tenant exclusion shared with the erasure (same
+	// instance, wired in cmd/bot). One batch holds the shared side from the
+	// listing to the last MarkStored: an erasure waits for the batch to
+	// finish, then deletes rows and sweeps the disk, so no download can land
+	// a blob after the sweep. A batch that starts during an erasure waits,
+	// then lists an emptied catalogue. Nil disables the coordination (unit
+	// tests); production always passes the shared guard.
+	guard  *tenantexcl.Guard
 	logger *slog.Logger
 	batch  int
 }
 
-func New(repo catalogue, resolver Resolver, downloader Downloader, token string, logger *slog.Logger) *Fetcher {
+func New(repo catalogue, resolver Resolver, downloader Downloader, token string, logger *slog.Logger, guard *tenantexcl.Guard) *Fetcher {
 	return &Fetcher{
 		repo:       repo,
 		resolver:   resolver,
 		downloader: downloader,
 		token:      token,
+		guard:      guard,
 		logger:     logger,
 		batch:      defaultBatch,
 	}
@@ -82,6 +92,13 @@ func New(repo catalogue, resolver Resolver, downloader Downloader, token string,
 // catalogued, so the deletion alert can still say a media existed, and the
 // loop stops asking for it forever.
 func (f *Fetcher) ProcessTenant(ctx context.Context, ownerUserID int64) (int, error) {
+	if f.guard != nil {
+		release, err := f.guard.Shared(ctx, ownerUserID)
+		if err != nil {
+			return 0, err
+		}
+		defer release()
+	}
 	pending, err := f.repo.ListPending(ctx, ownerUserID, f.batch)
 	if err != nil {
 		return 0, err

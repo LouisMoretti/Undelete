@@ -31,9 +31,9 @@ func (s *fakeMediaSender) SendMediaOnce(_ context.Context, alert telegram.MediaA
 func newMediaWorker(store Store, sender Sender, dir string, logBuffer *bytes.Buffer) *Worker {
 	logger := slog.New(slog.NewJSONHandler(logBuffer, nil))
 	if dir == "" {
-		return NewWorker(store, sender, logger)
+		return NewWorker(store, sender, logger, nil)
 	}
-	return NewWorker(store, sender, logger, WithMediaDir(dir))
+	return NewWorker(store, sender, logger, nil, WithMediaDir(dir))
 }
 
 // mediaJob is the media counterpart of testJob: same alert, but the files
@@ -290,7 +290,7 @@ func TestWorkerTreatsAnEmptyPayloadKindAsText(t *testing.T) {
 }
 
 func TestMediaPathRejectsEveryUnsafeRelativePath(t *testing.T) {
-	worker := NewWorker(nil, nil, slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)), WithMediaDir("/srv/media"))
+	worker := NewWorker(nil, nil, slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)), nil, WithMediaDir("/srv/media"))
 	for _, relative := range []string{"", "/etc/passwd", "../escape", "a/../../b", "a//b", `a\b`} {
 		if _, err := worker.mediaPath(relative); !errors.Is(err, media.ErrUnsafeRelativePath) {
 			t.Fatalf("mediaPath(%q) = %v, want ErrUnsafeRelativePath", relative, err)

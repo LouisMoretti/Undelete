@@ -137,3 +137,44 @@ func TestLoadParsesMediaPurgeDryRun(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadParsesBackupRetentionDays: the value is quoted verbatim in the
+// /delete_my_data confirmation as the maximum residual survival of the deleted
+// data. A malformed or non-positive one must fail at startup rather than be
+// rounded into a default that contradicts what backup.sh actually does — the
+// owner would be told a number that matches nothing.
+func TestLoadParsesBackupRetentionDays(t *testing.T) {
+	cases := map[string]struct {
+		env     string
+		want    int
+		wantErr bool
+	}{
+		"absent matches the backup.sh default": {env: "", want: 14},
+		"explicit value":                       {env: "90", want: 90},
+		"padded value":                         {env: " 7 ", want: 7},
+		"not a number is refused":              {env: "fortnight", wantErr: true},
+		"zero is refused":                      {env: "0", wantErr: true},
+		"negative is refused":                  {env: "-1", wantErr: true},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			validEnv(t)
+			t.Setenv("BACKUP_RETENTION_DAYS", tc.env)
+
+			cfg, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("Load() accepted BACKUP_RETENTION_DAYS=%q", tc.env)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() unexpected error: %v", err)
+			}
+			if cfg.BackupRetentionDays != tc.want {
+				t.Fatalf("BackupRetentionDays = %d, want %d", cfg.BackupRetentionDays, tc.want)
+			}
+		})
+	}
+}

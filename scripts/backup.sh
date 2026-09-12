@@ -1,6 +1,7 @@
 #!/bin/sh
-# Daily backup of the Postgres database: pg_dump | gzip to
-# ./backups, then purge of archives older than BACKUP_RETENTION_DAYS.
+# Daily backup of the Postgres database: purge of the archives that reached
+# BACKUP_RETENTION_DAYS days of age, then pg_dump | gzip to ./backups.
+# The purge runs first so a failed dump cannot skip it.
 #
 # NOTE 1: this dump does NOT include ./media (directory for media files).
 # In Phase 1 this directory is empty (no media handling), but from
@@ -25,6 +26,22 @@ BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
 
 mkdir -p "$BACKUP_DIR"
 
+# The purge runs BEFORE the dump, not after: with `set -e` a post-dump purge
+# never runs when pg_dump fails, and every archive then lives a day longer
+# than the number the /delete_my_data confirmation states.
+echo "backup: purging archives that reached ${BACKUP_RETENTION_DAYS} days of age"
+PURGE_AFTER_MTIME="+$((BACKUP_RETENTION_DAYS - 1))"
+if [ "${BACKUP_RETENTION_DAYS}" -le 1 ] 2>/dev/null; then
+    PURGE_AFTER_MTIME="+0"
+fi
+# -mtime compares whole days: -mtime +K matches files strictly older than K+1
+# days. Purging with K = RETENTION-1 therefore deletes an archive on the first
+# daily run where it is at least RETENTION days old. "About RETENTION days"
+# and "as long as this script runs daily" are load-bearing qualifiers: a day
+# the job does not run moves every deletion by a day, and the confirmation of
+# /delete_my_data states the number with exactly that qualification.
+find "$BACKUP_DIR" -name 'undelete-*.sql.gz' -type f -mtime "$PURGE_AFTER_MTIME" -delete
+
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 dest="${BACKUP_DIR}/undelete-${timestamp}.sql.gz"
 
@@ -34,8 +51,5 @@ echo "backup: dumping to ${dest}"
 trap 'rm -f "$dest"' EXIT HUP INT TERM
 pg_dump "$MIGRATION_DATABASE_URL" | gzip > "$dest"
 trap - EXIT HUP INT TERM
-
-echo "backup: purging archives older than ${BACKUP_RETENTION_DAYS} days"
-find "$BACKUP_DIR" -name 'undelete-*.sql.gz' -type f -mtime "+${BACKUP_RETENTION_DAYS}" -delete
 
 echo "backup: done"

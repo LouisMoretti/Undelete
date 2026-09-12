@@ -64,7 +64,7 @@ func (s *fakeSender) SendMessageOnce(_ context.Context, req telegram.SendMessage
 }
 
 func newTestWorker(store Store, sender Sender, logBuffer *bytes.Buffer) *Worker {
-	return NewWorker(store, sender, slog.New(slog.NewJSONHandler(logBuffer, nil)))
+	return NewWorker(store, sender, slog.New(slog.NewJSONHandler(logBuffer, nil)), nil)
 }
 
 func testJob() *Job {

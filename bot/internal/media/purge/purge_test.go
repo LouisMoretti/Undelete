@@ -195,6 +195,37 @@ func (c *fakeCatalogue) DeletePurged(_ context.Context, _ int64, grace time.Dura
 	return deleted, nil
 }
 
+// ListTenantPage is the status-blind page EraseTenant walks: unlike
+// ListStoredPage it hides nothing, which is the whole difference between
+// retention and an erasure.
+func (c *fakeCatalogue) ListTenantPage(_ context.Context, _, afterID int64, limit int) ([]media.File, error) {
+	c.note(limit)
+	var out []media.File
+	for _, row := range c.sorted() {
+		if row.file.ID > afterID {
+			out = append(out, row.file)
+			if len(out) == limit {
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+func (c *fakeCatalogue) DeleteTenantBatch(_ context.Context, _ int64, limit int) (int64, error) {
+	c.note(limit)
+	var deleted int64
+	for _, row := range c.sorted() {
+		if deleted == int64(limit) {
+			break
+		}
+		c.writes = append(c.writes, fmt.Sprintf("deleted:%d", row.file.ID))
+		delete(c.rows, row.file.ID)
+		deleted++
+	}
+	return deleted, nil
+}
+
 // --- test helpers -----------------------------------------------------------
 
 const testOwner = int64(42)

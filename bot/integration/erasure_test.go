@@ -330,13 +330,23 @@ func TestPostgreSQL16Erasure(t *testing.T) {
 			t.Fatalf("%d erasure requests survived, want exactly the completed one", got["data_erasure_requests"])
 		}
 		var status string
+		var telegramID *int64
+		var connectionID *string
 		if err := admin.QueryRow(ctx, `
-			SELECT status FROM data_erasure_requests WHERE owner_user_id = $1
-		`, erased.ID).Scan(&status); err != nil {
+			SELECT status, owner_telegram_user_id, business_connection_id
+			FROM data_erasure_requests WHERE owner_user_id = $1
+		`, erased.ID).Scan(&status, &telegramID, &connectionID); err != nil {
 			t.Fatalf("read the surviving request: %v", err)
 		}
 		if status != "completed" {
 			t.Fatalf("the surviving request is %q, want completed", status)
+		}
+		// The receipt is minimised on completion: the tenant key, the hash
+		// and the timestamps stay, the Telegram and connection identifiers
+		// are scrubbed (migration 0007).
+		if telegramID != nil || connectionID != nil {
+			t.Fatalf("the completed receipt still carries identifiers: telegram=%v connection=%v",
+				telegramID, connectionID)
 		}
 
 		if _, err := os.Lstat(filepath.Join(root, erasedBlob)); !os.IsNotExist(err) {

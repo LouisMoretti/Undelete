@@ -1,6 +1,6 @@
 undelete — Privacy policy
 
-Version: 1.1
+Version: 1.2
 Effective date: 2026-09-12
 
 This document is the answer sent by the /privacy command, word for word.
@@ -86,9 +86,13 @@ database — retention purge or the /delete_my_data erasure command — only eve
 affects live data. It cannot rewrite backup archives that were already written:
 those keep their copy until they are purged in their own turn.
 
-Database dumps are purged after BACKUP_RETENTION_DAYS days (14 by default),
-which is therefore the real delay before the last trace of a message
-disappears, not the retention period of section 7. Media archives are NOT
+Database dumps are deleted by the daily backup job once they are older than
+BACKUP_RETENTION_DAYS days (14 by default). That number is the job's cleanup
+target, not a guaranteed maximum: it holds only while the daily job runs, a
+day the job misses moves every archive's deletion by a day, and file ages are
+compared in whole days -- so the last trace of a message is gone about
+BACKUP_RETENTION_DAYS days after the dump that holds it, later if runs were
+missed. Media archives are NOT
 purged automatically: they survive until the operator deletes them.
 
 As long as an archive exists, its copy is beyond the reach of any command
@@ -102,7 +106,7 @@ offered by the bot.
   conversation, and the bot saves it like any other message. The answer comes
   back to you alone, as a private message from the bot, split into several
   messages and labelled with their number.
-- /delete_my_data erases everything this instance holds about you. It is typed
+- /delete_my_data erases this account's live data. It is typed
   in the same place and answered the same way as /privacy, and it takes two
   steps: typed alone it sends you a confirmation code, valid for a few minutes
   and usable once; typed followed by that code it disables your Business
@@ -114,6 +118,13 @@ offered by the bot.
   The confirmation code is sent to you privately, but the command that spends
   it is typed in a monitored chat, where your contact sees it like any other
   message — that is why it expires quickly and works only for you.
+  Three things are deliberately kept, because the erasure needs them to stay
+  erased and answerable: the disabled Business connection records (so nothing
+  is captured again until you reconnect), your account row (identifier and
+  retention setting), and one receipt of the erasure (code hash and
+  timestamps, without your Telegram identifier or connection identifier).
+  Everything else this instance held about you is gone from its database and
+  its disk.
 - Disabling the Business connection in your Telegram settings stops the
   capture immediately.
 - Lowering retention_days shortens how long everything is kept.

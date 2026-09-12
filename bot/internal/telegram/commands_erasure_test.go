@@ -118,6 +118,13 @@ func TestErasureMessagesNeverPromiseErasureFromBackups(t *testing.T) {
 // issue. The confirmation must name the configured retention, in days, and say
 // the media archives are not purged automatically -- the one number a "your
 // data is gone" message cannot honestly leave out.
+//
+// F7: the number alone is not the criterion. scripts/backup.sh only deletes
+// what its daily run reaches (a missed day moves every deletion by a day),
+// so the message must state the number as a CONDITIONAL cleanup target --
+// "only while that job runs" -- and never as an unconditional maximum. This
+// test asserts that qualification, i.e. the operational truth, not the mere
+// presence of the number.
 func TestTheConfirmationStatesTheResidualSurvival(t *testing.T) {
 	for _, days := range []int{7, 14, 90} {
 		for name, text := range map[string]string{
@@ -127,12 +134,20 @@ func TestTheConfirmationStatesTheResidualSurvival(t *testing.T) {
 			t.Run(name, func(t *testing.T) {
 				for _, needle := range []string{
 					"BACKUP_RETENTION_DAYS",
-					"maximum residual survival",
 					"not purged automatically",
-					"purged after " + itoa(days) + " days",
+					"older than " + itoa(days) + " days",
+					"only while that job runs",
+					"misses moves every deletion by a day",
 				} {
 					if !strings.Contains(text, needle) {
 						t.Fatalf("with %d days, the message never mentions %q", days, needle)
+					}
+				}
+				for _, forbidden := range []string{
+					"maximum residual survival",
+				} {
+					if strings.Contains(text, forbidden) {
+						t.Fatalf("with %d days, the message still claims %q, which the daily purge cannot guarantee", days, forbidden)
 					}
 				}
 			})

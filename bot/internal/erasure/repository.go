@@ -129,11 +129,23 @@ func (r *Repository) Claim(ctx context.Context, ownerUserID int64, codeHash stri
 // Complete marks a consumed request completed. Restricted to 'consumed' so it
 // can never resurrect a row the erasure already deleted, and COALESCE keeps the
 // first completion timestamp when a replay reaches it.
+//
+// The same statement scrubs the identifying columns the Issue wrote
+// (owner_telegram_user_id, business_connection_id): nothing reads them back
+// from a completed row -- the replay is answered from the Business connection
+// the message arrived through, never from this receipt -- so the row the
+// erasure deliberately keeps holds the tenant key, the code hash and the
+// timestamps, and no Telegram identifier (migration 0007 relaxed the two
+// columns to nullable for exactly this). Pending and consumed rows keep their
+// values; only the completed receipt is minimised.
 func (r *Repository) Complete(ctx context.Context, ownerUserID int64, codeHash string) error {
 	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
 			UPDATE data_erasure_requests
-			SET status = 'completed', completed_at = COALESCE(completed_at, now())
+			SET status = 'completed',
+			    completed_at = COALESCE(completed_at, now()),
+			    owner_telegram_user_id = NULL,
+			    business_connection_id = NULL
 			WHERE owner_user_id = $1 AND code_sha256 = $2 AND status = 'consumed'
 		`, ownerUserID, codeHash)
 		return err
@@ -145,9 +157,10 @@ func (r *Repository) Complete(ctx context.Context, ownerUserID int64, codeHash s
 }
 
 // DeleteOthers removes every erasure request of the tenant but the one being
-// spent. The kept row holds no content -- an owner id, a hash and three
-// timestamps -- and is what makes a replayed confirmation answerable instead of
-// being rejected as an unknown code.
+// spent. The kept row is the replay receipt: a tenant key, a code hash and
+// three timestamps, its Telegram and connection identifiers scrubbed on
+// completion (see Complete). Without it a replayed confirmation would read
+// as an unknown code.
 func (r *Repository) DeleteOthers(ctx context.Context, ownerUserID int64, keepHash string) (int64, error) {
 	var deleted int64
 	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {

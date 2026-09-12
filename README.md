@@ -336,8 +336,9 @@ tenant-scoped and goes through `storage.DB.InTenant`; the disk sweep is rooted a
 files. `MEDIA_PURGE_DRY_RUN` deliberately does not apply here: it holds back the
 deletions the bot decides on its own, not one the owner confirmed in writing.
 
-The final message states the **maximum residual survival in the backups** —
-`BACKUP_RETENTION_DAYS` (14 by default) for the dumps, and the fact that media
+The final message states the **residual survival in the backups** as a
+conditional target — `BACKUP_RETENTION_DAYS` (14 by default) for the dumps,
+which holds only while the daily backup job runs, and the fact that media
 archives are not purged automatically. It never promises an erasure *of* the
 backups, which no deletion can deliver.
 
@@ -361,13 +362,19 @@ receives and the text reviewed here cannot describe two different policies.
   and counters only.
 - Retention configurable per user (`retention_days`, 1 to 365 days), purged
   daily.
-- `/delete_my_data` erases, on demand, everything this instance holds about
-  the holder: messages, chat labels, attachments (rows and files), queued
-  alerts and the tenant metadata, after disabling the Business connections.
+- `/delete_my_data` erases, on demand, this account's live data: messages,
+  chat labels, attachments (rows and files), queued alerts and the tenant's
+  other erasure requests, after disabling the Business connections. Three
+  things are deliberately kept, because the erasure needs them to stay erased
+  and answerable: the disabled connection records, the account row, and one
+  scrubbed receipt of the erasure (code hash and timestamps, no Telegram or
+  connection identifier) — see section 9 of the policy for the exact list.
 - Database backups (`scripts/backup.sh`) do not cover `./media` (Phase 2). The
   backup retention duration (`BACKUP_RETENTION_DAYS`) is, in effect, the
-  residual survival time of data after a `/delete_my_data`: rows deleted in the
-  database remain present in already-written archives until their own purge.
+  residual survival time of data after a `/delete_my_data`, as a conditional
+  target: rows deleted in the database remain present in already-written
+  archives until the daily job's own purge reaches them, and each day that job
+  misses moves every deletion by a day.
   Section 8 of the policy states this explicitly, in wording that stays true
   once content encryption (Phase 4) lands: an erasure never rewrites an archive
   already written, and the confirmation message says so too.

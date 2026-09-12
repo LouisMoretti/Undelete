@@ -131,16 +131,19 @@ func privacyLabelUnits(total int) int {
 // the promise without the caveat that qualifies it.
 const (
 	// erasureBackupCaveat is the sentence the issue is really about, and it is
-	// deliberately phrased as a survival TIME rather than as a promise. A
-	// deletion in the database cannot rewrite an archive already written, so the
-	// only honest statement is how long those archives live -- and the media
-	// archives, which nothing purges automatically, are named rather than
-	// rounded into the same number.
+	// deliberately phrased as a conditional survival TIME rather than as a
+	// promise. A deletion in the database cannot rewrite an archive already
+	// written, so the only honest statement is how long those archives live:
+	// the daily backup job deletes dumps once they reach BACKUP_RETENTION_DAYS
+	// days of age, which holds only while that job runs -- a day it does not
+	// run moves every deletion by a day. The media archives, which nothing
+	// purges automatically, are named rather than rounded into the same
+	// number.
 	erasureBackupCaveat = "Backups are the exception, and the limit is worth stating plainly: a deletion " +
-		"here cannot rewrite an archive that was already written. Database dumps are purged after " +
-		"%d days (BACKUP_RETENTION_DAYS), which is therefore the maximum residual survival of what " +
-		"was just deleted. Media archives are not purged automatically: they survive until the " +
-		"operator deletes them."
+		"here cannot rewrite an archive that was already written. Database dumps are deleted by the daily " +
+		"backup job once they are older than %d days (BACKUP_RETENTION_DAYS) -- a cleanup target that holds " +
+		"only while that job runs, so each day it misses moves every deletion by a day. Media archives are " +
+		"not purged automatically: they survive until the operator deletes them."
 
 	erasureChallengeText = "Data erasure requested.\n\n" +
 		"To confirm, send this exact command within %d minutes:\n\n" +

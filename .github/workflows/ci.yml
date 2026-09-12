@@ -83,3 +83,23 @@ jobs:
       # restricted role created by db/init/01-app-role.sh.
       - name: make test-integration
         run: make test-integration
+
+  coverage:
+    name: combined coverage (unit + integration)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: bot/go.mod
+          cache-dependency-path: bot/go.sum
+
+      # Unit + integration statement coverage with a 75% floor gate
+      # (measured ~78%): the unit gate cannot see the DB-bound packages,
+      # this one can. Disposable container like the integration job.
+      - name: make test-coverage
+        run: make test-coverage

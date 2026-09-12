@@ -1,4 +1,4 @@
-.PHONY: build vet fmt tidy check test-integration test-restore test-restore-media up down logs
+.PHONY: build vet fmt tidy check test-integration test-restore test-restore-media test-coverage up down logs
 
 # The 4 delivery commands, grouped together.
 check:
@@ -18,6 +18,12 @@ fmt:
 
 test-integration:
 	./scripts/test-integration.sh
+
+# Combined unit + integration statement coverage with a floor gate
+# (default 75%, override with COVERAGE_FLOOR=...). Boots its own
+# disposable Postgres like test-integration; touches nothing existing.
+test-coverage:
+	./scripts/test-coverage.sh
 
 # Restores a backup into a distinct disposable database and verifies it.
 # See docs/backup-restore.md (RPO/RTO, periodic recipe).

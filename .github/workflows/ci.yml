@@ -103,3 +103,38 @@ jobs:
       # this one can. Disposable container like the integration job.
       - name: make test-coverage
         run: make test-coverage
+
+  fuzz:
+    name: short fuzz runs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: bot/go.mod
+          cache-dependency-path: bot/go.sum
+
+      # Bounded engine runs beyond the seed corpus. The seeds (f.Add in the
+      # Fuzz* tests plus testdata/fuzz regression inputs) already run as
+      # ordinary unit tests in lint-unit; these short runs let the mutator
+      # explore further. One -fuzz invocation per target: Go refuses a
+      # regexp matching more than one fuzz test. Any property violation
+      # fails the job with a minimised reproducer under testdata/fuzz.
+      - name: fuzz telegram (parse, splits, decode)
+        working-directory: bot
+        run: |
+          go test -run=NONE -fuzz=FuzzParseCommand -fuzztime=30s ./internal/telegram/
+          go test -run=NONE -fuzz=FuzzSplitTelegramText -fuzztime=60s ./internal/telegram/
+          go test -run=NONE -fuzz=FuzzSplitPolicyText -fuzztime=60s ./internal/telegram/
+          go test -run=NONE -fuzz=FuzzMessageUnmarshalJSON -fuzztime=30s ./internal/telegram/
+
+      - name: fuzz media guards
+        working-directory: bot
+        run: |
+          go test -run=NONE -fuzz=FuzzValidateFilePath -fuzztime=30s ./internal/media/store/
+          go test -run=NONE -fuzz=FuzzValidateRelativePath -fuzztime=30s ./internal/media/
+          go test -run=NONE -fuzz=FuzzValidateSHA256 -fuzztime=30s ./internal/media/

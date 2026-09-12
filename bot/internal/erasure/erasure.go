@@ -39,10 +39,33 @@
 // why the rows go after the files and not before.
 //
 // The completed request row is the one thing the erasure deliberately keeps:
-// it holds no content (an owner id, a hash, three timestamps) and it is what
-// lets a replayed confirmation be answered with the same message instead of
-// "unknown code" -- the difference between an idempotent command and one that
-// accuses the owner of making it up.
+// it holds no content (a tenant key, a code hash, three timestamps) and it is
+// what lets a replayed confirmation be answered with the same message instead
+// of "unknown code" -- the difference between an idempotent command and one
+// that accuses the owner of making it up. Its Telegram identifier and
+// connection identifier are scrubbed by the completion itself (migration
+// 0007), so the receipt keeps no identifier a replay could do without.
+//
+// # What the erasure keeps, and why (tombstones)
+//
+// Everything the tenant's capture produced goes: messages, chat labels,
+// attachment blobs and catalogue rows, queued alerts, and every other erasure
+// request. Three things stay, each of them load-bearing:
+//
+//   - the users row (Telegram identifier, retention setting, creation date).
+//     It anchors the foreign keys of the rows below and the tenant listing;
+//     deleting it would cascade to the receipt and to the connection records
+//     the handler needs to authenticate a retried code.
+//   - the business_connections rows, disabled. They are the capture stop:
+//     the handler answers control commands from the resolved connection, and
+//     resolving a deleted connection would fall through to the Telegram API
+//     and re-create it enabled. Reconnecting from the Telegram settings
+//     re-enables them and starts a fresh capture.
+//   - the completed erasure request, scrubbed as described above. It is the
+//     replay receipt.
+//
+// The privacy policy states exactly these exceptions; "erases everything"
+// would be false, and the policy does not say it.
 package erasure
 
 import (
@@ -54,6 +77,8 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+
+	"github.com/LouisMoretti/Undelete/bot/internal/tenantexcl"
 )
 
 // ChallengeTTL is how long an issued code stays spendable.
@@ -181,7 +206,16 @@ type Service struct {
 	outbox      Outbox
 	media       Media
 	messages    Messages
-	logger      *slog.Logger
+	// guard is the per-tenant exclusion shared with the media fetcher and
+	// the outbox worker. The erasure holds the exclusive side for its whole
+	// run (claim, steps, completion); workers hold the shared side for one
+	// unit of work. It is also what serialises two concurrent Confirm calls
+	// for one tenant: the claim happens INSIDE the exclusion, so the second
+	// caller waits, then reads the state the first one left behind
+	// (completed -> AlreadyErased, still consumed -> resume) instead of
+	// starting a second erasure alongside the first.
+	guard  *tenantexcl.Guard
+	logger *slog.Logger
 }
 
 // Config wires the Service. Every field is required: a Service missing one of
@@ -193,7 +227,12 @@ type Config struct {
 	Outbox      Outbox
 	Media       Media
 	Messages    Messages
-	Logger      *slog.Logger
+	// Guard is the exclusion above, shared with the fetcher and the worker
+	// (same instance, wired in cmd/bot). Without it two concurrent Confirms
+	// would both execute, and a worker could deliver or store after the
+	// confirmation.
+	Guard  *tenantexcl.Guard
+	Logger *slog.Logger
 }
 
 // New validates the configuration and returns the Service.
@@ -209,6 +248,8 @@ func New(cfg Config) (*Service, error) {
 		return nil, fmt.Errorf("erasure: Media is required")
 	case cfg.Messages == nil:
 		return nil, fmt.Errorf("erasure: Messages is required")
+	case cfg.Guard == nil:
+		return nil, fmt.Errorf("erasure: Guard is required")
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -220,6 +261,7 @@ func New(cfg Config) (*Service, error) {
 		outbox:      cfg.Outbox,
 		media:       cfg.Media,
 		messages:    cfg.Messages,
+		guard:       cfg.Guard,
 		logger:      logger,
 	}, nil
 }
@@ -248,6 +290,14 @@ func (s *Service) Request(ctx context.Context, t Tenant) (Challenge, error) {
 
 // Confirm spends a submitted code and, if it was valid, erases the tenant.
 //
+// The whole call runs under the tenant's exclusive exclusion: the claim, the
+// steps and the completion are one serialised unit per tenant. A second
+// Confirm arriving mid-erasure therefore waits, then claims against the
+// state the first one left -- a completed row reads as AlreadyErased (no
+// second deletion), a still-consumed one as a resume -- instead of executing
+// alongside it. Claiming BEFORE the exclusion would let two callers both see
+// a spendable or resumable row and both erase.
+//
 // An error means the erasure did not reach its last step. The request then
 // stays 'consumed', and submitting the same code again resumes it from the
 // beginning -- see the package comment for why rerunning is safe.
@@ -256,6 +306,13 @@ func (s *Service) Confirm(ctx context.Context, t Tenant, code string) (Outcome, 
 	if normalised == "" {
 		return OutcomeUnknown, nil
 	}
+
+	release, err := s.guard.Exclusive(ctx, t.OwnerUserID)
+	if err != nil {
+		return OutcomeUnknown, err
+	}
+	defer release()
+
 	hash := HashCode(normalised)
 
 	state, err := s.challenges.Claim(ctx, t.OwnerUserID, hash)

@@ -4,15 +4,23 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/LouisMoretti/Undelete/bot/internal/tenantexcl"
 )
 
 // fakeChallenges reimplements data_erasure_requests in memory. The SQL half is
 // covered by the integration test against a real PostgreSQL; what needs
 // covering here is the DECISION each state leads to, since every one of them
 // is a decision about destroying a tenant's data.
+//
+// The mutex mirrors the row serialisation PostgreSQL provides: the service
+// under test runs concurrent Confirms, and the fake must not be the thing
+// that races.
 type fakeChallenges struct {
+	mu   sync.Mutex
 	rows map[string]*fakeRequest
 	// issueErr, claimErr and completeErr inject a database failure at each of
 	// the three points where one changes the outcome.
@@ -21,9 +29,11 @@ type fakeChallenges struct {
 }
 
 type fakeRequest struct {
-	owner     int64
-	status    string
-	expiresAt time.Time
+	owner      int64
+	status     string
+	expiresAt  time.Time
+	telegramID int64
+	connection string
 }
 
 func newChallenges() *fakeChallenges {
@@ -31,6 +41,8 @@ func newChallenges() *fakeChallenges {
 }
 
 func (f *fakeChallenges) Issue(_ context.Context, t Tenant, codeHash string, ttl time.Duration) (time.Time, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.issueErr != nil {
 		return time.Time{}, f.issueErr
 	}
@@ -40,11 +52,19 @@ func (f *fakeChallenges) Issue(_ context.Context, t Tenant, codeHash string, ttl
 		}
 	}
 	expires := time.Now().Add(ttl)
-	f.rows[codeHash] = &fakeRequest{owner: t.OwnerUserID, status: "pending", expiresAt: expires}
+	f.rows[codeHash] = &fakeRequest{
+		owner:      t.OwnerUserID,
+		status:     "pending",
+		expiresAt:  expires,
+		telegramID: t.OwnerTelegramUserID,
+		connection: t.BusinessConnectionID,
+	}
 	return expires, nil
 }
 
 func (f *fakeChallenges) Claim(_ context.Context, ownerUserID int64, codeHash string) (ClaimState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.claimErr != nil {
 		return ClaimUnknown, f.claimErr
 	}
@@ -69,16 +89,24 @@ func (f *fakeChallenges) Claim(_ context.Context, ownerUserID int64, codeHash st
 }
 
 func (f *fakeChallenges) Complete(_ context.Context, ownerUserID int64, codeHash string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.completeErr != nil {
 		return f.completeErr
 	}
 	if row, ok := f.rows[codeHash]; ok && row.owner == ownerUserID && row.status == "consumed" {
 		row.status = "completed"
+		// Mirrors the SQL scrub of Repository.Complete: the receipt keeps
+		// the tenant key, the hash and the timestamps, not the identifiers.
+		row.telegramID = 0
+		row.connection = ""
 	}
 	return nil
 }
 
 func (f *fakeChallenges) DeleteOthers(_ context.Context, ownerUserID int64, keepHash string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var deleted int64
 	for hash, row := range f.rows {
 		if row.owner == ownerUserID && hash != keepHash {
@@ -93,20 +121,44 @@ func (f *fakeChallenges) DeleteOthers(_ context.Context, ownerUserID int64, keep
 // fakeSteps records the deletion steps in the order they ran, which is the
 // property the package comment rests on, and can fail at a chosen one.
 type fakeSteps struct {
+	mu      sync.Mutex
 	calls   []string
 	failAt  string
 	failErr error
+	// blockSteps, when non-nil, blocks a step until the channel is closed:
+	// the way to hold an erasure open while a second Confirm arrives.
+	blockSteps map[string]chan struct{}
+	// entered and left count the executions of the whole erase, so a test can
+	// tell overlapping runs apart without parsing the call list.
+	entered int
+	left    int
 }
 
 func (f *fakeSteps) record(step string) error {
+	f.mu.Lock()
 	f.calls = append(f.calls, step)
-	if f.failAt == step {
-		if f.failErr == nil {
-			f.failErr = errors.New("step failed")
-		}
-		return f.failErr
+	wait := f.blockSteps[step]
+	fail := f.failAt == step
+	if fail && f.failErr == nil {
+		f.failErr = errors.New("step failed")
+	}
+	err := f.failErr
+	f.mu.Unlock()
+	if wait != nil {
+		<-wait
+	}
+	if fail {
+		return err
 	}
 	return nil
+}
+
+// snapshot returns the recorded calls so far, safe to read while another
+// Confirm is blocked inside a step.
+func (f *fakeSteps) snapshot() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
 }
 
 func (f *fakeSteps) DisableOwner(_ context.Context, _ int64) (int64, error) {
@@ -137,6 +189,7 @@ func newService(t *testing.T, challenges Challenges, steps *fakeSteps) *Service 
 		Outbox:      steps,
 		Media:       steps,
 		Messages:    messageSteps{steps: steps},
+		Guard:       tenantexcl.New(),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -507,6 +560,7 @@ func TestNewRequiresEveryDependency(t *testing.T) {
 		Outbox:      steps,
 		Media:       steps,
 		Messages:    messageSteps{steps: steps},
+		Guard:       tenantexcl.New(),
 	}
 	tests := []struct {
 		name   string
@@ -517,6 +571,7 @@ func TestNewRequiresEveryDependency(t *testing.T) {
 		{name: "outbox", break_: func(c *Config) { c.Outbox = nil }},
 		{name: "media", break_: func(c *Config) { c.Media = nil }},
 		{name: "messages", break_: func(c *Config) { c.Messages = nil }},
+		{name: "guard", break_: func(c *Config) { c.Guard = nil }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -594,5 +649,194 @@ func TestGeneratedCodesUseTheUnambiguousAlphabet(t *testing.T) {
 func TestChallengeTTLStaysShort(t *testing.T) {
 	if ChallengeTTL <= 0 || ChallengeTTL > 15*time.Minute {
 		t.Fatalf("ChallengeTTL = %v, want a short positive window", ChallengeTTL)
+	}
+}
+
+// TestTwoConcurrentConfirmsRunOneErasure is the F4 guarantee: two submissions
+// of the same code racing each other must not execute the deletion twice. The
+// first Confirm holds the tenant exclusion with its "media" step blocked; the
+// second must wait outside instead of entering. Once released, the first
+// completes, and the second claims against the completed row -- AlreadyErased,
+// with no step of its own.
+func TestTwoConcurrentConfirmsRunOneErasure(t *testing.T) {
+	challenges := newChallenges()
+	unblock := make(chan struct{})
+	steps := &fakeSteps{blockSteps: map[string]chan struct{}{"media": unblock}}
+	service := newService(t, challenges, steps)
+
+	challenge, err := service.Request(context.Background(), testTenant)
+	if err != nil {
+		t.Fatalf("Request: %v", err)
+	}
+
+	type result struct {
+		outcome Outcome
+		err     error
+	}
+	first := make(chan result, 1)
+	go func() {
+		outcome, err := service.Confirm(context.Background(), testTenant, challenge.Code)
+		first <- result{outcome: outcome, err: err}
+	}()
+
+	// Wait until the first erasure is inside its run, blocked at "media".
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := strings.Join(steps.snapshot(), ",")
+		if got == "connections,outbox,media" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the first Confirm never reached its media step: %q", got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	second := make(chan result, 1)
+	go func() {
+		outcome, err := service.Confirm(context.Background(), testTenant, challenge.Code)
+		second <- result{outcome: outcome, err: err}
+	}()
+
+	// The second caller must still be waiting outside: no new step ran.
+	time.Sleep(100 * time.Millisecond)
+	if got := strings.Join(steps.snapshot(), ","); got != "connections,outbox,media" {
+		t.Fatalf("a second erasure started alongside the first: %q", got)
+	}
+
+	close(unblock)
+
+	res1 := <-first
+	if res1.err != nil {
+		t.Fatalf("first Confirm: %v", res1.err)
+	}
+	if res1.outcome != OutcomeErased {
+		t.Fatalf("first outcome = %v, want OutcomeErased", res1.outcome)
+	}
+	res2 := <-second
+	if res2.err != nil {
+		t.Fatalf("second Confirm: %v", res2.err)
+	}
+	if res2.outcome != OutcomeAlreadyErased {
+		t.Fatalf("second outcome = %v, want OutcomeAlreadyErased: it must see the completed row, not erase again", res2.outcome)
+	}
+
+	executions := 0
+	for _, step := range steps.snapshot() {
+		if step == "connections" {
+			executions++
+		}
+	}
+	if executions != 1 {
+		t.Fatalf("the deletion executed %d times, want exactly 1: %v", executions, steps.snapshot())
+	}
+}
+
+// TestTwoConcurrentConfirmsOfDifferentTenantsDoNotBlock: the exclusion is
+// per tenant, so one tenant's erasure never serialises another's.
+func TestTwoConcurrentConfirmsOfDifferentTenantsDoNotBlock(t *testing.T) {
+	challenges := newChallenges()
+	unblock := make(chan struct{})
+	steps := &fakeSteps{blockSteps: map[string]chan struct{}{"media": unblock}}
+	service := newService(t, challenges, steps)
+	other := Tenant{OwnerUserID: 22, OwnerTelegramUserID: 700002, BusinessConnectionID: "bc-2"}
+
+	firstChallenge, err := service.Request(context.Background(), testTenant)
+	if err != nil {
+		t.Fatalf("Request: %v", err)
+	}
+	secondChallenge, err := service.Request(context.Background(), other)
+	if err != nil {
+		t.Fatalf("other Request: %v", err)
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := service.Confirm(context.Background(), testTenant, firstChallenge.Code)
+		firstDone <- err
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if len(steps.snapshot()) >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the first Confirm never started")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// The other tenant's erasure runs to its own blocked media step while the
+	// first is still held: two tenants, two executors, no serialisation.
+	type result struct {
+		outcome Outcome
+		err     error
+	}
+	secondDone := make(chan result, 1)
+	go func() {
+		outcome, err := service.Confirm(context.Background(), other, secondChallenge.Code)
+		secondDone <- result{outcome: outcome, err: err}
+	}()
+
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		mediaCount := 0
+		for _, step := range steps.snapshot() {
+			if step == "media" {
+				mediaCount++
+			}
+		}
+		if mediaCount >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the other tenant's erasure never started alongside the first: %v", steps.snapshot())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	close(unblock)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first Confirm: %v", err)
+	}
+	res := <-secondDone
+	if res.err != nil || res.outcome != OutcomeErased {
+		t.Fatalf("second Confirm = (%v, %v), want (Erased, nil)", res.outcome, res.err)
+	}
+}
+
+// TestCompletedReceiptKeepsOnlyWhatTheReplayNeeds: the row the erasure
+// deliberately keeps is minimised on completion. The tenant key, the hash and
+// the timestamps stay (the replay looks the code up by them); the Telegram
+// identifier and the connection identifier, written at Issue time, are gone.
+func TestCompletedReceiptKeepsOnlyWhatTheReplayNeeds(t *testing.T) {
+	challenges := newChallenges()
+	service := newService(t, challenges, &fakeSteps{})
+
+	challenge, err := service.Request(context.Background(), testTenant)
+	if err != nil {
+		t.Fatalf("Request: %v", err)
+	}
+	hash := HashCode(challenge.Code)
+	if row := challenges.rows[hash]; row.telegramID != testTenant.OwnerTelegramUserID || row.connection != testTenant.BusinessConnectionID {
+		t.Fatalf("the pending request does not carry its identifiers: %+v", row)
+	}
+
+	if _, err := service.Confirm(context.Background(), testTenant, challenge.Code); err != nil {
+		t.Fatalf("Confirm: %v", err)
+	}
+	row, ok := challenges.rows[hash]
+	if !ok {
+		t.Fatal("the spent request is gone: a replayed confirmation would read as an unknown code")
+	}
+	if row.status != "completed" {
+		t.Fatalf("status = %q, want completed", row.status)
+	}
+	if row.telegramID != 0 || row.connection != "" {
+		t.Fatalf("the completed receipt still carries identifiers: %+v", row)
+	}
+	if row.owner != testTenant.OwnerUserID {
+		t.Fatalf("the receipt lost its tenant key: %+v", row)
 	}
 }

@@ -90,7 +90,7 @@ func testFetcher(cat *fakeCatalogue, res *fakeResolver, dl *fakeDownloader) *Fet
 			Bytes:   1024,
 		}}
 	}
-	return New(cat, res, dl, "token", slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	return New(cat, res, dl, "token", slog.New(slog.NewJSONHandler(io.Discard, nil)), nil)
 }
 
 func pendingFile(id int64) media.File {

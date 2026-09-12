@@ -14,6 +14,7 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/media"
 	"github.com/LouisMoretti/Undelete/bot/internal/metrics"
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
+	"github.com/LouisMoretti/Undelete/bot/internal/tenantexcl"
 )
 
 const (
@@ -71,8 +72,16 @@ type MediaSender interface {
 // available again if the process stops between Claim and acknowledgement:
 // delivery is therefore at-least-once, a duplicate alert remains possible.
 type Worker struct {
-	store    Store
-	sender   Sender
+	store  Store
+	sender Sender
+	// guard is the per-tenant exclusion shared with the erasure (same
+	// instance, wired in cmd/bot). One ProcessOne holds the shared side from
+	// the claim to the acknowledgement: an erasure waits for the in-flight
+	// delivery to settle, then drains the queue, so no alert claimed before
+	// the erasure is sent after it. Work that starts during an erasure waits,
+	// then claims from an emptied queue. Nil disables the coordination (unit
+	// tests); production always passes the shared guard.
+	guard    *tenantexcl.Guard
 	logger   *slog.Logger
 	lease    time.Duration
 	mediaDir string
@@ -88,8 +97,8 @@ func WithMediaDir(dir string) WorkerOption {
 	return func(w *Worker) { w.mediaDir = dir }
 }
 
-func NewWorker(store Store, sender Sender, logger *slog.Logger, opts ...WorkerOption) *Worker {
-	w := &Worker{store: store, sender: sender, logger: logger, lease: defaultLease}
+func NewWorker(store Store, sender Sender, logger *slog.Logger, guard *tenantexcl.Guard, opts ...WorkerOption) *Worker {
+	w := &Worker{store: store, sender: sender, logger: logger, lease: defaultLease, guard: guard}
 	for _, opt := range opts {
 		opt(w)
 	}
@@ -99,6 +108,16 @@ func NewWorker(store Store, sender Sender, logger *slog.Logger, opts ...WorkerOp
 // ProcessOne processes at most one alert for the tenant. The content, the
 // connection and the text of Telegram errors are never logged.
 func (w *Worker) ProcessOne(ctx context.Context, ownerUserID int64) (bool, error) {
+	if w.guard != nil {
+		release, err := w.guard.Shared(ctx, ownerUserID)
+		if err != nil {
+			if isShutdown(ctx, err) {
+				return false, nil
+			}
+			return false, fmt.Errorf("outbox exclusion: %w", err)
+		}
+		defer release()
+	}
 	job, err := w.store.Claim(ctx, ownerUserID, w.lease)
 	if err != nil {
 		if isShutdown(ctx, err) {

@@ -22,6 +22,7 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/messages"
 	"github.com/LouisMoretti/Undelete/bot/internal/outbox"
 	"github.com/LouisMoretti/Undelete/bot/internal/storage"
+	"github.com/LouisMoretti/Undelete/bot/internal/tenantexcl"
 	"github.com/LouisMoretti/Undelete/bot/internal/users"
 )
 
@@ -99,6 +100,7 @@ func TestPostgreSQL16Erasure(t *testing.T) {
 		Outbox:      outboxRepo,
 		Media:       mediaPurger,
 		Messages:    messagesRepo,
+		Guard:       tenantexcl.New(),
 		Logger:      logger,
 	})
 	if err != nil {

@@ -25,6 +25,7 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/outbox"
 	"github.com/LouisMoretti/Undelete/bot/internal/storage"
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
+	"github.com/LouisMoretti/Undelete/bot/internal/tenantexcl"
 	"github.com/LouisMoretti/Undelete/bot/internal/users"
 )
 
@@ -99,7 +100,13 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	fetcher := fetch.New(mediaRepo, client, downloader, cfg.TelegramBotToken, logger)
+	// One per-tenant exclusion for the whole process, shared by the erasure
+	// (exclusive side) and the two background writers (shared side): the
+	// media fetcher must not land a blob after the erasure swept the disk,
+	// and the outbox worker must not deliver an alert the erasure drained.
+	// It is also what serialises two concurrent erasures of one tenant.
+	guard := tenantexcl.New()
+	fetcher := fetch.New(mediaRepo, client, downloader, cfg.TelegramBotToken, logger, guard)
 
 	// Same root as the downloader and the outbox worker: the three of them
 	// resolve the paths of media_files against it, and a purger pointed
@@ -128,6 +135,7 @@ func run(logger *slog.Logger) error {
 		Outbox:      outboxRepo,
 		Media:       mediaPurger,
 		Messages:    messagesRepo,
+		Guard:       guard,
 		Logger:      logger,
 	})
 	if err != nil {
@@ -154,7 +162,7 @@ func run(logger *slog.Logger) error {
 		defer wg.Done()
 		// WithMediaDir: the same root the paths in media_files are relative
 		// to. Without it the worker would deliver every media alert as text.
-		worker := outbox.NewWorker(outboxRepo, client, logger, outbox.WithMediaDir(cfg.MediaDir))
+		worker := outbox.NewWorker(outboxRepo, client, logger, guard, outbox.WithMediaDir(cfg.MediaDir))
 		runOutboxLoop(ctx, usersRepo, worker, logger)
 	}()
 	go func() {

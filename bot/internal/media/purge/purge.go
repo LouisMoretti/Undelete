@@ -144,6 +144,10 @@ type Catalogue interface {
 	MarkPendingRetry(ctx context.Context, ownerUserID, id int64) error
 	DeleteStalePending(ctx context.Context, ownerUserID int64, maxAge time.Duration, retentionDays, limit int) (int64, error)
 	DeletePurged(ctx context.Context, ownerUserID int64, grace time.Duration, retentionDays, limit int) (int64, error)
+	// The two below serve EraseTenant only: retention never needs to see a row
+	// it is not allowed to delete yet, an erasure has to see them all.
+	ListTenantPage(ctx context.Context, ownerUserID, afterID int64, limit int) ([]media.File, error)
+	DeleteTenantBatch(ctx context.Context, ownerUserID int64, limit int) (int64, error)
 }
 
 // Config configures a Purger.
@@ -334,6 +338,165 @@ func (p *Purger) runTenant(ctx context.Context, tenant users.TenantRetention) (S
 	return stats, errors.Join(failures...)
 }
 
+// EraseTenant deletes EVERY attachment of one tenant -- blobs and rows -- and
+// returns the two counts. It serves /delete_my_data (internal/erasure) and
+// nothing else; retention never calls it.
+//
+// Same ordering as the retention path, for the same reason: the files go first,
+// located from the rows that name them, and only then the rows. A crash in
+// between leaves rows pointing at blobs that are already gone, which the next
+// run of this function simply re-visits (unlinking an absent file is a no-op).
+// The reverse order would leave blobs nothing points at any more, and only the
+// disk sweep below would ever find them.
+//
+// The sweep is what closes that loop. Once the rows are gone, the tenant's
+// storage subtree must hold nothing at all: no orphan from an earlier
+// interrupted attempt, no .dl-* temporary from a download the disabled
+// connection will never finish. It is deliberately NOT subject to the grace
+// periods of the reconciliation -- those exist to protect a download in flight,
+// and the tenant's connections were disabled before this ran.
+//
+// Two other deliberate differences from everything else in this package:
+//
+//   - it is not bounded per run. Every other sweep here may stop early and
+//     resume tomorrow, because retention has tomorrow; an erasure is answered
+//     with a message telling the owner their data is gone, so it either
+//     completes or reports an error. What bounds it is the tenant's own
+//     subtree.
+//   - MEDIA_PURGE_DRY_RUN does not apply. That switch holds back the deletions
+//     the bot decides on its own; this one was asked for, in writing, with a
+//     confirmation code. Honouring the dry run here would turn the confirmation
+//     message into a lie.
+//
+// A refusal (a symlink where a stored media should be, anything that is not a
+// plain regular file) aborts with an error rather than being counted and
+// skipped: the erasure must not report success over something it declined to
+// touch.
+func (p *Purger) EraseTenant(ctx context.Context, ownerUserID int64) (int64, int64, error) {
+	var files, rows int64
+
+	// Same guard as Run, and it matters more here: an unreachable root would
+	// make every unlink a silent no-op and this function would report a
+	// complete erasure of a disk it never looked at.
+	info, err := os.Stat(p.root)
+	switch {
+	case err != nil:
+		return 0, 0, fmt.Errorf("media erasure: unreachable media root: %w", err)
+	case !info.IsDir():
+		return 0, 0, fmt.Errorf("media erasure: media root %s is not a directory", p.root)
+	}
+
+	var cursor int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return files, rows, err
+		}
+		batch, err := p.cfg.Catalogue.ListTenantPage(ctx, ownerUserID, cursor, batchSize)
+		if err != nil {
+			return files, rows, err
+		}
+		for _, file := range batch {
+			cursor = file.ID
+			removed, err := p.removeFiles(file, "erasure", false)
+			files += removed.FilesDeleted
+			if err != nil {
+				return files, rows, fmt.Errorf("media erasure: tenant %d: %w", ownerUserID, err)
+			}
+		}
+		if len(batch) < batchSize {
+			break
+		}
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return files, rows, err
+		}
+		deleted, err := p.cfg.Catalogue.DeleteTenantBatch(ctx, ownerUserID, batchSize)
+		rows += deleted
+		if err != nil {
+			return files, rows, err
+		}
+		if deleted == 0 {
+			break
+		}
+	}
+
+	swept, err := p.eraseTenantTree(ownerUserID)
+	files += swept
+	return files, rows, err
+}
+
+// eraseTenantTree removes whatever is left under the tenant's own storage
+// subtree, then the directories that held it.
+//
+// Rooted at <root>/<ownerUserID>, the same scope reconcileDisk uses: one
+// tenant's erasure can never look at, let alone delete, another tenant's files.
+// Nothing outside that subtree is examined, and every unlink still goes through
+// the same path revalidation as the rest of the package.
+//
+// The directories are removed deepest first and best effort: a directory that
+// refuses to go is one that still holds something the walk declined to delete,
+// which the returned error already reports.
+func (p *Purger) eraseTenantTree(ownerUserID int64) (int64, error) {
+	tenantRoot := filepath.Join(p.root, strconv.FormatInt(ownerUserID, 10))
+
+	var deleted int64
+	var refusals []error
+	var dirs []string
+
+	walkErr := filepath.WalkDir(tenantRoot, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				// A tenant that never stored anything has no subtree.
+				return nil
+			}
+			return err
+		}
+		if entry.IsDir() {
+			dirs = append(dirs, path)
+			return nil
+		}
+
+		rel, relErr := filepath.Rel(p.root, path)
+		if relErr != nil {
+			refusals = append(refusals, fmt.Errorf("%w: %s", ErrUnsafeTarget, path))
+			return nil
+		}
+		// Covers symlinks as well: WalkDir reports one as an entry without
+		// descending into it, and it is refused rather than unlinked -- the
+		// package never decides on its own about something planted in the media
+		// tree, not even to delete it.
+		if !entry.Type().IsRegular() {
+			refusal := fmt.Errorf("%w: %s (%s)", ErrUnsafeTarget, rel, entry.Type())
+			refusals = append(refusals, refusal)
+			p.refused(rel, "irregular entry left by an erasure", refusal)
+			return nil
+		}
+		removed, err := p.remove(rel, "erasure", false)
+		if err != nil {
+			refusals = append(refusals, err)
+			p.refused(rel, "erasure target refused", err)
+			return nil
+		}
+		if removed {
+			deleted++
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return deleted, fmt.Errorf("media erasure: walking the media of tenant %d: %w", ownerUserID, walkErr)
+	}
+	if len(refusals) > 0 {
+		return deleted, errors.Join(refusals...)
+	}
+
+	for index := len(dirs) - 1; index >= 0; index-- {
+		_ = os.Remove(dirs[index])
+	}
+	return deleted, nil
+}
+
 // purgeExpired unlinks the blobs whose retention elapsed, then marks their row
 // purged. That order is the contract of this package: the crash window it
 // leaves open is the one reconcileRows can close.
@@ -364,7 +527,7 @@ func (p *Purger) purgeExpired(ctx context.Context, tenant users.TenantRetention)
 				return stats, nil
 			}
 			cursor = file.ID
-			unlinked, err := p.removeFiles(file, "retention")
+			unlinked, err := p.removeFiles(file, "retention", p.cfg.DryRun)
 			stats.add(unlinked)
 			if err != nil {
 				// Refusals are already counted and logged; they must not abort
@@ -717,7 +880,7 @@ func (p *Purger) sweepBatch(ctx context.Context, owner int64, batch []candidate)
 			// Possibly a file whose MarkStored has not committed yet.
 			continue
 		}
-		removed, err := p.remove(c.rel, "unreferenced")
+		removed, err := p.remove(c.rel, "unreferenced", p.cfg.DryRun)
 		if err != nil {
 			stats.Refused++
 			p.refused(c.rel, "unreferenced entry refused", err)
@@ -737,13 +900,18 @@ func (p *Purger) sweepBatch(ctx context.Context, owner int64, batch []candidate)
 
 // removeFiles unlinks the blob of a row and its thumbnail, and reports what it
 // did. A refusal on either one is returned so the caller leaves the row alone.
-func (p *Purger) removeFiles(file media.File, reason string) (Stats, error) {
+//
+// dryRun is a parameter rather than a read of the configuration because the two
+// callers do not mean the same thing by it: retention is what MEDIA_PURGE_DRY_RUN
+// exists to hold back, an erasure asked for by the owner is not (cf.
+// EraseTenant).
+func (p *Purger) removeFiles(file media.File, reason string, dryRun bool) (Stats, error) {
 	var stats Stats
 	for _, rel := range []string{file.RelativePath, file.ThumbnailRelativePath} {
 		if rel == "" {
 			continue
 		}
-		removed, err := p.remove(rel, reason)
+		removed, err := p.remove(rel, reason, dryRun)
 		if err != nil {
 			stats.Refused++
 			p.cfg.Logger.Warn("media purge: refusing to delete",
@@ -771,7 +939,7 @@ func (p *Purger) removeFiles(file media.File, reason string) (Stats, error) {
 //
 // An already absent file is a success, not an error: that is what makes the
 // whole purge replayable after a crash.
-func (p *Purger) remove(rel, reason string) (bool, error) {
+func (p *Purger) remove(rel, reason string, dryRun bool) (bool, error) {
 	full, err := p.resolve(rel)
 	if err != nil {
 		return false, err
@@ -787,7 +955,7 @@ func (p *Purger) remove(rel, reason string) (bool, error) {
 			ErrUnsafeTarget, rel, info.Mode().Type())
 	}
 
-	if p.cfg.DryRun {
+	if dryRun {
 		p.cfg.Logger.Info("media purge: dry run, would delete a file",
 			slog.String("reason", reason),
 			slog.Int64("bytes", info.Size()))

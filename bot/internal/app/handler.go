@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/LouisMoretti/Undelete/bot/internal/business"
+	"github.com/LouisMoretti/Undelete/bot/internal/erasure"
 	"github.com/LouisMoretti/Undelete/bot/internal/media"
 	"github.com/LouisMoretti/Undelete/bot/internal/messages"
 	"github.com/LouisMoretti/Undelete/bot/internal/metrics"
@@ -50,6 +51,15 @@ type alertSender interface {
 	SendMessage(ctx context.Context, req telegram.SendMessageRequest) error
 }
 
+// dataEraser is the subset of erasure.Service used by Handler: issue a
+// confirmation code, and spend one. An interface rather than the concrete type
+// so the command can be exercised without a database or a disk -- every branch
+// of it decides whether to destroy a tenant's data.
+type dataEraser interface {
+	Request(ctx context.Context, t erasure.Tenant) (erasure.Challenge, error)
+	Confirm(ctx context.Context, t erasure.Tenant, code string) (erasure.Outcome, error)
+}
+
 // Handler routes Telegram Business updates to business handling. Its
 // methods are called strictly sequentially by telegram.Poller (constraint
 // #5): no mutex protection is needed here, the call order IS the
@@ -64,7 +74,16 @@ type Handler struct {
 	// sender answers the owner's commands. Nil disables command handling
 	// entirely: messages keep being saved, a /privacy simply gets no answer.
 	sender alertSender
-	logger *slog.Logger
+	// eraser serves /delete_my_data. Nil disables that command alone: the
+	// command is then ignored exactly like an unknown one, silently, rather
+	// than answered with a promise nothing behind it can keep.
+	eraser dataEraser
+	// backupRetentionDays is BACKUP_RETENTION_DAYS, the maximum residual
+	// survival the erasure confirmation must state. Passed down rather than
+	// read from the environment here: the answer has to quote the value this
+	// deployment actually purges its dumps with.
+	backupRetentionDays int
+	logger              *slog.Logger
 }
 
 // Option configures a Handler. Used for what is optional by construction (the
@@ -74,6 +93,17 @@ type Option func(*Handler)
 // WithCommandSender enables the answers to the owner's commands (/privacy).
 func WithCommandSender(sender alertSender) Option {
 	return func(h *Handler) { h.sender = sender }
+}
+
+// WithDataEraser enables /delete_my_data. backupRetentionDays is what the
+// confirmation states as the maximum residual survival in the backups; it is
+// taken alongside the eraser rather than separately so a Handler can never
+// answer a completed erasure with a number nobody configured.
+func WithDataEraser(eraser dataEraser, backupRetentionDays int) Option {
+	return func(h *Handler) {
+		h.eraser = eraser
+		h.backupRetentionDays = backupRetentionDays
+	}
 }
 
 func NewHandler(businessSvc businessService, messagesRepo messageStore, mediaRepo mediaCatalogue, logger *slog.Logger, opts ...Option) *Handler {
@@ -257,6 +287,8 @@ func (h *Handler) answerCommand(ctx context.Context, conn *business.Connection, 
 	switch command {
 	case telegram.CommandPrivacy:
 		h.sendPrivacyPolicy(ctx, conn)
+	case telegram.CommandDeleteMyData:
+		h.handleDeleteMyData(ctx, conn, messageText(msg))
 	default:
 		h.logger.Debug("unknown command ignored",
 			slog.String("business_connection_id", conn.ID))
@@ -288,19 +320,9 @@ const commandAnswerTimeout = 10 * time.Second
 // less replay the message save that preceded it. A timeout is just one more
 // send failure: same log, same silence towards the poller.
 func (h *Handler) sendPrivacyPolicy(ctx context.Context, conn *business.Connection) {
-	ctx, cancel := context.WithTimeout(ctx, commandAnswerTimeout)
-	defer cancel()
-
 	requests := telegram.BuildPrivacyMessageRequests(conn.OwnerTelegramUserID, privacy.Text())
-	for index, req := range requests {
-		if err := h.sender.SendMessage(ctx, req); err != nil {
-			h.logger.Error("failed to send the privacy policy",
-				slog.String("business_connection_id", conn.ID),
-				slog.Int("chunk", index+1),
-				slog.Int("chunks", len(requests)),
-				slog.String("error", err.Error()))
-			return
-		}
+	if !h.sendCommandAnswer(ctx, conn, "privacy policy", requests) {
+		return
 	}
 
 	h.logger.Info("privacy policy sent",
@@ -308,6 +330,148 @@ func (h *Handler) sendPrivacyPolicy(ctx context.Context, conn *business.Connecti
 		slog.String("policy_version", privacy.Version()),
 		slog.String("policy_effective_date", privacy.EffectiveDate()),
 		slog.Int("chunks", len(requests)))
+}
+
+// sendCommandAnswer delivers the chunks of one command answer under
+// commandAnswerTimeout and reports whether all of them went out.
+//
+// Shared by every command rather than duplicated per command: the deadline is
+// the thing that keeps the poller moving, and a second copy of it is a second
+// place for it to be forgotten. The stop-at-first-failure rule is shared for
+// the same reason as it exists for /privacy -- half an answer is worse than
+// none, and a command is retried by typing it again.
+func (h *Handler) sendCommandAnswer(ctx context.Context, conn *business.Connection, what string, requests []telegram.SendMessageRequest) bool {
+	ctx, cancel := context.WithTimeout(ctx, commandAnswerTimeout)
+	defer cancel()
+
+	for index, req := range requests {
+		if err := h.sender.SendMessage(ctx, req); err != nil {
+			h.logger.Error("failed to send a command answer",
+				slog.String("answer", what),
+				slog.String("business_connection_id", conn.ID),
+				slog.Int("chunk", index+1),
+				slog.Int("chunks", len(requests)),
+				slog.String("error", err.Error()))
+			return false
+		}
+	}
+	return true
+}
+
+// erasureTimeout bounds the deletion itself, which -- like the answer it
+// precedes -- runs on the poller's single goroutine.
+//
+// It is much larger than commandAnswerTimeout because it covers a different
+// kind of work: several bounded DELETEs and the unlinking of every attachment
+// of one tenant. Blocking the poller for that long is acceptable precisely
+// because the first step of the erasure disables the tenant's connections, so
+// nothing of theirs is arriving meanwhile.
+//
+// Being cut short is not a corruption: the request stays 'consumed', and the
+// same code resubmitted resumes the erasure where it stopped (cf.
+// internal/erasure). That is what makes a ceiling here safe at all.
+const erasureTimeout = 60 * time.Second
+
+// handleDeleteMyData serves both halves of /delete_my_data: the bare command
+// issues a confirmation code, the command followed by that code spends it.
+//
+// Reached only through answerCommand, which has already established that the
+// sender IS the owner of the connection the message arrived through. A contact
+// typing either form gets nothing at all -- not an answer in the chat, not an
+// answer to themselves, and no erasure.
+//
+// Nothing is returned to the poller, for the same reason /privacy returns
+// nothing: an undelivered answer must never make an update look like it failed
+// and replay the message save that preceded it. A failed erasure is logged and
+// told to the owner, who can resume it with the same code.
+func (h *Handler) handleDeleteMyData(ctx context.Context, conn *business.Connection, text string) {
+	if h.eraser == nil {
+		h.logger.Debug("erasure command ignored: no eraser configured",
+			slog.String("business_connection_id", conn.ID))
+		return
+	}
+
+	tenant := erasure.Tenant{
+		OwnerUserID:          conn.OwnerUserID,
+		OwnerTelegramUserID:  conn.OwnerTelegramUserID,
+		BusinessConnectionID: conn.ID,
+	}
+	code := telegram.CommandArgument(text)
+	if code == "" {
+		h.requestErasure(ctx, conn, tenant)
+		return
+	}
+	h.confirmErasure(ctx, conn, tenant, code)
+}
+
+// requestErasure issues the challenge and sends it to the owner.
+//
+// The code is only ever held in memory between these two lines: the database
+// stores its hash, and no log line carries either. A challenge that cannot be
+// delivered is left to expire on its own rather than being retracted -- the
+// owner simply types the command again, and issuing a new code invalidates it.
+func (h *Handler) requestErasure(ctx context.Context, conn *business.Connection, tenant erasure.Tenant) {
+	requestCtx, cancel := context.WithTimeout(ctx, commandAnswerTimeout)
+	defer cancel()
+
+	challenge, err := h.eraser.Request(requestCtx, tenant)
+	if err != nil {
+		h.logger.Error("failed to issue an erasure challenge",
+			slog.String("business_connection_id", conn.ID),
+			slog.String("error", err.Error()))
+		return
+	}
+
+	h.sendCommandAnswer(ctx, conn, "erasure challenge", []telegram.SendMessageRequest{
+		telegram.BuildErasureChallengeRequest(conn.OwnerTelegramUserID, challenge.Code, erasure.ChallengeTTL),
+	})
+}
+
+// confirmErasure spends a submitted code and answers what it did.
+//
+// Every outcome gets an answer, including the refusals: a code that expired
+// while the owner was reading the message, or one mistyped, must not leave them
+// wondering whether their data is gone.
+func (h *Handler) confirmErasure(ctx context.Context, conn *business.Connection, tenant erasure.Tenant, code string) {
+	eraseCtx, cancel := context.WithTimeout(ctx, erasureTimeout)
+	defer cancel()
+
+	outcome, err := h.eraser.Confirm(eraseCtx, tenant, code)
+	if err != nil {
+		// Logged with ids only, never the code: the erasure is resumable and
+		// the owner is told so, but an operator reading this log must not be
+		// handed a spendable token.
+		h.logger.Error("erasure did not complete",
+			slog.String("business_connection_id", conn.ID),
+			slog.Int64("owner_user_id", conn.OwnerUserID),
+			slog.String("error", err.Error()))
+		h.sendCommandAnswer(ctx, conn, "erasure failure", []telegram.SendMessageRequest{
+			telegram.BuildErasureNoticeRequest(conn.OwnerTelegramUserID, telegram.ErasureFailedNotice),
+		})
+		return
+	}
+
+	var request telegram.SendMessageRequest
+	var what string
+	switch outcome {
+	case erasure.OutcomeErased:
+		request = telegram.BuildErasureConfirmationRequest(conn.OwnerTelegramUserID, h.backupRetentionDays)
+		what = "erasure confirmation"
+	case erasure.OutcomeAlreadyErased:
+		request = telegram.BuildErasureReplayRequest(conn.OwnerTelegramUserID, h.backupRetentionDays)
+		what = "erasure replay"
+	case erasure.OutcomeExpired:
+		request = telegram.BuildErasureNoticeRequest(conn.OwnerTelegramUserID, telegram.ErasureExpiredNotice)
+		what = "erasure expired code"
+	default:
+		request = telegram.BuildErasureNoticeRequest(conn.OwnerTelegramUserID, telegram.ErasureUnknownNotice)
+		what = "erasure unknown code"
+	}
+
+	h.sendCommandAnswer(ctx, conn, what, []telegram.SendMessageRequest{request})
+	h.logger.Info("erasure command answered",
+		slog.String("business_connection_id", conn.ID),
+		slog.String("answer", what))
 }
 
 // saveMedia catalogues the attachments of a message. The rows are created

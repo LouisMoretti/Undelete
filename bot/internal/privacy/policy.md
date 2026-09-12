@@ -1,6 +1,6 @@
 undelete — Privacy policy
 
-Version: 1.0
+Version: 1.1
 Effective date: 2026-09-12
 
 This document is the answer sent by the /privacy command, word for word.
@@ -82,9 +82,9 @@ deletion.
 8. SURVIVAL IN BACKUPS
 
 Backups are the honest exception to the paragraph above. A deletion in the
-database — retention purge or, later, an erasure command — only ever affects
-live data. It cannot rewrite backup archives that were already written: those
-keep their copy until they are purged in their own turn.
+database — retention purge or the /delete_my_data erasure command — only ever
+affects live data. It cannot rewrite backup archives that were already written:
+those keep their copy until they are purged in their own turn.
 
 Database dumps are purged after BACKUP_RETENTION_DAYS days (14 by default),
 which is therefore the real delay before the last trace of a message
@@ -102,12 +102,26 @@ offered by the bot.
   conversation, and the bot saves it like any other message. The answer comes
   back to you alone, as a private message from the bot, split into several
   messages and labelled with their number.
+- /delete_my_data erases everything this instance holds about you. It is typed
+  in the same place and answered the same way as /privacy, and it takes two
+  steps: typed alone it sends you a confirmation code, valid for a few minutes
+  and usable once; typed followed by that code it disables your Business
+  connections, then deletes your messages, your chat labels, your stored
+  attachments (rows AND files on disk) and the alerts still queued. Submitting
+  the same code again deletes nothing more and says so. A contact who types
+  either form receives nothing and erases nothing: only the holder of the
+  connection is answered.
+  The confirmation code is sent to you privately, but the command that spends
+  it is typed in a monitored chat, where your contact sees it like any other
+  message — that is why it expires quickly and works only for you.
 - Disabling the Business connection in your Telegram settings stops the
   capture immediately.
 - Lowering retention_days shortens how long everything is kept.
 
-An on-demand erasure command is not available yet; when it ships, it will be
-subject to section 8 like every other deletion.
+An erasure covers the live data of this instance, and it is subject to section
+8 like every other deletion: what an archive already holds stays there until
+that archive is purged in its own turn. Reconnecting undelete afterwards starts
+a new capture from zero.
 
 10. CHANGES
 

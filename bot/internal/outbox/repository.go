@@ -206,6 +206,37 @@ func (r *Repository) CountBacklog(ctx context.Context, tenants []users.TenantRet
 	return total, nil
 }
 
+// DeleteTenant removes every queued alert of one tenant, whatever its status,
+// and returns how many went. The outbox half of /delete_my_data
+// (internal/erasure), never called by retention.
+//
+// 'processing' rows are deleted too, and that is the point: a leased job is an
+// alert carrying a deleted message's content, already claimed by the worker and
+// about to be sent. Leaving those behind would let an alert from an erased
+// tenant reach Telegram after the owner was told their data is gone. A worker
+// holding such a lease fails its next MarkSent with ErrLeaseLost, which it
+// already knows how to survive.
+//
+// The window it cannot close is the send already in flight on the wire: one
+// alert can still land after this returns. Nothing on this side of the API can
+// unsend it, and the confirmation message says nothing that this would
+// contradict.
+func (r *Repository) DeleteTenant(ctx context.Context, ownerUserID int64) (int64, error) {
+	var deleted int64
+	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `DELETE FROM notification_outbox WHERE owner_user_id = $1`, ownerUserID)
+		if err != nil {
+			return fmt.Errorf("deleting queued alerts of tenant %d: %w", ownerUserID, err)
+		}
+		deleted = tag.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return deleted, nil
+}
+
 func (r *Repository) PurgeExpired(ctx context.Context, tenants []users.TenantRetention) (int64, error) {
 	var total int64
 	for _, tenant := range tenants {

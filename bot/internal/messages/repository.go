@@ -248,6 +248,43 @@ func (r *Repository) MarkDeleted(ctx context.Context, ownerUserID, ownerTelegram
 	return found, nil
 }
 
+// DeleteTenant deletes every message and every chat label of one tenant, and
+// returns the two counts. It is the messages half of /delete_my_data
+// (internal/erasure), never called by retention.
+//
+// One transaction for both tables: they are written together by Save, and a
+// crash between two separate deletions would leave chat labels describing
+// conversations whose messages are gone -- metadata about people the owner
+// just asked to have forgotten.
+//
+// Scoped to the tenant, in an InTenant transaction, with the owner_user_id
+// predicate on top: the RLS policy already restricts the DELETE, and the
+// predicate makes the intent unmissable when reading the query. Deliberately
+// unbounded, unlike every purge query in this package: a partial erasure that
+// reports success is worse than a long transaction, and the volume is bounded
+// by the tenant's own retention window (365 days at most).
+func (r *Repository) DeleteTenant(ctx context.Context, ownerUserID int64) (int64, int64, error) {
+	var deletedMessages, deletedChats int64
+	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `DELETE FROM messages WHERE owner_user_id = $1`, ownerUserID)
+		if err != nil {
+			return fmt.Errorf("deleting messages of tenant %d: %w", ownerUserID, err)
+		}
+		deletedMessages = tag.RowsAffected()
+
+		tag, err = tx.Exec(ctx, `DELETE FROM chats WHERE owner_user_id = $1`, ownerUserID)
+		if err != nil {
+			return fmt.Errorf("deleting chat labels of tenant %d: %w", ownerUserID, err)
+		}
+		deletedChats = tag.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return deletedMessages, deletedChats, nil
+}
+
 // PurgeExpired deletes messages whose retention has elapsed, tenant by
 // tenant.
 //

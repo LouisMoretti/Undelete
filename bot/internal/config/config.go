@@ -45,6 +45,16 @@ type Config struct {
 	// silent breach of the promise made to the owner.
 	MediaPurgeDryRun bool
 
+	// BackupRetentionDays mirrors the BACKUP_RETENTION_DAYS used by
+	// scripts/backup.sh to purge the daily dumps. The bot never reads or writes
+	// a backup; it needs the value for one sentence: the confirmation of
+	// /delete_my_data states the maximum residual survival of the data in the
+	// archives already written, and quoting a hardcoded 14 on a deployment that
+	// keeps them for 90 would be a false statement about deleted data.
+	// Defaults to defaultBackupRetentionDays, the same default backup.sh
+	// applies when the variable is absent.
+	BackupRetentionDays int
+
 	// HealthAddr is the listen address for the /livez, /readyz and
 	// /metrics probes. Defaults to defaultHealthAddr if HEALTH_ADDR is not
 	// set; an explicitly EMPTY value disables the server (no port opened).
@@ -62,6 +72,12 @@ const defaultHealthAddr = ":9090"
 // /app/media), the bot running with /app as its working directory.
 const defaultMediaDir = "media"
 
+// defaultBackupRetentionDays is the default of scripts/backup.sh, repeated here
+// because the bot has no way to ask the script what it applies. The two must
+// stay equal: this is the number the owner is told their deleted data can
+// survive in a dump.
+const defaultBackupRetentionDays = 14
+
 // Load reads the configuration from the environment and validates it.
 //
 // Refuses to start if DatabaseURL == MigrationDatabaseURL: if the two DSNs
@@ -78,6 +94,23 @@ func Load() (*Config, error) {
 		TelegramBotToken:     os.Getenv("TELEGRAM_BOT_TOKEN"),
 		HealthAddr:           defaultHealthAddr,
 		MediaDir:             defaultMediaDir,
+		BackupRetentionDays:  defaultBackupRetentionDays,
+	}
+
+	// Same parse rule as preflight.sh applies to the same variable: an integer,
+	// and a strictly positive one. A malformed or zero value would make the
+	// erasure confirmation state a survival time that matches nothing the
+	// backups actually do, so it fails at startup rather than being rounded to
+	// a default that contradicts the operator's intent.
+	if raw := strings.TrimSpace(os.Getenv("BACKUP_RETENTION_DAYS")); raw != "" {
+		days, err := strconv.Atoi(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid BACKUP_RETENTION_DAYS (expected an integer number of days): %w", err)
+		}
+		if days <= 0 {
+			return nil, fmt.Errorf("invalid BACKUP_RETENTION_DAYS: %d days; expected a positive number of days", days)
+		}
+		cfg.BackupRetentionDays = days
 	}
 
 	// An empty MEDIA_DIR is not a way to disable anything: it would resolve

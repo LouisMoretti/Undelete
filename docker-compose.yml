@@ -35,6 +35,12 @@ services:
       MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       OWNER_TELEGRAM_USER_ID: ${OWNER_TELEGRAM_USER_ID}
+      # The same variable the backup service below purges its archives with,
+      # and it must stay the same value: the bot never touches a backup, it
+      # only quotes this number to the owner as the maximum residual survival
+      # of the data an on-demand /delete_my_data just deleted. Two different
+      # values here and there would make that statement false.
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS}
       # Probes /livez, /readyz and /metrics. No "ports" here either: the port
       # stays internal to the Docker network, like Postgres.
       # Form ${VAR-default} and not ${VAR:-default}: a HEALTH_ADDR set to an

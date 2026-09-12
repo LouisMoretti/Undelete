@@ -14,6 +14,7 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/app"
 	"github.com/LouisMoretti/Undelete/bot/internal/business"
 	"github.com/LouisMoretti/Undelete/bot/internal/config"
+	"github.com/LouisMoretti/Undelete/bot/internal/erasure"
 	"github.com/LouisMoretti/Undelete/bot/internal/health"
 	"github.com/LouisMoretti/Undelete/bot/internal/media"
 	"github.com/LouisMoretti/Undelete/bot/internal/media/fetch"
@@ -85,9 +86,6 @@ func run(logger *slog.Logger) error {
 	outboxRepo := outbox.NewRepository(db)
 	mediaRepo := media.NewRepository(db)
 	businessSvc := business.NewService(db.Pool, client, usersRepo, cfg.OwnerTelegramUserID, logger)
-	// WithCommandSender: the same client the welcome message goes through.
-	// Without it the bot still saves everything, but /privacy stays silent.
-	handler := app.NewHandler(businessSvc, messagesRepo, mediaRepo, logger, app.WithCommandSender(client))
 
 	// Dedicated HTTP client for the downloads: a media transfer must not share
 	// the connection pool of the long-polling client, whose timeout is sized
@@ -118,6 +116,31 @@ func run(logger *slog.Logger) error {
 	if cfg.MediaPurgeDryRun {
 		logger.Warn("media retention purge running in DRY RUN: no file will be deleted")
 	}
+
+	// The erasure reuses the very components the capture is built on -- the
+	// same connection service (whose in-memory cache it has to invalidate), the
+	// same repositories, the same media purger and therefore the same media
+	// root. A second path to any of them would be a second place for the
+	// tenant scope to be got wrong.
+	eraser, err := erasure.New(erasure.Config{
+		Challenges:  erasure.NewRepository(db),
+		Connections: businessSvc,
+		Outbox:      outboxRepo,
+		Media:       mediaPurger,
+		Messages:    messagesRepo,
+		Logger:      logger,
+	})
+	if err != nil {
+		return err
+	}
+
+	// WithCommandSender: the same client the welcome message goes through.
+	// Without it the bot still saves everything, but /privacy stays silent.
+	// WithDataEraser adds /delete_my_data, and the number its confirmation
+	// quotes as the residual survival of the deleted data in the dumps.
+	handler := app.NewHandler(businessSvc, messagesRepo, mediaRepo, logger,
+		app.WithCommandSender(client),
+		app.WithDataEraser(eraser, cfg.BackupRetentionDays))
 
 	poller := telegram.NewPoller(client, logger)
 

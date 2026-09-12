@@ -126,6 +126,52 @@ func (s *Service) Resolve(ctx context.Context, connectionID string) (*Connection
 	return resolved, nil
 }
 
+// DisableOwner disables every Business connection of one owner and returns how
+// many rows changed. It is the first step of /delete_my_data
+// (internal/erasure): from here on, saveMessage ignores everything arriving
+// through those connections, so every later step of the erasure works on a set
+// that only shrinks.
+//
+// The cache update is not an optimisation, it is half the point. Resolve
+// answers from s.cache before ever reading the database, so a connection
+// disabled in PostgreSQL alone would keep being resolved as enabled for the
+// lifetime of the process -- and the poller would go on saving messages the
+// owner just asked to have erased. The two writes are ordered database first:
+// a failed UPDATE must leave the cache describing what the table actually says.
+//
+// The cache is rewritten even when no row changed. Zero rows means the
+// connections were already disabled, which is exactly the state the cache must
+// agree with.
+//
+// Nothing here is permanent against the owner's will: reconnecting from the
+// Telegram settings sends a business_connection update that re-enables the
+// connection and starts a fresh capture. An erasure deletes what was captured,
+// it does not ban the account.
+func (s *Service) DisableOwner(ctx context.Context, ownerUserID int64) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE business_connections
+		SET is_enabled = false, updated_at = now()
+		WHERE owner_user_id = $1 AND is_enabled
+	`, ownerUserID)
+	if err != nil {
+		return 0, fmt.Errorf("disabling business connections of owner %d: %w", ownerUserID, err)
+	}
+
+	s.mu.Lock()
+	for id, cached := range s.cache {
+		if cached.OwnerUserID == ownerUserID {
+			cached.IsEnabled = false
+			s.cache[id] = cached
+		}
+	}
+	s.mu.Unlock()
+
+	s.logger.Info("business connections disabled for erasure",
+		slog.Int64("owner_user_id", ownerUserID),
+		slog.Int64("connections", tag.RowsAffected()))
+	return tag.RowsAffected(), nil
+}
+
 func (s *Service) ownerAllowed(telegramUserID int64) bool {
 	return s.ownerFilter == 0 || telegramUserID == s.ownerFilter
 }

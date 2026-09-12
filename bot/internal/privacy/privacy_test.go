@@ -103,6 +103,19 @@ func TestPolicyCoversEveryRequiredTopic(t *testing.T) {
 		{topic: "backup survival", needles: []string{"BACKUP_RETENTION_DAYS", "already written"}},
 		{topic: "owner only", needles: []string{"only ever sent to the account holder", "third party asking for it receives nothing"}},
 		{topic: "the command itself", needles: []string{"/privacy"}},
+		// The erasure command is a promise the policy now makes, and every part
+		// of it is load-bearing: that it exists, that it is confirmed by a code
+		// that expires and works once, that it reaches the files on disk and not
+		// only the rows, and that a contact typing it erases nothing. A policy
+		// that keeps the command but drops one of those describes a different
+		// product.
+		{topic: "the erasure command", needles: []string{
+			"/delete_my_data",
+			"confirmation code",
+			"usable once",
+			"rows AND files on disk",
+			"A contact who types",
+		}},
 		// Where the command is typed is part of what the policy must disclose:
 		// the Bot API only delivers business updates, so the command lands in a
 		// monitored chat, in front of the contact, and is saved like any other

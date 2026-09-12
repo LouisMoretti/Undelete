@@ -487,6 +487,63 @@ func (r *Repository) ListStoredPage(ctx context.Context, ownerUserID, afterID in
 	return files, nil
 }
 
+// ListTenantPage returns at most limit attachments of the tenant with an id
+// strictly greater than afterID, ordered by id, WHATEVER their status.
+//
+// The status-blind counterpart of ListStoredPage, and it exists for
+// /delete_my_data alone: retention only ever looks at rows that describe a file
+// it may remove, whereas an erasure has to visit every row the tenant owns --
+// including a 'pending' one whose download just completed on disk and a
+// 'purged' one that still remembers a thumbnail.
+func (r *Repository) ListTenantPage(ctx context.Context, ownerUserID, afterID int64, limit int) ([]File, error) {
+	var files []File
+	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT`+selectColumns+`
+			FROM media_files
+			WHERE id > $1
+			ORDER BY id
+			LIMIT $2
+		`, afterID, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		files, err = scanFiles(rows)
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing media of tenant %d: %w", ownerUserID, err)
+	}
+	return files, nil
+}
+
+// DeleteTenantBatch deletes at most limit rows of the tenant and returns how
+// many went. The caller loops until it returns zero.
+//
+// Batched rather than one DELETE: the blobs were already unlinked row by row
+// before this is called, so there is nothing to gain from making the row
+// deletion atomic with anything, and a bounded statement keeps one erasure from
+// holding a lock over a catalogue of arbitrary size.
+func (r *Repository) DeleteTenantBatch(ctx context.Context, ownerUserID int64, limit int) (int64, error) {
+	var deleted int64
+	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			DELETE FROM media_files
+			WHERE id IN (SELECT id FROM media_files ORDER BY id LIMIT $1)
+		`, limit)
+		if err != nil {
+			return err
+		}
+		deleted = tag.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("deleting media rows of tenant %d: %w", ownerUserID, err)
+	}
+	return deleted, nil
+}
+
 // KnownPaths returns the subset of relPaths that a row of THIS tenant still
 // references, either as a file or as a thumbnail.
 //

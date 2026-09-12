@@ -120,6 +120,109 @@ func privacyLabelUnits(total int) int {
 	return utf16Units(fmt.Sprintf(privacyChunkLabelFormat, total, total)) + utf16Units(privacyLabelSeparator)
 }
 
+// The /delete_my_data texts. They live here, next to the welcome message and
+// the privacy chunk label, for the reason the whole package exists: every
+// string the bot sends is built in one place, where the wire contract (a direct
+// message to the owner, never a business_connection_id -- impossible by
+// construction on SendMessageRequest) is testable without a database.
+//
+// Each of them is a single message: unlike the policy, none comes close to the
+// 4096-unit limit, and a confirmation split in two would let the owner receive
+// the promise without the caveat that qualifies it.
+const (
+	// erasureBackupCaveat is the sentence the issue is really about, and it is
+	// deliberately phrased as a survival TIME rather than as a promise. A
+	// deletion in the database cannot rewrite an archive already written, so the
+	// only honest statement is how long those archives live -- and the media
+	// archives, which nothing purges automatically, are named rather than
+	// rounded into the same number.
+	erasureBackupCaveat = "Backups are the exception, and the limit is worth stating plainly: a deletion " +
+		"here cannot rewrite an archive that was already written. Database dumps are purged after " +
+		"%d days (BACKUP_RETENTION_DAYS), which is therefore the maximum residual survival of what " +
+		"was just deleted. Media archives are not purged automatically: they survive until the " +
+		"operator deletes them."
+
+	erasureChallengeText = "Data erasure requested.\n\n" +
+		"To confirm, send this exact command within %d minutes:\n\n" +
+		"%s %s\n\n" +
+		"It deletes, for this account: every saved message, every chat label, every stored " +
+		"attachment on disk and every alert still queued. The Business connections are disabled " +
+		"first, so nothing new is captured while it runs.\n\n" +
+		"The code works once and only for you. Doing nothing cancels it: the code simply expires."
+
+	erasureConfirmationText = "Data erasure complete.\n\n" +
+		"Your Business connections are disabled, and every saved message, chat label, stored " +
+		"attachment and queued alert of this account is gone from the database and from the disk " +
+		"of this instance.\n\n" +
+		"%s\n\n" +
+		"Reconnecting undelete from your Telegram settings starts a new capture from zero; nothing " +
+		"that was deleted comes back."
+
+	erasureReplayText = "Nothing left to erase.\n\n" +
+		"This confirmation code was already used, and the data it covered is already gone. Nothing " +
+		"was deleted a second time.\n\n" +
+		"%s"
+
+	// ErasureExpiredNotice and ErasureUnknownNotice both send the owner back to
+	// the same place, and neither says which of the two happened in a way a
+	// third party could use: the answer only ever reaches the owner anyway.
+	ErasureExpiredNotice = "This confirmation code has expired. A code is valid for a few minutes only; " +
+		"send /delete_my_data again to get a new one. Nothing was deleted."
+
+	ErasureUnknownNotice = "This confirmation code is not valid. Send /delete_my_data to get a new one. " +
+		"Nothing was deleted."
+
+	// ErasureFailedNotice is the honest answer to a half-done erasure: the
+	// deletion is resumable, the same code still spends it, and what is already
+	// deleted is not coming back.
+	ErasureFailedNotice = "The erasure did not finish. Part of your data may already be deleted, and what " +
+		"is deleted does not come back. Send the same /delete_my_data command with the same code " +
+		"again to resume it."
+)
+
+// BuildErasureChallengeRequest builds the message that hands the owner a
+// confirmation code.
+//
+// The code travels to the owner's private conversation with the bot, but the
+// confirmation is typed back in a monitored chat -- the Bot API delivers no
+// other kind of message -- where the contact sees it. That exposure is bounded
+// by the short validity window and made harmless by the sender check: a contact
+// re-typing the code is not the owner of the connection, so the bot never even
+// reads their command as one.
+func BuildErasureChallengeRequest(ownerTelegramUserID int64, code string, ttl time.Duration) SendMessageRequest {
+	minutes := int(ttl.Round(time.Minute) / time.Minute)
+	return SendMessageRequest{
+		ChatID: ownerTelegramUserID,
+		Text:   fmt.Sprintf(erasureChallengeText, minutes, CommandDeleteMyData, code),
+	}
+}
+
+// BuildErasureConfirmationRequest builds the final confirmation, which states
+// the maximum residual survival in the backups without ever promising an
+// erasure OF them.
+func BuildErasureConfirmationRequest(ownerTelegramUserID int64, backupRetentionDays int) SendMessageRequest {
+	return SendMessageRequest{
+		ChatID: ownerTelegramUserID,
+		Text:   fmt.Sprintf(erasureConfirmationText, fmt.Sprintf(erasureBackupCaveat, backupRetentionDays)),
+	}
+}
+
+// BuildErasureReplayRequest answers a confirmation code submitted again after
+// its erasure already completed. It repeats the backup caveat rather than
+// referring back to a message the owner may no longer have in view.
+func BuildErasureReplayRequest(ownerTelegramUserID int64, backupRetentionDays int) SendMessageRequest {
+	return SendMessageRequest{
+		ChatID: ownerTelegramUserID,
+		Text:   fmt.Sprintf(erasureReplayText, fmt.Sprintf(erasureBackupCaveat, backupRetentionDays)),
+	}
+}
+
+// BuildErasureNoticeRequest wraps one of the Erasure*Notice texts into the same
+// owner-only, connection-less envelope as every other answer.
+func BuildErasureNoticeRequest(ownerTelegramUserID int64, notice string) SendMessageRequest {
+	return SendMessageRequest{ChatID: ownerTelegramUserID, Text: notice}
+}
+
 // MediaUnavailableNote is appended to the text of a media alert that could not
 // carry its files (purged from disk, storage unmounted, file above the Bot API
 // limit, definitive Telegram refusal). The owner is told a media existed rather

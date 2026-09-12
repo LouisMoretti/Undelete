@@ -271,7 +271,40 @@ branch ruleset* / *Add rule* on `main`) — not automatable from this repository
    label to make alerts readable, with no activation flag, and is never
    consulted to decide what to save or notify.
 
+## Commands
+
+| Command | Who | Answer |
+|---|---|---|
+| `/privacy` | the account holder only | the privacy policy, as a direct message from the bot |
+
+**Where to type them.** `allowed_updates` requests the four `business_*`
+types and nothing else (the explicit `allowed_updates` constraint), so a plain
+`message` sent to the bot is never delivered to it. Commands are therefore typed **inside a chat covered by
+the Business connection**, where they arrive as `business_message` like any
+other message — the holder's own outgoing messages included.
+
+**Who gets answered.** Only the holder of the connection the command arrived
+through: the sender's `telegram_user_id` is compared against the owner
+resolved from `business_connections`. A contact writing `/privacy` in a
+monitored chat receives nothing at all — no answer in the chat, no answer to
+themselves. The reply goes out as a direct message from the bot, without
+`business_connection_id` (the alerts-without-`business_connection_id`
+constraint), and never into the chat where the command was typed. The command
+itself is saved like any other message (the exhaustive-and-automatic-saving
+constraint), and it stays visible in the conversation it was typed in: the
+answer is private, the command is not.
+
+The answer is labelled `Privacy policy (1/2)`, `(2/2)`: the document does not
+fit in one Telegram message, and a delivery that stops short must be readable
+as incomplete rather than pass for the whole policy.
+
 ## Privacy
+
+The policy served by `/privacy` is
+[`bot/internal/privacy/policy.md`](bot/internal/privacy/policy.md), versioned
+here and embedded in the binary: the command sends that document verbatim, and
+its version and effective date are read back from it, so the text a user
+receives and the text reviewed here cannot describe two different policies.
 
 - Every private conversation exposed by the active Business connection is
   saved in full (text), with no per-conversation opt-out.
@@ -289,14 +322,16 @@ branch ruleset* / *Add rule* on `main`) — not automatable from this repository
   backup retention duration (`BACKUP_RETENTION_DAYS`) is, in effect, the
   residual survival time of data after a future `/delete_my_data` command:
   rows deleted in the database remain present in already-written archives
-  until their own purge. To be documented explicitly in a future `/privacy`
-  command.
+  until their own purge. Section 8 of the policy states this explicitly, in
+  wording that stays true once content encryption (Phase 4) lands: an erasure
+  never rewrites an archive already written.
 
 ## Roadmap by phases
 
 - **Phase 1 (this task)**: mono-tenant, plaintext text, RLS in place.
 - **Phase 2**: media (`media_files` table, backup of `./media` separately
-  from SQL dumps), GDPR commands (`/delete_my_data`, `/privacy`).
+  from SQL dumps), GDPR commands (`/privacy` shipped, `/delete_my_data` still
+  to come).
 - **Phase 3**: real multi-tenancy (several simultaneous account holders,
   removal of the `OWNER_TELEGRAM_USER_ID` guard).
 - **Phase 4**: content encryption (`text_encrypted BYTEA`, AES-256-GCM,

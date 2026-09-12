@@ -485,7 +485,23 @@ const commandAnswerTimeout = 10 * time.Second
 // less replay the message save that preceded it. A timeout is just one more
 // send failure: same log, same silence towards the poller.
 func (h *Handler) sendPrivacyPolicy(ctx context.Context, conn *business.Connection) {
-	requests := telegram.BuildPrivacyMessageRequests(conn.OwnerTelegramUserID, privacy.Text())
+	h.sendPrivacyAnswer(ctx, conn, telegram.BuildPrivacyMessageRequests(conn.OwnerTelegramUserID, privacy.Text()))
+}
+
+// sendPrivacyAnswer delivers prebuilt policy chunks and logs the outcome.
+// Split out from sendPrivacyPolicy so the empty-document guard stays
+// unit-testable: the real policy never produces zero chunks, so no update
+// flowing through HandleUpdate can exercise that branch.
+func (h *Handler) sendPrivacyAnswer(ctx context.Context, conn *business.Connection, requests []telegram.SendMessageRequest) {
+	if len(requests) == 0 {
+		// BuildPrivacyMessageRequests returns nil for an empty document.
+		// Without this guard the send below would be a no-op and the Info
+		// would still claim "privacy policy sent, chunks=0".
+		h.logger.Error("privacy policy produced no chunks, nothing sent",
+			slog.String("business_connection_id", conn.ID),
+			slog.String("policy_version", privacy.Version()))
+		return
+	}
 	if !h.sendCommandAnswer(ctx, conn, "privacy policy", requests) {
 		return
 	}
@@ -505,6 +521,10 @@ func (h *Handler) sendPrivacyPolicy(ctx context.Context, conn *business.Connecti
 // place for it to be forgotten. The stop-at-first-failure rule is shared for
 // the same reason as it exists for /privacy -- half an answer is worse than
 // none, and a command is retried by typing it again.
+//
+// The chunks go out back to back, with no delay between them: acceptable at
+// the two chunks the policy needs today, to be revisited if the document
+// grows enough to need many more.
 func (h *Handler) sendCommandAnswer(ctx context.Context, conn *business.Connection, what string, requests []telegram.SendMessageRequest) bool {
 	ctx, cancel := context.WithTimeout(ctx, commandAnswerTimeout)
 	defer cancel()

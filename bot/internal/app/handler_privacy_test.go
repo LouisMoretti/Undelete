@@ -1,9 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -39,7 +41,8 @@ func (f *fakeSender) SendMessage(ctx context.Context, req telegram.SendMessageRe
 
 // ownerMessage is a /privacy typed by the account holder in a chat covered by
 // the connection — the only shape the Bot API can deliver, since
-// allowed_updates never includes a plain `message` (constraint #2).
+// allowed_updates never includes a plain `message` (the explicit
+// `allowed_updates` constraint).
 func ownerMessage(text string) *telegram.Message {
 	msg := testMessage()
 	msg.From = &telegram.User{ID: 700001, FirstName: "Louis"}
@@ -59,7 +62,7 @@ func newPrivacyHandler(sender *fakeSender) (*Handler, *fakeMessages) {
 
 // TestPrivacyCommandAnswersTheOwner is the happy path: the holder types
 // /privacy in a monitored chat, the message is saved like any other
-// (constraint #8), and the policy comes back as a direct message to the
+// (the exhaustive-and-automatic-saving constraint), and the policy comes back as a direct message to the
 // holder — never into the chat it was typed in.
 func TestPrivacyCommandAnswersTheOwner(t *testing.T) {
 	sender := &fakeSender{}
@@ -371,6 +374,29 @@ func TestPrivacyAnswerDoesNotWaitForAStalledSender(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("HandleUpdate is still waiting on the sender: the command answer is not bounded")
+	}
+}
+
+// TestPrivacyAnswerWithNoChunksLogsAnError: BuildPrivacyMessageRequests
+// returns nil for an empty document, so a zero-chunk answer must log an error
+// and send nothing -- never the success line with chunks=0.
+func TestPrivacyAnswerWithNoChunksLogsAnError(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	biz := &fakeBusiness{connections: map[string]*business.Connection{"bc-1": enabledConn()}}
+	sender := &fakeSender{}
+	h := NewHandler(biz, &fakeMessages{}, &fakeMedia{}, logger, WithCommandSender(sender))
+
+	h.sendPrivacyAnswer(context.Background(), enabledConn(), nil)
+
+	if len(sender.sent) != 0 {
+		t.Fatalf("%d message(s) sent, want 0: there were no chunks to send", len(sender.sent))
+	}
+	if !strings.Contains(logs.String(), "produced no chunks") {
+		t.Fatalf("no error logged for the zero-chunk answer: %q", logs.String())
+	}
+	if strings.Contains(logs.String(), "privacy policy sent") {
+		t.Fatalf("the success line was logged for an answer that sent nothing: %q", logs.String())
 	}
 }
 

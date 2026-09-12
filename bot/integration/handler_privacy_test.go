@@ -4,6 +4,7 @@ package integration_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -136,7 +137,15 @@ func TestPrivacyCommandAnswersOnlyTheConnectionOwner(t *testing.T) {
 		if req.ChatID != ownerTelegramID {
 			t.Fatalf("chunk %d: chat_id = %d, want the owner's telegram_user_id (%d)", index, req.ChatID, ownerTelegramID)
 		}
-		rebuilt.WriteString(req.Text)
+		// Each chunk announces its rank and the real total, so a delivery that
+		// stops short reads as incomplete instead of passing for the whole
+		// policy. Stripping the label is also how the document is checked
+		// whole.
+		prefix := fmt.Sprintf("Privacy policy (%d/%d)\n\n", index+1, len(sender.sent))
+		if !strings.HasPrefix(req.Text, prefix) {
+			t.Fatalf("chunk %d does not start with %q", index, prefix)
+		}
+		rebuilt.WriteString(strings.TrimPrefix(req.Text, prefix))
 	}
 	if rebuilt.String() != privacy.Text() {
 		t.Fatal("the delivered answer is not the policy document, whole and in order")

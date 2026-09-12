@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/LouisMoretti/Undelete/bot/internal/business"
 	"github.com/LouisMoretti/Undelete/bot/internal/media"
@@ -205,15 +206,17 @@ func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited
 // covered by the connection.
 //
 // Why a monitored chat and not a direct conversation with the bot: the
-// allowed_updates list is the four business_* types (constraint #2), so a
-// plain `message` addressed to the bot is never delivered. What the bot does
-// receive is every business_message, the holder's own outgoing messages
-// included -- that is where the command is read from.
+// allowed_updates list is the four business_* types (the explicit
+// allowed_updates constraint), so a plain `message` addressed to the bot is
+// never delivered. What the bot does receive is every business_message, the
+// holder's own outgoing messages included -- that is where the command is read
+// from.
 //
 // The answer goes out as a direct message from the bot to the holder, on
-// their own Telegram id, and NEVER carries a business_connection_id
-// (constraint #7, enforced by SendMessageRequest itself): the policy must not
-// appear, signed by the holder, in the conversation where it was typed.
+// their own Telegram id, and NEVER carries a business_connection_id (the
+// alerts-without-business_connection_id constraint, enforced by
+// SendMessageRequest itself): the policy must not appear, signed by the holder,
+// in the conversation where it was typed.
 //
 // Only the holder is answered. A contact who writes /privacy in a monitored
 // chat gets nothing at all: not an answer in the chat, not an answer to
@@ -247,15 +250,34 @@ func (h *Handler) answerCommand(ctx context.Context, conn *business.Connection, 
 	}
 }
 
+// commandAnswerTimeout bounds the whole answer to one command, every chunk and
+// every Telegram retry included.
+//
+// Why a bound at all: this runs on the poller's single goroutine (the
+// sequential-update-processing invariant), so getUpdates is blocked until it
+// returns, and telegram.Client retries three times while honouring an
+// unbounded 429 retry_after. Without a ceiling, one /privacy could park the
+// poller on Telegram's backoff and delay the deleted_business_messages updates
+// that carry content existing nowhere else.
+// Ten seconds is generous for two sendMessage calls and still short enough
+// that a deletion arriving meanwhile is handled within the same poll cycle.
+const commandAnswerTimeout = 10 * time.Second
+
 // sendPrivacyPolicy delivers the policy, split into chunks that respect the
-// Telegram limit in UTF-16 units.
+// Telegram limit in UTF-16 units and each labelled "Privacy policy (i/n)".
 //
 // A failed send is logged and stops the remaining chunks: sending the rest
 // would leave the holder with a document missing its middle, and a command is
-// retried by typing it again. Nothing is returned to the poller either -- an
-// undelivered policy must never make an update look like it failed, still
-// less replay the message save that preceded it.
+// retried by typing it again. The label is what makes that visible on the
+// receiving side -- a policy stopping at "(1/2)" reads as incomplete, where an
+// unlabelled one would look whole. Nothing is returned to the poller either --
+// an undelivered policy must never make an update look like it failed, still
+// less replay the message save that preceded it. A timeout is just one more
+// send failure: same log, same silence towards the poller.
 func (h *Handler) sendPrivacyPolicy(ctx context.Context, conn *business.Connection) {
+	ctx, cancel := context.WithTimeout(ctx, commandAnswerTimeout)
+	defer cancel()
+
 	requests := telegram.BuildPrivacyMessageRequests(conn.OwnerTelegramUserID, privacy.Text())
 	for index, req := range requests {
 		if err := h.sender.SendMessage(ctx, req); err != nil {

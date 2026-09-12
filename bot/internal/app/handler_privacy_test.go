@@ -3,8 +3,10 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LouisMoretti/Undelete/bot/internal/business"
 	"github.com/LouisMoretti/Undelete/bot/internal/privacy"
@@ -12,14 +14,19 @@ import (
 )
 
 // fakeSender records what the handler asks Telegram to send, and can fail on
-// demand at a chosen call.
+// demand at a chosen call. It also records the deadline each call was given:
+// the answer runs on the poller's goroutine, so the absence of a deadline is a
+// defect in itself.
 type fakeSender struct {
-	sent    []telegram.SendMessageRequest
-	failAt  int // 1-based index of the call that fails; 0 = never fails
-	sendErr error
+	sent      []telegram.SendMessageRequest
+	deadlines []time.Time
+	failAt    int // 1-based index of the call that fails; 0 = never fails
+	sendErr   error
 }
 
-func (f *fakeSender) SendMessage(_ context.Context, req telegram.SendMessageRequest) error {
+func (f *fakeSender) SendMessage(ctx context.Context, req telegram.SendMessageRequest) error {
+	deadline, _ := ctx.Deadline()
+	f.deadlines = append(f.deadlines, deadline)
 	f.sent = append(f.sent, req)
 	if f.failAt > 0 && len(f.sent) == f.failAt {
 		if f.sendErr == nil {
@@ -78,7 +85,7 @@ func TestPrivacyCommandAnswersTheOwner(t *testing.T) {
 		if req.ChatID == msg.Chat.ID {
 			t.Fatalf("chunk %d was sent into the monitored chat", index)
 		}
-		rebuilt.WriteString(req.Text)
+		rebuilt.WriteString(policyBody(t, sender.sent, index))
 	}
 	if rebuilt.String() != privacy.Text() {
 		t.Fatal("the answer is not the policy document, whole and in order")
@@ -86,6 +93,18 @@ func TestPrivacyCommandAnswersTheOwner(t *testing.T) {
 	if len(sender.sent) < 2 {
 		t.Fatalf("chunks = %d: the policy is longer than one Telegram message, the split must happen", len(sender.sent))
 	}
+}
+
+// policyBody strips the label of a chunk and, in doing so, asserts that the
+// total it announces is the number of messages actually sent: a label promising
+// three messages when two went out would hide exactly what it exists to reveal.
+func policyBody(t *testing.T, sent []telegram.SendMessageRequest, index int) string {
+	t.Helper()
+	prefix := fmt.Sprintf("Privacy policy (%d/%d)\n\n", index+1, len(sent))
+	if !strings.HasPrefix(sent[index].Text, prefix) {
+		t.Fatalf("chunk %d does not start with %q", index, prefix)
+	}
+	return strings.TrimPrefix(sent[index].Text, prefix)
 }
 
 // TestPrivacyCommandAcceptsTheWireShapes: Telegram appends @botname, and the
@@ -273,6 +292,85 @@ func TestPrivacyAnswerFailureIsNotAnUpdateFailure(t *testing.T) {
 	}
 	if len(msgs.saved) != 1 {
 		t.Fatalf("saved messages = %d, want 1", len(msgs.saved))
+	}
+
+	// What the owner is left with must be readable as incomplete: the chunk
+	// that did go out announces a total the owner never received.
+	if !strings.HasPrefix(sender.sent[0].Text, "Privacy policy (1/") {
+		t.Fatalf("the delivered chunk carries no label: %q", sender.sent[0].Text[:40])
+	}
+	if strings.HasPrefix(sender.sent[0].Text, "Privacy policy (1/1)") {
+		t.Fatal("the delivered chunk claims to be the whole policy, yet the rest was dropped")
+	}
+}
+
+// TestPrivacyAnswerRunsUnderADeadline: the answer is built and sent on the
+// poller's single goroutine, which getUpdates cannot leave until it returns.
+// telegram.Client retries three times and honours an unbounded 429
+// retry_after, so the deadline is the only thing keeping one /privacy from
+// parking the poller -- and delaying the deleted_business_messages updates
+// that carry content existing nowhere else.
+func TestPrivacyAnswerRunsUnderADeadline(t *testing.T) {
+	sender := &fakeSender{}
+	h, _ := newPrivacyHandler(sender)
+
+	if err := h.HandleUpdate(context.Background(), telegram.Update{UpdateID: 1, BusinessMessage: ownerMessage("/privacy")}); err != nil {
+		t.Fatalf("HandleUpdate: %v", err)
+	}
+	// The ceiling is measured AFTER the call: every deadline was set during it,
+	// so none of them may reach further than now plus the timeout.
+	ceiling := time.Now().Add(commandAnswerTimeout)
+
+	if len(sender.deadlines) == 0 {
+		t.Fatal("no answer sent to the owner")
+	}
+	for index, deadline := range sender.deadlines {
+		if deadline.IsZero() {
+			t.Fatalf("chunk %d was sent on a context with no deadline: an unbounded retry_after would block the poller", index)
+		}
+		if deadline.After(ceiling) {
+			t.Fatalf("chunk %d may run %v past commandAnswerTimeout (%v)",
+				index, deadline.Sub(ceiling), commandAnswerTimeout)
+		}
+	}
+}
+
+// blockingSender waits for its context to end before returning, the way
+// telegram.Client does while honouring a retry_after.
+type blockingSender struct{}
+
+func (blockingSender) SendMessage(ctx context.Context, _ telegram.SendMessageRequest) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestPrivacyAnswerDoesNotWaitForAStalledSender is the behaviour the deadline
+// buys: a sender that never comes back releases the poller anyway, and the
+// failure stays a logged failure.
+//
+// The bound exercised here is a 50 ms parent deadline rather than the 10 s
+// constant -- same mechanism, and a unit test that sleeps ten seconds is a test
+// nobody runs. That the constant itself is applied is what
+// TestPrivacyAnswerRunsUnderADeadline asserts.
+func TestPrivacyAnswerDoesNotWaitForAStalledSender(t *testing.T) {
+	biz := &fakeBusiness{connections: map[string]*business.Connection{"bc-1": enabledConn()}}
+	h := NewHandler(biz, &fakeMessages{}, &fakeMedia{}, testLogger(), WithCommandSender(blockingSender{}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- h.HandleUpdate(ctx, telegram.Update{UpdateID: 1, BusinessMessage: ownerMessage("/privacy")})
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("a stalled send must not surface as an update failure, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("HandleUpdate is still waiting on the sender: the command answer is not bounded")
 	}
 }
 

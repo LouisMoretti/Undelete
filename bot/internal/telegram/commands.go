@@ -1,6 +1,9 @@
 package telegram
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+)
 
 // CommandPrivacy is the command that returns the privacy policy.
 const CommandPrivacy = "/privacy"
@@ -24,7 +27,11 @@ func ParseCommand(text string) (string, bool) {
 	}
 
 	command := text
-	if index := strings.IndexAny(command, " \t\n"); index >= 0 {
+	// Any whitespace ends the command, not a hand-picked list of three: a
+	// Telegram client on Windows sends CRLF, and "/privacy\r" would otherwise
+	// match no command at all. unicode.IsSpace also covers the non-breaking
+	// and ideographic spaces mobile keyboards insert.
+	if index := strings.IndexFunc(command, unicode.IsSpace); index >= 0 {
 		command = command[:index]
 	}
 	if index := strings.Index(command, "@"); index >= 0 {

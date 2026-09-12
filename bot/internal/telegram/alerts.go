@@ -62,24 +62,62 @@ func BuildDeletionMessageRequests(alert DeletionAlert) []SendMessageRequest {
 	return requests
 }
 
+// privacyChunkLabelFormat labels every chunk of the /privacy answer with its
+// rank and the total, e.g. "Privacy policy (1/2)". It is not decoration: the
+// sending loop stops at the first failure, so without the total a truncated
+// policy would be indistinguishable from a complete one for the only person
+// who receives it.
+const privacyChunkLabelFormat = "Privacy policy (%d/%d)"
+
+// privacyLabelSeparator sits between the label and the policy text. Its own
+// length counts against the Telegram limit like any other character.
+const privacyLabelSeparator = "\n\n"
+
 // BuildPrivacyMessageRequests builds the answer of the /privacy command and
 // splits it on the same Telegram limit as any other alert.
 //
 // ownerTelegramUserID is the ONLY recipient: the policy travels as a direct
 // message from the bot to the account holder, never with a
-// business_connection_id (constraint 7), which would post it as the holder
-// inside the monitored conversation the command was typed in.
+// business_connection_id (the alerts-without-business_connection_id
+// constraint), which would post it as the holder inside the monitored
+// conversation the command was typed in.
 //
 // The policy is a long document that will not fit in a single message: the
 // split is not a defensive precaution here, it is the normal path, and the
-// chunks stay in order.
+// chunks stay in order. The label is part of the message, so the 4096-unit
+// limit applies to the FINAL text, label included -- the same rule the
+// identity header of a deletion alert follows.
 func BuildPrivacyMessageRequests(ownerTelegramUserID int64, policyText string) []SendMessageRequest {
-	chunks := splitTelegramText(policyText, telegramTextLimit)
+	// The label announces the total, and the total depends on how much room
+	// the label leaves: the two are resolved together. Assuming fewer chunks
+	// than there are can only under-reserve, never overflow a budget already
+	// used, so the assumption is raised until it holds. The loop terminates
+	// because each round raises it strictly and a chunk always carries at
+	// least one character.
+	total := 1
+	chunks := splitPolicyText(policyText, telegramTextLimit-privacyLabelUnits(total))
+	for len(chunks) > total {
+		total = len(chunks)
+		chunks = splitPolicyText(policyText, telegramTextLimit-privacyLabelUnits(total))
+	}
+
 	requests := make([]SendMessageRequest, 0, len(chunks))
-	for _, chunk := range chunks {
-		requests = append(requests, SendMessageRequest{ChatID: ownerTelegramUserID, Text: chunk})
+	for index, chunk := range chunks {
+		label := fmt.Sprintf(privacyChunkLabelFormat, index+1, len(chunks))
+		requests = append(requests, SendMessageRequest{
+			ChatID: ownerTelegramUserID,
+			Text:   label + privacyLabelSeparator + chunk,
+		})
 	}
 	return requests
+}
+
+// privacyLabelUnits is the room the label of a chunk takes, for an answer made
+// of total chunks. The widest label of that answer is the one of its last
+// chunk ("(total/total)"): reserving that much keeps every chunk under the
+// limit, not just the first nine.
+func privacyLabelUnits(total int) int {
+	return utf16Units(fmt.Sprintf(privacyChunkLabelFormat, total, total)) + utf16Units(privacyLabelSeparator)
 }
 
 // MediaUnavailableNote is appended to the text of a media alert that could not
@@ -175,6 +213,96 @@ func formatAlertDate(telegramDate int64) string {
 	return time.Unix(telegramDate, 0).UTC().Format("2006-01-02 15:04 UTC")
 }
 
+// splitPolicyText splits a long document into messages of at most limit UTF-16
+// units, cutting on paragraph boundaries rather than wherever the limit falls.
+//
+// Why: a blind split lands mid-word -- measured on the real policy, it cut
+// "purged au|tomatically" in the middle of the sentence saying media archives
+// are not purged. A document whose sentences survive the split is the point of
+// serving a policy at all.
+//
+// Paragraphs are filled greedily, and each chunk keeps the blank line that
+// followed its last paragraph: the chunks therefore partition the text exactly
+// (concatenating them returns the input, byte for byte), and a boundary can
+// only ever fall on whitespace. A single paragraph too long for one message has
+// no boundary to align on and falls back to the rune-level split, which is
+// UTF-16-safe but word-blind.
+func splitPolicyText(text string, limit int) []string {
+	if text == "" || limit < 1 {
+		return nil
+	}
+
+	var chunks []string
+	var current strings.Builder
+	currentUnits := 0
+	for _, paragraph := range paragraphSegments(text) {
+		units := utf16Units(paragraph)
+		if currentUnits+units > limit && current.Len() > 0 {
+			chunks = append(chunks, current.String())
+			current.Reset()
+			currentUnits = 0
+		}
+		if units > limit {
+			// current was just flushed (or was empty), so appending the
+			// sub-chunks here keeps the document in order.
+			chunks = append(chunks, splitTelegramText(paragraph, limit)...)
+			continue
+		}
+		current.WriteString(paragraph)
+		currentUnits += units
+	}
+	if current.Len() > 0 {
+		chunks = append(chunks, current.String())
+	}
+	return chunks
+}
+
+// paragraphSegments cuts text on blank lines, each segment carrying the
+// separator that ended it. Keeping the separator with the paragraph it follows
+// (rather than dropping it, or re-joining with a canonical "\n\n") is what
+// makes the split lossless: the segments concatenate back into the input.
+func paragraphSegments(text string) []string {
+	var segments []string
+	for text != "" {
+		index := strings.Index(text, "\n\n")
+		if index < 0 {
+			segments = append(segments, text)
+			break
+		}
+		// Absorb any further newlines: a separator of three blank lines is one
+		// boundary, not an empty paragraph between two of them.
+		end := index + len("\n\n")
+		for end < len(text) && text[end] == '\n' {
+			end++
+		}
+		segments = append(segments, text[:end])
+		text = text[end:]
+	}
+	return segments
+}
+
+// utf16Units counts a string in the unit Telegram enforces its limit in: UTF-16
+// code units, where a character outside the BMP counts twice.
+func utf16Units(text string) int {
+	units := 0
+	for _, r := range text {
+		units += runeUTF16Units(r)
+	}
+	return units
+}
+
+// runeUTF16Units is the UTF-16 width of a single rune. RuneLen returns -1 for
+// what UTF-16 cannot encode (a lone surrogate, an out-of-range value); such a
+// rune is counted as one unit, which keeps the bound conservative instead of
+// making a chunk look shorter than it is.
+func runeUTF16Units(r rune) int {
+	units := utf16.RuneLen(r)
+	if units < 1 {
+		return 1
+	}
+	return units
+}
+
 func splitTelegramText(text string, limit int) []string {
 	if text == "" || limit < 1 {
 		return nil
@@ -184,10 +312,7 @@ func splitTelegramText(text string, limit int) []string {
 	current := make([]rune, 0, limit)
 	units := 0
 	for _, r := range text {
-		runeUnits := utf16.RuneLen(r)
-		if runeUnits < 1 {
-			runeUnits = 1
-		}
+		runeUnits := runeUTF16Units(r)
 		if units+runeUnits > limit && len(current) > 0 {
 			chunks = append(chunks, string(current))
 			current = current[:0]

@@ -17,8 +17,9 @@ package purge
 // resolve-then-use window because nothing is ever resolved as a string.
 //
 // Every function here is Linux-specific in the same way the deployment is:
-// the bot ships as a Linux container, and these are raw openat/fstatat
-// semantics. The stdlib syscall package carries them; no new dependency.
+// the bot ships as a Linux container, and these are raw openat/fstat
+// semantics. The stdlib syscall package carries them on every Linux
+// architecture; no new dependency.
 
 import (
 	"errors"
@@ -57,20 +58,31 @@ func openChildDir(parent *os.File, name string) (*os.File, error) {
 }
 
 // statChild stats a direct child of an open directory without following a
-// final symlink (which is then visible as S_IFLNK rather than its target).
+// final symlink: the child is opened with O_NOFOLLOW first, so a symlink at
+// that final component fails the open with ELOOP instead of being traversed,
+// and is reported as an ErrUnsafeTarget refusal. The stat itself comes from
+// Fstat on the child descriptor, which -- unlike Fstatat -- exists on every
+// Linux architecture (Fstatat is missing on amd64, the CI architecture).
+//
+// O_NONBLOCK rides along so opening a planted fifo never blocks the caller:
+// a no-op for regular files and directories, which stay distinguished by the
+// returned stat (S_IFREG vs S_IFDIR) exactly as before.
 func statChild(dir *os.File, name string) (syscall.Stat_t, error) {
+	fd, err := syscall.Openat(int(dir.Fd()), name,
+		syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return syscall.Stat_t{}, fmt.Errorf("%w: %s is a symlink", ErrUnsafeTarget, name)
+		}
+		return syscall.Stat_t{}, err
+	}
+	defer syscall.Close(fd)
 	var st syscall.Stat_t
-	if err := syscall.Fstatat(int(dir.Fd()), name, &st, atSymlinkNofollow); err != nil {
+	if err := syscall.Fstat(fd, &st); err != nil {
 		return syscall.Stat_t{}, err
 	}
 	return st, nil
 }
-
-// atSymlinkNofollow is AT_SYMLINK_NOFOLLOW, which the stdlib syscall package
-// only carries as the private _AT_SYMLINK_NOFOLLOW. Stable Linux ABI, 0x100
-// on every architecture; defined here rather than pulled in with a new
-// dependency for one constant.
-const atSymlinkNofollow = 0x100
 
 // isRegular reports a stat that is a plain regular file.
 func isRegular(st syscall.Stat_t) bool {

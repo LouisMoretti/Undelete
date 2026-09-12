@@ -96,7 +96,12 @@ offered by the bot.
 
 9. WHAT YOU CAN DO TODAY
 
-- /privacy returns this document.
+- /privacy returns this document. The command is typed in a chat covered by
+  the Business connection, because the Bot API never delivers a plain message
+  sent to the bot: the person you are writing to sees that command in your
+  conversation, and the bot saves it like any other message. The answer comes
+  back to you alone, as a private message from the bot, split into several
+  messages and labelled with their number.
 - Disabling the Business connection in your Telegram settings stops the
   capture immediately.
 - Lowering retention_days shortens how long everything is kept.

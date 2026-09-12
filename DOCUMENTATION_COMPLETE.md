@@ -124,6 +124,7 @@ bot/
 - **Features**:
   - `BuildWelcomeMessageRequest`: Welcome message.
   - `BuildDeletionMessageRequests`: Splits the alert text into chunks ≤ 4096 UTF-16 units.
+  - `BuildPrivacyMessageRequests`: Answer of `/privacy`, split on **paragraph boundaries** (never mid-word) and labelled `Privacy policy (i/n)` so a partial delivery is visible; label included in the 4096-unit budget.
   - `buildDeletionText`: Formats the alert with:
     - Chat label (title or `@username` or `chat <id>`).
     - Sender (name + `user_id` if available).
@@ -511,7 +512,7 @@ docker compose logs -f bot   # View the logs
 | Phase | Description |
 |-------|-------------|
 | **Phase 1** (current) | Mono-tenant, plaintext text, RLS in place. |
-| **Phase 2** | Media (`media_files` table + local storage), GDPR commands (`/delete_my_data`, `/privacy`). |
+| **Phase 2** | Media (`media_files` table + local storage), GDPR commands (`/privacy` shipped, `/delete_my_data` still to come). |
 | **Phase 3** | Real multi-tenancy (removal of the `OWNER_TELEGRAM_USER_ID` guard). |
 | **Phase 4** | Content encryption (`text_encrypted BYTEA`, AES-256-GCM, per-tenant key). |
 

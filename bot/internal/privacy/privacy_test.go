@@ -7,14 +7,23 @@ import (
 	"time"
 )
 
-// TestVersionAndEffectiveDateComeFromTheDocument is the test this issue is
-// really about: the version and the effective date the command reports must
-// be the ones written in the document reviewers read, with no second copy
-// able to drift.
+// TestVersionAndEffectiveDateComeFromTheDocument is about the guarantee this
+// issue really rests on: the version and the effective date exist in ONE
+// place, the header of policy.md, parsed once at init. That guarantee is
+// structural rather than asserted, and the honest reading of this test is that
+// its first half cannot fail as long as the structure holds:
 //
-// The test reads policy.md from disk, which is an INDEPENDENT path from the
-// go:embed used in production: it therefore catches both a stale constant and
-// an embed pointing at another file.
+//   - the embedded document equals policy.md on disk because go:embed names
+//     exactly that path; the assertion only bites if the directive is ever
+//     pointed at another file, or the document becomes generated;
+//   - Version()/EffectiveDate() equal a fresh parse of the file because
+//     parseHeader is the only thing that produces them; the assertion bites
+//     the day someone replaces the parse with a literal "1.0".
+//
+// What has teeth today is the second half: the answer the owner receives must
+// carry the version and the effective date. That breaks if the header is
+// reformatted, moved below the scan window, or dropped from the text the
+// command sends -- none of which the structure prevents.
 func TestVersionAndEffectiveDateComeFromTheDocument(t *testing.T) {
 	onDisk, err := os.ReadFile("policy.md")
 	if err != nil {
@@ -94,6 +103,16 @@ func TestPolicyCoversEveryRequiredTopic(t *testing.T) {
 		{topic: "backup survival", needles: []string{"BACKUP_RETENTION_DAYS", "already written"}},
 		{topic: "owner only", needles: []string{"only ever sent to the account holder", "third party asking for it receives nothing"}},
 		{topic: "the command itself", needles: []string{"/privacy"}},
+		// Where the command is typed is part of what the policy must disclose:
+		// the Bot API only delivers business updates, so the command lands in a
+		// monitored chat, in front of the contact, and is saved like any other
+		// message. A reader who assumes a private chat with the bot would be
+		// misled by the document, not by the code.
+		{topic: "where the command is typed", needles: []string{
+			"typed in a chat covered by",
+			"saves it like any other message",
+			"as a private message from the bot",
+		}},
 	}
 
 	answer := Text()

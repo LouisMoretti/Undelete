@@ -278,8 +278,8 @@ branch ruleset* / *Add rule* on `main`) — not automatable from this repository
 | `/privacy` | the account holder only | the privacy policy, as a direct message from the bot |
 
 **Where to type them.** `allowed_updates` requests the four `business_*`
-types and nothing else (constraint 2), so a plain `message` sent to the bot is
-never delivered to it. Commands are therefore typed **inside a chat covered by
+types and nothing else (the explicit `allowed_updates` constraint), so a plain
+`message` sent to the bot is never delivered to it. Commands are therefore typed **inside a chat covered by
 the Business connection**, where they arrive as `business_message` like any
 other message — the holder's own outgoing messages included.
 
@@ -288,9 +288,15 @@ through: the sender's `telegram_user_id` is compared against the owner
 resolved from `business_connections`. A contact writing `/privacy` in a
 monitored chat receives nothing at all — no answer in the chat, no answer to
 themselves. The reply goes out as a direct message from the bot, without
-`business_connection_id` (constraint 7), and never into the chat where the
-command was typed. The command itself is saved like any other message
-(constraint 8).
+`business_connection_id` (the alerts-without-`business_connection_id`
+constraint), and never into the chat where the command was typed. The command
+itself is saved like any other message (the exhaustive-and-automatic-saving
+constraint), and it stays visible in the conversation it was typed in: the
+answer is private, the command is not.
+
+The answer is labelled `Privacy policy (1/2)`, `(2/2)`: the document does not
+fit in one Telegram message, and a delivery that stops short must be readable
+as incomplete rather than pass for the whole policy.
 
 ## Privacy
 

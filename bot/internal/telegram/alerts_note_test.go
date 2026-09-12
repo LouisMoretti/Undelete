@@ -3,20 +3,7 @@ package telegram
 import (
 	"strings"
 	"testing"
-	"unicode/utf16"
 )
-
-func utf16Units(s string) int {
-	n := 0
-	for _, r := range s {
-		if u := utf16.RuneLen(r); u > 0 {
-			n += u
-		} else {
-			n++
-		}
-	}
-	return n
-}
 
 func TestWithMediaUnavailableNoteRespectsLimit(t *testing.T) {
 	// Short text: note appended verbatim.

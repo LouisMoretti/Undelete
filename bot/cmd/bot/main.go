@@ -85,7 +85,9 @@ func run(logger *slog.Logger) error {
 	outboxRepo := outbox.NewRepository(db)
 	mediaRepo := media.NewRepository(db)
 	businessSvc := business.NewService(db.Pool, client, usersRepo, cfg.OwnerTelegramUserID, logger)
-	handler := app.NewHandler(businessSvc, messagesRepo, mediaRepo, logger)
+	// WithCommandSender: the same client the welcome message goes through.
+	// Without it the bot still saves everything, but /privacy stays silent.
+	handler := app.NewHandler(businessSvc, messagesRepo, mediaRepo, logger, app.WithCommandSender(client))
 
 	// Dedicated HTTP client for the downloads: a media transfer must not share
 	// the connection pool of the long-polling client, whose timeout is sized

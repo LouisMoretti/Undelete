@@ -15,7 +15,7 @@
 ## Project Structure
 - `bot/` — Go 1.23 module (`github.com/LouisMoretti/Undelete/bot`)
 - `bot/cmd/bot/main.go` — entrypoint
-- `bot/internal/` — packages: `app`, `business`, `config`, `messages`, `outbox`, `storage`, `telegram`, `users`
+- `bot/internal/` — packages: `app`, `business`, `config`, `messages`, `outbox`, `privacy`, `storage`, `telegram`, `users`
 - `db/init/01-app-role.sh` — creates restricted `undelete_app` role (runs on Postgres init)
 - `scripts/test-integration.sh` — spins up throwaway Postgres 16 container for tests
 
@@ -50,4 +50,5 @@
 - Outbox: `deleted_at` + notification chunks written atomically; worker processes leases with exponential backoff, respects 429 `retry_after`
 - Retention purge runs daily, separate from poller loop (poller must stay responsive)
 - Media retention (`internal/media/purge`) extends that daily cycle to `./media`: the blob is unlinked BEFORE the row is marked `purged`, so a crash between the two leaves only the mismatch the catalogue can detect on its own. The reconciliation repairs both directions (row without file, file without row), always bounded per run and resumed by cursor. `MEDIA_PURGE_DRY_RUN=true` logs without deleting.
+- Commands (`/privacy`): read from `business_message` only — `allowed_updates` never delivers a plain `message`. Answered ONLY to the sender when they are the owner of the connection the command arrived through, as a direct message without `business_connection_id`. The answer is cut on paragraph boundaries (never mid-word) and every message is labelled `Privacy policy (i/n)`, label included in the 4096-unit budget, so a delivery that stops short reads as incomplete; the whole send is bounded by `commandAnswerTimeout` because it runs on the poller's goroutine. The policy has one source of truth, `internal/privacy/policy.md`, embedded with `go:embed`; its version and effective date are parsed back from it, never duplicated in Go
 - Logs: `slog` JSON, never contain message content

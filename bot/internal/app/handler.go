@@ -126,6 +126,17 @@ func (h *Handler) HandleUpdate(ctx context.Context, u telegram.Update) error {
 		return h.business.HandleBusinessConnection(ctx, *u.BusinessConnection)
 
 	case u.BusinessMessage != nil:
+		// Control commands are resolved BEFORE the capture filter: a
+		// disabled connection still authenticates its owner's
+		// /delete_my_data (resume after a crash, replay of a completed
+		// erasure), and a confirmation carrying a code is never saved --
+		// the code must not land in messages.text_content (and therefore
+		// in a dump), whatever the sender or the connection state.
+		if handled, err := h.handleControlCommand(ctx, u.BusinessMessage); err != nil {
+			return err
+		} else if handled {
+			return nil
+		}
 		conn, err := h.saveMessage(ctx, u.BusinessMessage, false)
 		if err != nil {
 			return err
@@ -140,7 +151,16 @@ func (h *Handler) HandleUpdate(ctx context.Context, u telegram.Update) error {
 
 	case u.EditedBusinessMessage != nil:
 		// Deliberately no command handling on an edit: a command is an act,
-		// and rewriting an old message into "/privacy" is not one.
+		// and rewriting an old message into "/privacy" is not one. The one
+		// exception is the negative half of the secrecy rule: an edit whose
+		// new text IS a confirmation would persist a live code in
+		// messages.text_content without ever spending it, so it is dropped
+		// before the save, unexecuted.
+		if drop, err := h.dropConfirmEdit(ctx, u.EditedBusinessMessage); err != nil {
+			return err
+		} else if drop {
+			return nil
+		}
 		_, err := h.saveMessage(ctx, u.EditedBusinessMessage, true)
 		return err
 
@@ -154,6 +174,100 @@ func (h *Handler) HandleUpdate(ctx context.Context, u telegram.Update) error {
 		h.logger.Debug("update ignored: no business_* field populated", slog.Int64("update_id", u.UpdateID))
 		return nil
 	}
+}
+
+// handleControlCommand serves /delete_my_data before the message is saved,
+// and reports whether the update was consumed (true: the caller must not save
+// it, let alone answer it a second time).
+//
+// Two properties make the pre-save position necessary, and both are about a
+// connection the capture filter would refuse:
+//
+//   - resumption: step 1 of the erasure disables the tenant's connections, so
+//     a code whose erasure was interrupted (or completed) arrives through a
+//     disabled connection from then on. Resolving it through saveMessage
+//     would drop it as "connection disabled" and strand the tenant with no
+//     way to resume or to hear "already erased". The control path therefore
+//     resolves the connection itself and serves the owner's command WITHOUT
+//     saving the message and WITHOUT re-enabling anything.
+//   - secrecy: the confirmation carries the code in clear. Saving the message
+//     first would persist that code in messages.text_content -- and every row
+//     travels into every pg_dump -- before the erasure (or the sender check)
+//     ever runs. A confirmation is therefore never saved, on any connection,
+//     by any sender.
+//
+// Anything that is not the owner's /delete_my_data returns false and flows
+// into the normal path: an unknown command or a bare request on an enabled
+// connection is a message like any other (saved, then answered), and a
+// refused connection stays silent exactly as saveMessage would keep it.
+func (h *Handler) handleControlCommand(ctx context.Context, msg *telegram.Message) (bool, error) {
+	if msg == nil || msg.BusinessConnectionID == "" || msg.Chat.ID == 0 || msg.MessageID == 0 {
+		return false, nil
+	}
+	conn, err := h.business.Resolve(ctx, msg.BusinessConnectionID)
+	if err != nil {
+		if errors.Is(err, business.ErrOwnerMismatch) {
+			// Refused by the mono-tenant guard: no owner, no command.
+			return true, nil
+		}
+		return false, fmt.Errorf("connection resolution for control command: %w", err)
+	}
+	command, ok := telegram.ParseCommand(messageText(msg))
+	if !ok || command != telegram.CommandDeleteMyData {
+		return false, nil
+	}
+	if msg.From == nil || msg.From.ID != conn.OwnerTelegramUserID {
+		// A third party retyping a code they saw in the monitored chat, a
+		// message without a sender, or a chat id spoofed to look like the
+		// owner's: nothing is sent, nothing reaches the eraser, and -- the
+		// point of doing this before the save -- nothing is WRITTEN either.
+		// A retried code is a live erasure token; persisting it would store
+		// the very secret the challenge table only ever hashes.
+		h.logger.Debug("erasure command ignored: sender is not the owner of the connection",
+			slog.String("business_connection_id", conn.ID),
+			slog.Int64("chat_id", msg.Chat.ID))
+		return true, nil
+	}
+
+	if code := telegram.CommandArgument(messageText(msg)); code != "" {
+		h.handleDeleteMyData(ctx, conn, messageText(msg))
+		return true, nil
+	}
+	if conn.IsEnabled {
+		// A bare request on a live connection stays a message like any
+		// other: it carries no secret, so the normal path saves it and
+		// answers it.
+		return false, nil
+	}
+	// A bare request on a disabled connection (the state an erasure leaves
+	// behind): issue a fresh code without saving anything.
+	h.handleDeleteMyData(ctx, conn, messageText(msg))
+	return true, nil
+}
+
+// dropConfirmEdit reports whether an edited message must not be saved: its
+// new text is a /delete_my_data confirmation, i.e. a live erasure token in
+// clear. Edits never execute commands, so dropping it loses no act -- only
+// the secret the save would otherwise persist. Anything else (including a
+// bare /delete_my_data, which carries no code) saves normally.
+func (h *Handler) dropConfirmEdit(ctx context.Context, msg *telegram.Message) (bool, error) {
+	if msg == nil || msg.BusinessConnectionID == "" || msg.Chat.ID == 0 || msg.MessageID == 0 {
+		return false, nil
+	}
+	text := messageText(msg)
+	command, ok := telegram.ParseCommand(text)
+	if !ok || command != telegram.CommandDeleteMyData || telegram.CommandArgument(text) == "" {
+		return false, nil
+	}
+	if _, err := h.business.Resolve(ctx, msg.BusinessConnectionID); err != nil {
+		if errors.Is(err, business.ErrOwnerMismatch) {
+			return true, nil
+		}
+		return false, fmt.Errorf("connection resolution for edited command: %w", err)
+	}
+	h.logger.Debug("edited confirmation dropped before the save: a code is never stored",
+		slog.String("business_connection_id", msg.BusinessConnectionID))
+	return true, nil
 }
 
 // saveMessage always saves the received message. It returns the connection
@@ -375,15 +489,22 @@ const erasureTimeout = 60 * time.Second
 // handleDeleteMyData serves both halves of /delete_my_data: the bare command
 // issues a confirmation code, the command followed by that code spends it.
 //
-// Reached only through answerCommand, which has already established that the
-// sender IS the owner of the connection the message arrived through. A contact
-// typing either form gets nothing at all -- not an answer in the chat, not an
-// answer to themselves, and no erasure.
+// A confirmation reaches here through handleControlCommand, BEFORE the message
+// is saved -- never through answerCommand, which only sees what the capture
+// kept. That ordering is what keeps the code out of messages.text_content. A
+// bare request on an enabled connection arrives through answerCommand instead,
+// after the save, since it carries no secret.
+//
+// Either way, the sender IS the owner of the connection the message arrived
+// through by the time this runs (control commands authenticate first, the
+// answer path checks in answerCommand). A contact typing either form gets
+// nothing at all -- not an answer in the chat, not an answer to themselves,
+// and no erasure.
 //
 // Nothing is returned to the poller, for the same reason /privacy returns
-// nothing: an undelivered answer must never make an update look like it failed
-// and replay the message save that preceded it. A failed erasure is logged and
-// told to the owner, who can resume it with the same code.
+// nothing: an undelivered answer must never make an update look like it
+// failed. A failed erasure is logged and told to the owner, who can resume
+// it with the same code.
 func (h *Handler) handleDeleteMyData(ctx context.Context, conn *business.Connection, text string) {
 	if h.eraser == nil {
 		h.logger.Debug("erasure command ignored: no eraser configured",

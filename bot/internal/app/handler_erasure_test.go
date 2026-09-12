@@ -177,7 +177,13 @@ func TestEveryErasureOutcomeIsAnswered(t *testing.T) {
 
 // TestErasureIgnoresEveryoneButTheOwner is the acceptance criterion that
 // matters most here: a contact typing either form of the command erases
-// nothing and is answered nothing — neither in the chat, nor privately.
+// nothing and is answered nothing — neither in the chat, nor privately --
+// and nothing is WRITTEN either.
+//
+// A confirmation carries a live code, so persisting it would store the very
+// secret the challenge table only ever hashes; a bare command from a third
+// party is dropped with it, uniformly, before the save. What the owner types
+// is another matter: their bare command saves like any other message.
 func TestErasureIgnoresEveryoneButTheOwner(t *testing.T) {
 	messages := map[string]func(string) *telegram.Message{
 		"a contact in the monitored chat": func(text string) *telegram.Message {
@@ -216,8 +222,8 @@ func TestErasureIgnoresEveryoneButTheOwner(t *testing.T) {
 				if len(eraser.requests) != 0 || len(eraser.confirmed) != 0 {
 					t.Fatal("a third party reached the eraser")
 				}
-				if len(msgs.saved) != 1 {
-					t.Fatal("the message must still be saved: only the answer and the erasure are withheld")
+				if len(msgs.saved) != 0 {
+					t.Fatalf("%d message(s) saved, want 0: a third party's command writes nothing", len(msgs.saved))
 				}
 			})
 		}
@@ -257,11 +263,12 @@ func TestErasureIgnoresNonCommands(t *testing.T) {
 
 // TestErasureNeverTriggeredByAnEdit: rewriting an old message into a
 // confirmation is not an act, and it would let a code be spent long after the
-// message that carried it was read.
+// message that carried it was read. The edit is dropped before the save, so
+// the code is not even persisted.
 func TestErasureNeverTriggeredByAnEdit(t *testing.T) {
 	sender := &fakeSender{}
 	eraser := &fakeEraser{}
-	h, _ := newErasureHandler(sender, eraser)
+	h, msgs := newErasureHandler(sender, eraser)
 
 	if err := h.HandleUpdate(context.Background(), telegram.Update{
 		UpdateID: 1, EditedBusinessMessage: ownerMessage("/delete_my_data ABCD2345"),
@@ -271,10 +278,16 @@ func TestErasureNeverTriggeredByAnEdit(t *testing.T) {
 	if len(eraser.confirmed) != 0 || len(sender.sent) != 0 {
 		t.Fatal("an edit spent a confirmation code")
 	}
+	if len(msgs.saved) != 0 {
+		t.Fatalf("%d edited message(s) saved, want 0: a code is never stored, not even through an edit", len(msgs.saved))
+	}
 }
 
 // TestErasureWithoutAnEraserIsInert: a Handler built without WithDataEraser
-// keeps saving everything and answers nothing. No nil dereference on the
+// keeps saving everything it may, and answers nothing. The bare command
+// carries no secret and saves like any other message; a confirmation is
+// dropped before the save even without an eraser behind it -- a code that
+// can never be spent must still never be stored. No nil dereference on the
 // poller path, and above all no confirmation for an erasure nothing performed.
 func TestErasureWithoutAnEraserIsInert(t *testing.T) {
 	sender := &fakeSender{}
@@ -288,43 +301,158 @@ func TestErasureWithoutAnEraserIsInert(t *testing.T) {
 	if len(sender.sent) != 0 {
 		t.Fatalf("%d message(s) sent without an eraser, want 0", len(sender.sent))
 	}
-	if len(msgs.saved) != 2 {
-		t.Fatalf("saved messages = %d, want 2", len(msgs.saved))
+	if len(msgs.saved) != 1 {
+		t.Fatalf("saved messages = %d, want 1: the bare command saves, the confirmation never does", len(msgs.saved))
 	}
 }
 
-// TestErasureIgnoredOnRefusedConnections: a connection the mono-tenant guard
-// rejects, or a disabled one, provides no owner — and a disabled connection is
-// also what a tenant looks like right after an erasure, which must not be a
-// path back into one.
-func TestErasureIgnoredOnRefusedConnections(t *testing.T) {
+// TestErasureIgnoredOnARefusedConnection: a connection the mono-tenant guard
+// rejects provides no owner, so even a well-formed confirmation from the
+// configured owner id is dropped before the save -- silently, exactly as the
+// capture would keep it.
+func TestErasureIgnoredOnARefusedConnection(t *testing.T) {
+	sender := &fakeSender{}
+	eraser := &fakeEraser{}
+	biz := &fakeBusiness{resolveErr: map[string]error{"bc-1": business.ErrOwnerMismatch}}
+	h := NewHandler(biz, &fakeMessages{}, &fakeMedia{}, testLogger(),
+		WithCommandSender(sender), WithDataEraser(eraser, 14))
+
+	for _, text := range []string{"/delete_my_data", "/delete_my_data ABCD2345"} {
+		if err := h.HandleUpdate(context.Background(), telegram.Update{
+			UpdateID: 1, BusinessMessage: ownerMessage(text),
+		}); err != nil {
+			t.Fatalf("HandleUpdate: %v", err)
+		}
+	}
+	if len(sender.sent) != 0 || len(eraser.confirmed) != 0 || len(eraser.requests) != 0 {
+		t.Fatal("a refused connection reached the eraser or the sender")
+	}
+}
+
+// disabledErasureHandler is a Handler whose only connection is disabled --
+// the state a tenant is in after step 1 of an erasure, or after one completed.
+func disabledErasureHandler(sender *fakeSender, eraser *fakeEraser) (*Handler, *fakeMessages) {
 	disabled := enabledConn()
 	disabled.IsEnabled = false
+	biz := &fakeBusiness{connections: map[string]*business.Connection{"bc-1": disabled}}
+	msgs := &fakeMessages{}
+	return NewHandler(biz, msgs, &fakeMedia{}, testLogger(),
+		WithCommandSender(sender), WithDataEraser(eraser, 14)), msgs
+}
 
-	tests := []struct {
-		name string
-		biz  *fakeBusiness
-	}{
-		{name: "refused by the mono-tenant guard", biz: &fakeBusiness{resolveErr: map[string]error{"bc-1": business.ErrOwnerMismatch}}},
-		{name: "disabled connection", biz: &fakeBusiness{connections: map[string]*business.Connection{"bc-1": disabled}}},
+// TestErasureResumesOnADisabledConnection is the F1 path, end to end at the
+// handler level: the first submission fails halfway (the eraser reports it),
+// the owner resubmits the SAME code through the now-disabled connection, and
+// the erasure completes. Both submissions are served without saving anything
+// and without re-enabling the capture.
+func TestErasureResumesOnADisabledConnection(t *testing.T) {
+	sender := &fakeSender{}
+	eraser := &fakeEraser{confirmErr: errors.New("database down halfway")}
+	h, msgs := disabledErasureHandler(sender, eraser)
+
+	if err := h.HandleUpdate(context.Background(), telegram.Update{
+		UpdateID: 1, BusinessMessage: ownerMessage("/delete_my_data ABCD2345"),
+	}); err != nil {
+		t.Fatalf("first HandleUpdate: %v", err)
+	}
+	if len(eraser.confirmed) != 1 {
+		t.Fatal("the first submission never reached the eraser: a disabled connection would strand every resume")
+	}
+	if len(sender.sent) != 1 || !strings.Contains(sender.sent[0].Text, "did not finish") {
+		t.Fatalf("the failure was not answered as resumable: %+v", sender.sent)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			sender := &fakeSender{}
-			eraser := &fakeEraser{}
-			h := NewHandler(tt.biz, &fakeMessages{}, &fakeMedia{}, testLogger(),
-				WithCommandSender(sender), WithDataEraser(eraser, 14))
+	eraser.confirmErr = nil
+	eraser.outcome = erasure.OutcomeErased
+	if err := h.HandleUpdate(context.Background(), telegram.Update{
+		UpdateID: 2, BusinessMessage: ownerMessage("/delete_my_data ABCD2345"),
+	}); err != nil {
+		t.Fatalf("second HandleUpdate: %v", err)
+	}
+	if len(eraser.confirmed) != 2 {
+		t.Fatal("resubmitting the same code on a disabled connection reached nothing")
+	}
+	if len(sender.sent) != 2 || !strings.Contains(sender.sent[1].Text, "Data erasure complete") {
+		t.Fatalf("the resumed erasure was not confirmed: %+v", sender.sent)
+	}
+	if len(msgs.saved) != 0 {
+		t.Fatalf("%d message(s) saved, want 0: control commands on a disabled connection save nothing", len(msgs.saved))
+	}
+	for _, sent := range sender.sent {
+		if sent.ChatID != 700001 {
+			t.Fatalf("an erasure answer went to %d, want the owner alone", sent.ChatID)
+		}
+	}
+}
 
-			if err := h.HandleUpdate(context.Background(), telegram.Update{
-				UpdateID: 1, BusinessMessage: ownerMessage("/delete_my_data ABCD2345"),
-			}); err != nil {
-				t.Fatalf("HandleUpdate: %v", err)
-			}
-			if len(sender.sent) != 0 || len(eraser.confirmed) != 0 {
-				t.Fatal("a refused connection reached the eraser or the sender")
-			}
-		})
+// TestErasureReplayOnADisabledConnection: after a completed erasure every
+// connection is disabled, and resubmitting the spent code must still be
+// answered -- "already erased", not silence, and not "unknown code".
+func TestErasureReplayOnADisabledConnection(t *testing.T) {
+	sender := &fakeSender{}
+	eraser := &fakeEraser{outcome: erasure.OutcomeAlreadyErased}
+	h, msgs := disabledErasureHandler(sender, eraser)
+
+	if err := h.HandleUpdate(context.Background(), telegram.Update{
+		UpdateID: 1, BusinessMessage: ownerMessage("/delete_my_data ABCD2345"),
+	}); err != nil {
+		t.Fatalf("HandleUpdate: %v", err)
+	}
+	if len(eraser.confirmed) != 1 {
+		t.Fatal("the replay never reached the eraser")
+	}
+	if len(sender.sent) != 1 || !strings.Contains(sender.sent[0].Text, "Nothing left to erase") {
+		t.Fatalf("the replay was not answered as already-erased: %+v", sender.sent)
+	}
+	if len(msgs.saved) != 0 {
+		t.Fatalf("%d message(s) saved, want 0", len(msgs.saved))
+	}
+}
+
+// TestErasureBareRequestOnADisabledConnection: the owner can still ask for a
+// fresh code after an erasure (or an interrupted one) -- served without
+// saving, without re-enabling.
+func TestErasureBareRequestOnADisabledConnection(t *testing.T) {
+	sender := &fakeSender{}
+	eraser := &fakeEraser{code: "WXYZ7788"}
+	h, msgs := disabledErasureHandler(sender, eraser)
+
+	if err := h.HandleUpdate(context.Background(), telegram.Update{
+		UpdateID: 1, BusinessMessage: ownerMessage("/delete_my_data"),
+	}); err != nil {
+		t.Fatalf("HandleUpdate: %v", err)
+	}
+	if len(eraser.requests) != 1 {
+		t.Fatal("the bare command on a disabled connection issued nothing")
+	}
+	if len(sender.sent) != 1 || !strings.Contains(sender.sent[0].Text, "WXYZ7788") {
+		t.Fatalf("the challenge was not delivered: %+v", sender.sent)
+	}
+	if len(msgs.saved) != 0 {
+		t.Fatalf("%d message(s) saved, want 0", len(msgs.saved))
+	}
+}
+
+// TestConfirmationIsNeverSaved is the F6 secrecy rule at the handler level:
+// the owner's confirmation is spent and answered, and no record of it --
+// neither the message nor its media -- is written anywhere the handler owns.
+func TestConfirmationIsNeverSaved(t *testing.T) {
+	sender := &fakeSender{}
+	eraser := &fakeEraser{outcome: erasure.OutcomeErased}
+	h, msgs := newErasureHandler(sender, eraser)
+
+	msg := ownerMessage("/delete_my_data ABCD2345")
+	if err := h.HandleUpdate(context.Background(), telegram.Update{UpdateID: 1, BusinessMessage: msg}); err != nil {
+		t.Fatalf("HandleUpdate: %v", err)
+	}
+	if len(eraser.confirmed) != 1 {
+		t.Fatal("the confirmation was not spent")
+	}
+	if len(sender.sent) != 1 {
+		t.Fatal("the confirmation was not answered")
+	}
+	if len(msgs.saved) != 0 {
+		t.Fatalf("%d message(s) saved, want 0: the code must never reach messages.text_content", len(msgs.saved))
 	}
 }
 
@@ -363,9 +491,10 @@ func TestErasureRunsUnderDeadlines(t *testing.T) {
 	}
 }
 
-// TestErasureAnswerFailureIsNotAnUpdateFailure: the message is already saved,
-// and an undelivered confirmation must never replay the update that carried the
-// command — which would submit the same code a second time.
+// TestErasureAnswerFailureIsNotAnUpdateFailure: no message precedes the
+// command any more (a confirmation is never saved), so an undelivered answer
+// must simply stay silent towards the poller -- and above all must not fail
+// the update, which would look like a reason to retry the spend.
 func TestErasureAnswerFailureIsNotAnUpdateFailure(t *testing.T) {
 	sender := &fakeSender{failAt: 1}
 	eraser := &fakeEraser{outcome: erasure.OutcomeErased}
@@ -376,8 +505,8 @@ func TestErasureAnswerFailureIsNotAnUpdateFailure(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("HandleUpdate must swallow a send failure, got %v", err)
 	}
-	if len(msgs.saved) != 1 {
-		t.Fatalf("saved messages = %d, want 1", len(msgs.saved))
+	if len(msgs.saved) != 0 {
+		t.Fatalf("saved messages = %d, want 0: confirmations are never saved", len(msgs.saved))
 	}
 	if len(eraser.confirmed) != 1 {
 		t.Fatalf("the code was submitted %d times, want 1", len(eraser.confirmed))

@@ -276,6 +276,8 @@ branch ruleset* / *Add rule* on `main`) — not automatable from this repository
 | Command | Who | Answer |
 |---|---|---|
 | `/privacy` | the account holder only | the privacy policy, as a direct message from the bot |
+| `/retention` | the account holder only | the current retention period, as a direct message from the bot |
+| `/retention <days>` | the account holder only | the new retention period (1 to 365 days), as a direct message from the bot |
 | `/delete_my_data` | the account holder only | a single-use confirmation code, as a direct message from the bot |
 | `/delete_my_data <code>` | the account holder only | the erasure of everything this instance holds about them, then a confirmation |
 
@@ -361,7 +363,9 @@ receives and the text reviewed here cannot describe two different policies.
 - Logs (`log/slog`, JSON) never contain message content: identifiers, types
   and counters only.
 - Retention configurable per user (`retention_days`, 1 to 365 days), purged
-  daily.
+  daily. The owner reads it with `/retention` and sets it with
+  `/retention <days>` (typed in a covered chat like `/privacy`, answered
+  privately); there is no per-chat setting.
 - `/delete_my_data` erases, on demand, this account's live data: messages,
   chat labels, attachments (rows and files), queued alerts and the tenant's
   other erasure requests, after disabling the Business connections. Three

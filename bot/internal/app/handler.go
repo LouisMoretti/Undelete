@@ -18,6 +18,7 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/metrics"
 	"github.com/LouisMoretti/Undelete/bot/internal/privacy"
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
+	"github.com/LouisMoretti/Undelete/bot/internal/users"
 )
 
 // businessService is the subset of business.Service used by Handler: resolving
@@ -60,6 +61,16 @@ type dataEraser interface {
 	Confirm(ctx context.Context, t erasure.Tenant, code string) (erasure.Outcome, error)
 }
 
+// retentionStore is the subset of users.Repository used by Handler: read and
+// set the tenant's retention period (users.retention_days). An interface
+// rather than the concrete type so the command can be exercised without a
+// database -- every branch of it decides whether to rewrite one tenant's
+// setting.
+type retentionStore interface {
+	GetRetentionDays(ctx context.Context, ownerUserID int64) (int, error)
+	SetRetentionDays(ctx context.Context, ownerUserID int64, days int) error
+}
+
 // Handler routes Telegram Business updates to business handling. Its
 // methods are called strictly sequentially by telegram.Poller (constraint
 // #5): no mutex protection is needed here, the call order IS the
@@ -78,6 +89,10 @@ type Handler struct {
 	// command is then ignored exactly like an unknown one, silently, rather
 	// than answered with a promise nothing behind it can keep.
 	eraser dataEraser
+	// retention serves /retention. Nil disables that command alone: the
+	// command is then ignored exactly like an unknown one, silently, rather
+	// than answered with a number nothing behind it can keep.
+	retention retentionStore
 	// backupRetentionDays is BACKUP_RETENTION_DAYS, the maximum residual
 	// survival the erasure confirmation must state. Passed down rather than
 	// read from the environment here: the answer has to quote the value this
@@ -102,6 +117,17 @@ func WithCommandSender(sender alertSender) Option {
 func WithDataEraser(eraser dataEraser, backupRetentionDays int) Option {
 	return func(h *Handler) {
 		h.eraser = eraser
+		h.backupRetentionDays = backupRetentionDays
+	}
+}
+
+// WithRetention enables /retention. backupRetentionDays is what the read and
+// set answers quote as the independence reference (BACKUP_RETENTION_DAYS); it
+// is taken alongside the store rather than separately so a Handler can never
+// answer a retention question with a number nobody configured.
+func WithRetention(store retentionStore, backupRetentionDays int) Option {
+	return func(h *Handler) {
+		h.retention = store
 		h.backupRetentionDays = backupRetentionDays
 	}
 }
@@ -178,7 +204,9 @@ func (h *Handler) HandleUpdate(ctx context.Context, u telegram.Update) error {
 
 // handleControlCommand serves /delete_my_data before the message is saved,
 // and reports whether the update was consumed (true: the caller must not save
-// it, let alone answer it a second time).
+// it, let alone answer it a second time). It also drops a /retention typed by
+// anyone but the owner before the save, for the same no-write guarantee;
+// the owner's own /retention flows through to the normal path.
 //
 // Two properties make the pre-save position necessary, and both are about a
 // connection the capture filter would refuse:
@@ -213,7 +241,28 @@ func (h *Handler) handleControlCommand(ctx context.Context, msg *telegram.Messag
 		return false, fmt.Errorf("connection resolution for control command: %w", err)
 	}
 	command, ok := telegram.ParseCommand(messageText(msg))
-	if !ok || command != telegram.CommandDeleteMyData {
+	if !ok {
+		return false, nil
+	}
+	switch command {
+	case telegram.CommandRetention:
+		// A third party retyping the command they saw in the monitored chat,
+		// a message without a sender, or a chat id spoofed to look like the
+		// owner's: nothing is sent, nothing reaches the retention store, and
+		// -- the point of doing this before the save -- nothing is WRITTEN
+		// either. The owner's own command flows into the normal path instead:
+		// it carries no secret, so it is saved like any other message and
+		// answered after the save, exactly like /privacy.
+		if msg.From == nil || msg.From.ID != conn.OwnerTelegramUserID {
+			h.logger.Debug("retention command ignored: sender is not the owner of the connection",
+				slog.String("business_connection_id", conn.ID),
+				slog.Int64("chat_id", msg.Chat.ID))
+			return true, nil
+		}
+		return false, nil
+	case telegram.CommandDeleteMyData:
+		break
+	default:
 		return false, nil
 	}
 	if msg.From == nil || msg.From.ID != conn.OwnerTelegramUserID {
@@ -403,6 +452,8 @@ func (h *Handler) answerCommand(ctx context.Context, conn *business.Connection, 
 		h.sendPrivacyPolicy(ctx, conn)
 	case telegram.CommandDeleteMyData:
 		h.handleDeleteMyData(ctx, conn, messageText(msg))
+	case telegram.CommandRetention:
+		h.handleRetention(ctx, conn, messageText(msg))
 	default:
 		h.logger.Debug("unknown command ignored",
 			slog.String("business_connection_id", conn.ID))
@@ -593,6 +644,97 @@ func (h *Handler) confirmErasure(ctx context.Context, conn *business.Connection,
 	h.logger.Info("erasure command answered",
 		slog.String("business_connection_id", conn.ID),
 		slog.String("answer", what))
+}
+
+// handleRetention serves /retention, the tenant's retention period
+// (users.retention_days), in both of its shapes: typed alone it answers the
+// current value, typed with a number of days between 1 and 365 it sets it.
+//
+// It only ever runs after the save, through answerCommand: neither shape
+// carries a secret (a number of days is a setting, not a token), so the
+// command is saved like any other message, exactly like /privacy. The sender
+// IS the owner of the connection by the time this runs -- a third party's
+// /retention was already consumed by handleControlCommand before the save, so
+// nothing of theirs is stored, written or answered.
+//
+// The tenant is resolved strictly from the connection: conn.OwnerUserID, never
+// anything derived from the message. There is no per-chat variant anywhere on
+// this path: the setting belongs to the tenant.
+//
+// An invalid argument (out of bounds, non-numeric, empty past the command, or
+// trailed by extra tokens) is answered with the usage and changes nothing. A
+// store failure is logged and stays silent towards the owner -- like every
+// other command answer, an undelivered one must never fail the update. Nothing
+// is returned to the poller either way.
+func (h *Handler) handleRetention(ctx context.Context, conn *business.Connection, text string) {
+	if h.retention == nil {
+		h.logger.Debug("retention command ignored: no retention store configured",
+			slog.String("business_connection_id", conn.ID))
+		return
+	}
+
+	argument := telegram.CommandArgument(text)
+	if argument == "" {
+		h.answerRetention(ctx, conn)
+		return
+	}
+	days, err := users.ParseRetentionDays(argument)
+	if err != nil {
+		h.logger.Debug("retention command refused: invalid argument",
+			slog.String("business_connection_id", conn.ID))
+		h.sendCommandAnswer(ctx, conn, "retention usage", []telegram.SendMessageRequest{
+			telegram.BuildRetentionUsageRequest(conn.OwnerTelegramUserID),
+		})
+		return
+	}
+	h.applyRetention(ctx, conn, days)
+}
+
+// answerRetention reads the tenant's current period and sends it to the owner,
+// with when the purge applies it and the independence from the backups. A
+// read failure sends nothing: the owner retries the command.
+func (h *Handler) answerRetention(ctx context.Context, conn *business.Connection) {
+	readCtx, cancel := context.WithTimeout(ctx, commandAnswerTimeout)
+	defer cancel()
+
+	days, err := h.retention.GetRetentionDays(readCtx, conn.OwnerUserID)
+	if err != nil {
+		h.logger.Error("failed to read the retention period",
+			slog.String("business_connection_id", conn.ID),
+			slog.Int64("owner_user_id", conn.OwnerUserID),
+			slog.String("error", err.Error()))
+		return
+	}
+	if h.sendCommandAnswer(ctx, conn, "retention status", []telegram.SendMessageRequest{
+		telegram.BuildRetentionStatusRequest(conn.OwnerTelegramUserID, days, h.backupRetentionDays),
+	}) {
+		h.logger.Info("retention command answered",
+			slog.String("business_connection_id", conn.ID),
+			slog.Int("retention_days", days))
+	}
+}
+
+// applyRetention sets the tenant's period to days (already validated) and
+// confirms it to the owner. A write failure sends nothing: the setting is
+// unchanged and the owner retries the command.
+func (h *Handler) applyRetention(ctx context.Context, conn *business.Connection, days int) {
+	writeCtx, cancel := context.WithTimeout(ctx, commandAnswerTimeout)
+	defer cancel()
+
+	if err := h.retention.SetRetentionDays(writeCtx, conn.OwnerUserID, days); err != nil {
+		h.logger.Error("failed to set the retention period",
+			slog.String("business_connection_id", conn.ID),
+			slog.Int64("owner_user_id", conn.OwnerUserID),
+			slog.String("error", err.Error()))
+		return
+	}
+	if h.sendCommandAnswer(ctx, conn, "retention change", []telegram.SendMessageRequest{
+		telegram.BuildRetentionChangedRequest(conn.OwnerTelegramUserID, days, h.backupRetentionDays),
+	}) {
+		h.logger.Info("retention period changed",
+			slog.String("business_connection_id", conn.ID),
+			slog.Int("retention_days", days))
+	}
 }
 
 // saveMedia catalogues the attachments of a message. The rows are created

@@ -226,6 +226,97 @@ func BuildErasureNoticeRequest(ownerTelegramUserID int64, notice string) SendMes
 	return SendMessageRequest{ChatID: ownerTelegramUserID, Text: notice}
 }
 
+// The /retention texts. They live here for the same reason the erasure texts
+// do: every string the bot sends is built in one place, where the wire
+// contract (a direct message to the owner, never a business_connection_id --
+// impossible by construction on SendMessageRequest) is testable without a
+// database.
+//
+// Each of them is a single message: none comes close to the 4096-unit limit,
+// so no split is needed and no chunk label either -- unlike the policy, a
+// retention answer cannot be mistaken for complete when it stops short, since
+// a missing sentence here is a missing answer, not a truncated document.
+const (
+	// retentionPurgeNote states when the setting takes effect. The purge is a
+	// daily cycle (retentionInterval in cmd/bot/main.go, 24 hours): no
+	// wall-clock time is promised, because the ticker starts at boot, not at
+	// midnight.
+	retentionPurgeNote = "Messages, alerts and media older than %s are deleted by the daily purge, " +
+		"which runs about every 24 hours. Retention is measured from the date each message was " +
+		"received, not from its deletion."
+
+	// retentionBackupNote states the independence from the backups. Phrased,
+	// like the erasure caveat above, as what a setting change cannot do to an
+	// archive already written -- never as a promise about the archives.
+	retentionBackupNote = "This setting is independent of the database backups (BACKUP_RETENTION_DAYS, " +
+		"currently %d days): lowering it does not rewrite an archive that was already written. " +
+		"The copy such an archive holds survives until the daily backup job purges that archive " +
+		"in its own turn. Media archives are not purged automatically: they survive until the " +
+		"operator deletes them."
+
+	retentionStatusText = "Retention: %s.\n\n" +
+		"%s\n\n" +
+		"%s\n\n" +
+		"To change it, send /retention followed by a number of days between 1 and 365, " +
+		"for example \"/retention 30\"."
+
+	retentionChangedText = "Retention updated: %s.\n\n" +
+		"The new period applies from the next daily purge, which runs about every 24 hours; " +
+		"everything older than %s will then be deleted. Retention is measured from the date " +
+		"each message was received, not from its deletion.\n\n" +
+		"%s"
+
+	// RetentionUsageNotice answers a /retention the bot cannot apply: an
+	// out-of-range number, a non-numeric argument, or more than one argument.
+	// It states the bounds and the two valid shapes, and changes nothing.
+	RetentionUsageNotice = "Retention was not changed.\n\n" +
+		"Send /retention alone to read the current period, or /retention followed by a single " +
+		"number of days between 1 and 365 to set it, for example \"/retention 30\"."
+)
+
+// retentionDaysText renders a retention period with its unit, singular for one
+// day. The unit is part of the answer, not decoration: "Retention: 1" without
+// it would read as a count of something else.
+func retentionDaysText(days int) string {
+	if days == 1 {
+		return "1 day"
+	}
+	return fmt.Sprintf("%d days", days)
+}
+
+// BuildRetentionStatusRequest builds the answer to a bare /retention: the
+// tenant's current period, when the purge applies it, and the independence
+// from the backups.
+func BuildRetentionStatusRequest(ownerTelegramUserID int64, retentionDays, backupRetentionDays int) SendMessageRequest {
+	return SendMessageRequest{
+		ChatID: ownerTelegramUserID,
+		Text: fmt.Sprintf(retentionStatusText,
+			retentionDaysText(retentionDays),
+			fmt.Sprintf(retentionPurgeNote, retentionDaysText(retentionDays)),
+			fmt.Sprintf(retentionBackupNote, backupRetentionDays)),
+	}
+}
+
+// BuildRetentionChangedRequest builds the confirmation of a successful
+// /retention <days>: the new period, when it takes effect, and the same backup
+// independence note -- a lowered period must not read as reaching into the
+// archives.
+func BuildRetentionChangedRequest(ownerTelegramUserID int64, retentionDays, backupRetentionDays int) SendMessageRequest {
+	return SendMessageRequest{
+		ChatID: ownerTelegramUserID,
+		Text: fmt.Sprintf(retentionChangedText,
+			retentionDaysText(retentionDays),
+			retentionDaysText(retentionDays),
+			fmt.Sprintf(retentionBackupNote, backupRetentionDays)),
+	}
+}
+
+// BuildRetentionUsageRequest wraps RetentionUsageNotice into the same
+// owner-only, connection-less envelope as every other answer.
+func BuildRetentionUsageRequest(ownerTelegramUserID int64) SendMessageRequest {
+	return SendMessageRequest{ChatID: ownerTelegramUserID, Text: RetentionUsageNotice}
+}
+
 // MediaUnavailableNote is appended to the text of a media alert that could not
 // carry its files (purged from disk, storage unmounted, file above the Bot API
 // limit, definitive Telegram refusal). The owner is told a media existed rather

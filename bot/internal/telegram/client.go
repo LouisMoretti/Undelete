@@ -14,6 +14,11 @@ import (
 
 const apiBaseURL = "https://api.telegram.org/bot"
 
+// maxResponseBytes bounds a single Bot API response body. getUpdates returns
+// at most 100 updates; without a bound a compromised proxy (or a runaway
+// update) could OOM the bot via an unbounded io.ReadAll.
+const maxResponseBytes = 10 << 20
+
 // Client is a minimal HTTP client for the Bot API. Deliberately free of any
 // third-party Telegram library dependency (cf. package comment): this client
 // only exposes the methods used by the bot.
@@ -85,9 +90,12 @@ func (c *Client) do(req *http.Request, method string, out any) error {
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return fmt.Errorf("reading response %s: %w", method, err)
+	}
+	if len(raw) > maxResponseBytes {
+		return fmt.Errorf("reading response %s: body exceeds %d bytes", method, maxResponseBytes)
 	}
 
 	var env apiResponse[json.RawMessage]

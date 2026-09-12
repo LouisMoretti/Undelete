@@ -94,6 +94,19 @@ func (h *Handler) HandleUpdate(ctx context.Context, u telegram.Update) error {
 // business.Service.Resolve (does the connection exist and is_enabled),
 // never a per-conversation filter.
 func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited bool) error {
+	if msg == nil {
+		return nil
+	}
+	if msg.BusinessConnectionID == "" {
+		h.logger.Debug("message ignored: empty business_connection_id")
+		return nil
+	}
+	if msg.Chat.ID == 0 || msg.MessageID == 0 {
+		h.logger.Debug("message ignored: zero chat_id or message_id",
+			slog.Int64("chat_id", msg.Chat.ID),
+			slog.Int64("message_id", msg.MessageID))
+		return nil
+	}
 	conn, err := h.business.Resolve(ctx, msg.BusinessConnectionID)
 	if err != nil {
 		if errors.Is(err, business.ErrOwnerMismatch) {
@@ -231,6 +244,15 @@ func messageText(msg *telegram.Message) string {
 // handled by outbox.Worker. A nil return therefore means "the deletion is
 // recorded and the alert is guaranteed to go out", not "the alert is out".
 func (h *Handler) handleDeleted(ctx context.Context, del *telegram.BusinessMessagesDeleted) error {
+	if del == nil {
+		return nil
+	}
+	if del.BusinessConnectionID == "" || len(del.MessageIDs) == 0 || del.Chat.ID == 0 {
+		h.logger.Debug("deletion ignored: empty connection, empty message_ids or zero chat_id",
+			slog.Int("requested", len(del.MessageIDs)),
+			slog.Int64("chat_id", del.Chat.ID))
+		return nil
+	}
 	conn, err := h.business.Resolve(ctx, del.BusinessConnectionID)
 	if err != nil {
 		if errors.Is(err, business.ErrOwnerMismatch) {

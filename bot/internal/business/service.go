@@ -79,6 +79,9 @@ func NewService(pool *pgxpool.Pool, client *telegram.Client, usersRepo *users.Re
 // order: in-memory cache, database, Telegram API. A connection found via the
 // API is upserted to the database and stored in cache before being returned.
 func (s *Service) Resolve(ctx context.Context, connectionID string) (*Connection, error) {
+	if connectionID == "" {
+		return nil, fmt.Errorf("empty business_connection_id")
+	}
 	s.mu.RLock()
 	if c, ok := s.cache[connectionID]; ok {
 		s.mu.RUnlock()
@@ -204,6 +207,9 @@ func (s *Service) notifyWelcome(ctx context.Context, tc telegram.BusinessConnect
 // BusinessConnection. Returns (nil, nil) if the mono-tenant guardrail rejects
 // the connection (not an error, a business refusal).
 func (s *Service) upsertFromTelegram(ctx context.Context, tc telegram.BusinessConnection) (*Connection, error) {
+	if tc.ID == "" || tc.User.ID == 0 {
+		return nil, fmt.Errorf("business connection with empty id or zero user id")
+	}
 	if !s.ownerAllowed(tc.User.ID) {
 		return nil, nil
 	}

@@ -61,6 +61,21 @@ func (p *Poller) LastSuccessfulPoll() time.Time {
 	return time.Unix(0, nanos)
 }
 
+// pollWait returns how long Run sleeps after a getUpdates failure: the
+// exponential backoff, or retry_after on a 429, capped at maxBackoff so one
+// abusive retry_after cannot freeze the sequential loop.
+func pollWait(backoff time.Duration, err error) time.Duration {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.IsRateLimited() {
+		wait := time.Duration(apiErr.RetryAfter) * time.Second
+		if wait > maxBackoff {
+			return maxBackoff
+		}
+		return wait
+	}
+	return backoff
+}
+
 // Run loops until the context is cancelled.
 func (p *Poller) Run(ctx context.Context, handle Handler) error {
 	backoff := minBackoff
@@ -76,14 +91,9 @@ func (p *Poller) Run(ctx context.Context, handle Handler) error {
 				return ctx.Err()
 			}
 
-			wait := backoff
-			var apiErr *APIError
-			if errors.As(err, &apiErr) && apiErr.IsRateLimited() {
-				// Strict respect of retry_after (429): Telegram tells us
-				// exactly how long to wait, we don't apply our own backoff
-				// on top.
-				wait = time.Duration(apiErr.RetryAfter) * time.Second
-			} else {
+			wait := pollWait(backoff, err)
+			var rateLimited *APIError
+			if !(errors.As(err, &rateLimited) && rateLimited.IsRateLimited()) {
 				backoff *= 2
 				if backoff > maxBackoff {
 					backoff = maxBackoff

@@ -284,15 +284,23 @@ func SelectStoredTx(ctx context.Context, tx pgx.Tx, businessConnectionID string,
 }
 
 // SelectAlbumAnchorsTx returns, for each album touched by the given messages,
-// the SMALLEST message_id it is made of -- whatever the status of its files.
+// the SMALLEST message_id among the messages OF THIS BATCH that belong to
+// it -- whatever the status of its files.
 //
-// Status-independent on purpose, and that is the whole point of this query: the
-// set of 'stored' rows moves under our feet (the fetch loop turns pending into
-// stored, and a failed download into purged), so an anchor derived from the
-// stored subset would shift between two deliveries of the SAME deletion. The
-// outbox anti-duplicate key contains the message_id, so a shifting anchor lets
-// the same album through twice. Catalogued membership, itself written once at
-// capture time, does not move.
+// Status-independent on purpose, and that is the whole point of this query:
+// the set of 'stored' rows moves under our feet (the fetch loop turns pending
+// into stored, and a failed download into purged), so an anchor derived from
+// the stored subset would shift between two deliveries of the SAME deletion.
+// The outbox anti-duplicate key contains the message_id, so a shifting anchor
+// lets the same album through twice. The batch membership, itself fixed by
+// the deletion event being processed, does not move: redelivering the same
+// deletion yields the same MIN over the same batch, and ON CONFLICT drops the
+// duplicate.
+//
+// NOT album-scoped: an album deleted across two separate deletion events gets
+// one anchor per event (one media entry per deletion, which is correct --
+// each deletion is its own alert). Only the stability within one event is
+// promised, and only that is needed.
 //
 // Same transaction contract as SelectStoredTx: the tenant context is set by the
 // caller, RLS applies unchanged.

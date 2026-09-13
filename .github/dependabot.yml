@@ -1,0 +1,21 @@
+# Weekly dependency updates: Go modules (incl. the toolchain via go.mod),
+# Docker base images (golang, alpine, postgres) and GitHub Actions.
+# Without this, toolchain drift like the Go 1.23 EOL goes unnoticed until
+# something breaks -- the weekly scheduled CI run then proves the updates.
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/bot"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"

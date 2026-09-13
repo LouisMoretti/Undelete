@@ -1,8 +1,8 @@
 module github.com/LouisMoretti/Undelete/bot
 
-go 1.23.0
+go 1.25.0
 
-toolchain go1.23.4
+toolchain go1.25.10
 
 require github.com/jackc/pgx/v5 v5.7.6
 

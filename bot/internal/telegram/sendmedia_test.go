@@ -270,6 +270,47 @@ func TestBuildMediaFormRefusesUnusableFiles(t *testing.T) {
 	}
 }
 
+// A file that becomes unreadable AFTER the pre-check (purged between Lstat
+// and Open, I/O error mid-copy) must keep the hopeless classification all
+// the way to the outbox, which degrades to text on it. A directory stands in
+// for the vanished file: os.Open succeeds on it, io.Copy fails -- the exact
+// mid-stream shape, without any race to win.
+func TestWriteMediaFormClassifiesMidStreamLoss(t *testing.T) {
+	dir := t.TempDir()
+	form := mediaForm{
+		method: "sendPhoto",
+		fields: []formField{{name: "chat_id", value: "42"}},
+		files:  []formFile{{name: "photo", filename: "photo.jpg", path: dir}},
+	}
+	mw := multipart.NewWriter(io.Discard)
+	if err := writeMediaForm(mw, form); !errors.Is(err, ErrMediaUnavailable) {
+		t.Fatalf("writeMediaForm(mid-stream loss) = %v, want ErrMediaUnavailable", err)
+	}
+}
+
+// The classification must survive the io.Pipe -> net/http hop: the transport
+// error is only the messenger, and net/http is not guaranteed to preserve
+// errors.Is through the request-body path. End to end through sendForm,
+// against a real (local) HTTP server.
+func TestSendFormPreservesHopelessClassification(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{}}`))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	client := NewClient("test-token", 5*time.Second, WithBaseURL(srv.URL+"/bot"))
+	form := mediaForm{
+		method: "sendPhoto",
+		fields: []formField{{name: "chat_id", value: "42"}},
+		files:  []formFile{{name: "photo", filename: "photo.jpg", path: dir}},
+	}
+	if err := client.sendForm(context.Background(), form); !errors.Is(err, ErrMediaUnavailable) {
+		t.Fatalf("sendForm(mid-stream loss) = %v, want ErrMediaUnavailable", err)
+	}
+}
+
 // A symlink at the media path would upload whatever it points at into the
 // owner's chat. Only a regular file written by the media store is legitimate.
 func TestBuildMediaFormRefusesSymlink(t *testing.T) {

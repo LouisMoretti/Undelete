@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # --- Build stage ---
-FROM golang:1.23-alpine AS build
+FROM golang:1.25-alpine AS build
 
 WORKDIR /src
 
@@ -16,7 +16,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/undelete-bot ./cmd/bot
 
 # --- Runtime stage ---
-FROM alpine:3.20
+FROM alpine:3.22
 
 # ca-certificates is required for TLS validation of outbound calls to
 # api.telegram.org: without this package, all HTTPS calls fail with a

@@ -100,6 +100,31 @@ func TestSendMessage5xxRetriesThreeTimesThenGivesUp(t *testing.T) {
 	}
 }
 
+// TestSendMessageWaitCapsAbusiveRetryAfter pins the poller-freeze fix: a 429
+// carrying a huge retry_after resolves to sendMessageMaxWait, never to hours.
+// Tested on the pure wait function: sleeping the real capped 60s here would
+// make the suite unusable.
+func TestSendMessageWaitCapsAbusiveRetryAfter(t *testing.T) {
+	abusive := &APIError{Code: 429, RetryAfter: 3600}
+	if got := sendMessageWait(abusive, time.Second); got != sendMessageMaxWait {
+		t.Fatalf("sendMessageWait(429/retry_after=3600) = %v, want %v", got, sendMessageMaxWait)
+	}
+	// A reasonable retry_after passes through untouched: the server's recovery
+	// timeline takes precedence over the client-side backoff.
+	sane := &APIError{Code: 429, RetryAfter: 5}
+	if got := sendMessageWait(sane, time.Second); got != 5*time.Second {
+		t.Fatalf("sendMessageWait(429/retry_after=5) = %v, want 5s", got)
+	}
+	// Non-429 errors keep the exponential backoff.
+	unavailable := &APIError{Code: 503}
+	if got := sendMessageWait(unavailable, 4*time.Second); got != 4*time.Second {
+		t.Fatalf("sendMessageWait(503) = %v, want the 4s backoff", got)
+	}
+	if got := sendMessageWait(nil, 2*time.Second); got != 2*time.Second {
+		t.Fatalf("sendMessageWait(transport error) = %v, want the 2s backoff", got)
+	}
+}
+
 // TestSendMessageCancelledDuringBackoff pins shutdown responsiveness: a
 // cancelled context during the retry wait aborts immediately with ctx.Err.
 func TestSendMessageCancelledDuringBackoff(t *testing.T) {

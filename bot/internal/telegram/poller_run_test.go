@@ -85,7 +85,7 @@ func updateJSON(id int64) string {
 func TestRunAdvancesOffsetDespiteHandlerErrors(t *testing.T) {
 	script := &scriptedPoller{t: t, bodies: []string{updateJSON(5) + "," + updateJSON(6)}}
 	srv := newScriptServer(t, script)
-	client := NewClient("token", 5*time.Second, WithBaseURL(srv.URL+"/bot"))
+	client := NewClient("token", 61*time.Second, WithBaseURL(srv.URL+"/bot"))
 	poller := NewPoller(client, silentTestLogger())
 
 	var handled []int64
@@ -117,7 +117,7 @@ func TestRunProcessesBatchSequentially(t *testing.T) {
 		updateJSON(1) + "," + updateJSON(2) + "," + updateJSON(3),
 	}}
 	srv := newScriptServer(t, script)
-	client := NewClient("token", 5*time.Second, WithBaseURL(srv.URL+"/bot"))
+	client := NewClient("token", 61*time.Second, WithBaseURL(srv.URL+"/bot"))
 	poller := NewPoller(client, silentTestLogger())
 
 	var mu orderRecorder
@@ -142,7 +142,7 @@ func TestRunProcessesBatchSequentially(t *testing.T) {
 func TestRunReturnsOnImmediateCancellation(t *testing.T) {
 	script := &scriptedPoller{t: t}
 	srv := newScriptServer(t, script)
-	client := NewClient("token", 5*time.Second, WithBaseURL(srv.URL+"/bot"))
+	client := NewClient("token", 61*time.Second, WithBaseURL(srv.URL+"/bot"))
 	poller := NewPoller(client, silentTestLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -169,7 +169,7 @@ func TestRunRespectsRetryAfter(t *testing.T) {
 		}
 		fmt.Fprintf(w, `{"ok":true,"result":[%s]}`, updateJSON(40))
 	})
-	client := NewClient("token", 5*time.Second, WithBaseURL(srv.URL+"/bot"))
+	client := NewClient("token", 61*time.Second, WithBaseURL(srv.URL+"/bot"))
 	poller := NewPoller(client, silentTestLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())

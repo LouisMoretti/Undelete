@@ -703,6 +703,27 @@ func TestVerify(t *testing.T) {
 	}
 }
 
+// TestHTTPStatusExposesTheDownloadVerdict pins the accessor the fetch loop
+// classifies on: a status-carrying failure reports its status, anything else
+// reports none (and stays pending upstream).
+func TestHTTPStatusExposesTheDownloadVerdict(t *testing.T) {
+	if status, ok := HTTPStatus(&httpError{status: 404}); !ok || status != 404 {
+		t.Fatalf("HTTPStatus(404) = (%d, %t), want (404, true)", status, ok)
+	}
+	if status, ok := HTTPStatus(&httpError{status: 503}); !ok || status != 503 {
+		t.Fatalf("HTTPStatus(503) = (%d, %t), want (503, true)", status, ok)
+	}
+	if status, ok := HTTPStatus(ErrHTTP); ok || status != 0 {
+		t.Fatalf("HTTPStatus(bare ErrHTTP) = (%d, %t), want (0, false)", status, ok)
+	}
+	if status, ok := HTTPStatus(errors.New("connection reset")); ok || status != 0 {
+		t.Fatalf("HTTPStatus(transport) = (%d, %t), want (0, false)", status, ok)
+	}
+	if status, ok := HTTPStatus(nil); ok || status != 0 {
+		t.Fatalf("HTTPStatus(nil) = (%d, %t), want (0, false)", status, ok)
+	}
+}
+
 func TestNewRequiresBaseDirAndAppliesDefaults(t *testing.T) {
 	if _, err := New(Config{}); err == nil {
 		t.Fatal("New() without BaseDir should fail")

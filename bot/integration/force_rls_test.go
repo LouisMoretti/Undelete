@@ -20,9 +20,9 @@ import (
 //
 // ENABLE alone does not apply to the table owner: without FORCE, the owner
 // role (which runs migrations and owns the tables) would bypass every
-// policy silently. The restore script checks three of the tables; this test
-// covers all four -- messages, notification_outbox, chats AND media_files
-// (migration 0004, forgotten by the restore check).
+// policy silently. The restore script checks the same five tables; this test
+// covers them all -- messages, notification_outbox, chats, media_files
+// (migration 0004) and data_erasure_requests (migration 0006).
 func TestPostgreSQL16ForceRowLevelSecurity(t *testing.T) {
 	adminDSN := requireEnv(t, "POSTGRES_INTEGRATION_ADMIN_DSN")
 	runtimeDSN := requireEnv(t, "POSTGRES_INTEGRATION_RUNTIME_DSN")
@@ -50,14 +50,14 @@ func TestPostgreSQL16ForceRowLevelSecurity(t *testing.T) {
 		t.Fatalf("run migrations: %v", err)
 	}
 	// The runtime pool must still open: this also proves the migration set
-	// grants the undelete_app role everything it needs on all four tables.
+	// grants the undelete_app role everything it needs on all five tables.
 	db, err := storage.NewPool(ctx, runtimeDSN)
 	if err != nil {
 		t.Fatalf("open runtime pool: %v", err)
 	}
 	defer db.Close()
 
-	for _, table := range []string{"messages", "notification_outbox", "chats", "media_files"} {
+	for _, table := range []string{"messages", "notification_outbox", "chats", "media_files", "data_erasure_requests"} {
 		t.Run("FORCE RLS on "+table, func(t *testing.T) {
 			ctx := phaseContext(t)
 			var enabled, forced bool

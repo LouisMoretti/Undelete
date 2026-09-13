@@ -20,12 +20,25 @@ import (
 const (
 	EventDeletedMessage = "deleted_message"
 	// Strictly greater than the 60s HTTP timeout configured by cmd/bot.
-	defaultLease        = 2 * time.Minute
-	maxBackoff          = 15 * time.Minute
-	maxDeliveryAttempts = 5
+	defaultLease = 2 * time.Minute
+	maxBackoff   = 15 * time.Minute
+	// maxDeliveryAttempts bounds the FAST lane: how many reschedules one job
+	// gets before it moves to the slow lane (MarkFailed + a long-dated
+	// next_attempt_at, reclaimed later by Claim). Attempts 0..9 wait
+	// 1s..512s (2^9 = 512s < maxBackoff): roughly two hours of sustained
+	// Telegram outage. Beyond that the 6h resweep takes over instead of
+	// giving up -- a short outage must not cost an alert, and a long one
+	// must not spin the worker either.
+	maxDeliveryAttempts = 10
 	// 2^10 s = 1024s already exceeds maxBackoff: beyond that, the exponentiation
 	// is useless and would eventually overflow time.Duration (negative duration).
 	maxBackoffAttempts = 10
+	// maxThrottleDelay caps a stored retry_after. The server-provided value
+	// takes precedence over the client-side backoff, but a bogus one must
+	// not park an alert for a month. The wait is only ever STORED in
+	// next_attempt_at, never slept: the worker claims by deadline, so even a
+	// long retry_after blocks nothing.
+	maxThrottleDelay = 24 * time.Hour
 )
 
 // Job is an alert reserved by a worker.
@@ -156,6 +169,11 @@ func (w *Worker) ProcessOne(ctx context.Context, ownerUserID int64) (bool, error
 		return false, nil
 	}
 
+	// A 4xx that is not a 429 is a definitive refusal (unknown chat, blocked
+	// bot): no backoff would ever clear it. The job still goes through
+	// MarkFailed rather than being dropped, so the slow-lane resweep can
+	// deliver it if the refusal was transient in disguise (or the owner
+	// unblocked the bot since).
 	code := "transport"
 	var apiErr *telegram.APIError
 	if errors.As(err, &apiErr) {
@@ -169,6 +187,10 @@ func (w *Worker) ProcessOne(ctx context.Context, ownerUserID int64) (bool, error
 			return true, nil
 		}
 	}
+	// The fast lane is over: the alert moves to the slow lane (failed +
+	// long-dated next_attempt_at) instead of being abandoned. Claim reclaims
+	// it after the resweep delay with a fresh budget, so a multi-hour
+	// Telegram outage delays the alert instead of losing it.
 	if job.Attempts+1 >= maxDeliveryAttempts {
 		if markErr := w.store.MarkFailed(ctx, ownerUserID, job.ID, job.LeaseToken, code); markErr != nil {
 			return true, fmt.Errorf("outbox attempts exhausted: %w", markErr)
@@ -180,9 +202,14 @@ func (w *Worker) ProcessOne(ctx context.Context, ownerUserID int64) (bool, error
 
 	wait := retryDelay(job.Attempts)
 	if apiErr != nil && apiErr.IsRateLimited() {
+		// The server's own recovery timeline takes precedence over the
+		// client-side backoff (a 429 without retry_after is not rate-limited
+		// and falls through to the standard backoff above). Stored, never
+		// slept: claiming filters on next_attempt_at, so even an hour-long
+		// retry_after freezes nothing.
 		wait = time.Duration(apiErr.RetryAfter) * time.Second
-		if wait > maxBackoff {
-			wait = maxBackoff
+		if wait > maxThrottleDelay {
+			wait = maxThrottleDelay
 		}
 	}
 	if markErr := w.store.MarkRetry(ctx, ownerUserID, job.ID, job.LeaseToken, wait, code); markErr != nil {

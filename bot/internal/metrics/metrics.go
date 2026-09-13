@@ -9,7 +9,7 @@
 //
 // Deliberate corollary: the exposed series have NO labels, the list of names
 // is fixed and hardcoded in RenderPrometheus. Cardinality is therefore
-// bounded by construction (one series per name, five in total), without any
+// bounded by construction (one series per name, six in total), without any
 // runtime guardrail being necessary.
 package metrics
 
@@ -96,7 +96,7 @@ var allSeries = []series{
 	},
 	{
 		name:  "undelete_outbox_failed_total",
-		help:  "Total number of outbox alerts permanently abandoned (never delivered).",
+		help:  "Total number of outbox alerts that exhausted the fast lane and entered the slow lane (deferred with a fresh budget, never abandoned).",
 		kind:  "counter",
 		value: func(c *Counters) int64 { return c.outboxFailed.Load() },
 	},

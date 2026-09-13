@@ -149,7 +149,7 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeoutSeconds in
 	req := getUpdatesRequest{
 		Offset:         offset,
 		Timeout:        timeoutSeconds,
-		AllowedUpdates: AllowedUpdates, // contrainte n°1 : jamais omis
+		AllowedUpdates: AllowedUpdates(), // contrainte n°1 : jamais omis
 	}
 	var updates []Update
 	if err := c.call(ctx, "getUpdates", req, &updates); err != nil {
@@ -159,6 +159,29 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeoutSeconds in
 }
 
 const sendMessageAttempts = 3
+
+// sendMessageMaxWait bounds one 429-mandated sleep. SendMessage runs on the
+// sequential poller goroutine for the welcome message (with a context that
+// carries no deadline): an uncapped retry_after would freeze ALL capture for
+// its whole duration, the exact threat the poller caps at pollWait. A
+// truncated wait may draw another 429, which is what the attempt budget
+// absorbs.
+const sendMessageMaxWait = time.Minute
+
+// sendMessageWait resolves how long to sleep before the next attempt. The
+// server-provided retry_after takes precedence over the client-side backoff
+// (it is the service's own recovery timeline), capped so one abusive value
+// cannot freeze the poller; otherwise the exponential backoff applies.
+func sendMessageWait(apiErr *APIError, backoff time.Duration) time.Duration {
+	if apiErr != nil && apiErr.IsRateLimited() {
+		wait := time.Duration(apiErr.RetryAfter) * time.Second
+		if wait > sendMessageMaxWait {
+			return sendMessageMaxWait
+		}
+		return wait
+	}
+	return backoff
+}
 
 // SendMessage keeps the bounded retries for non-persisted sends (for
 // example the welcome message). The outbox alerts call SendMessageOnce so
@@ -174,12 +197,10 @@ func (c *Client) SendMessage(ctx context.Context, req SendMessageRequest) error 
 		wait := backoff
 		var apiErr *APIError
 		if errors.As(lastErr, &apiErr) {
-			switch {
-			case apiErr.IsRateLimited():
-				wait = time.Duration(apiErr.RetryAfter) * time.Second
-			case apiErr.Code < http.StatusInternalServerError:
+			if apiErr.Code < http.StatusInternalServerError && !apiErr.IsRateLimited() {
 				return lastErr
 			}
+			wait = sendMessageWait(apiErr, backoff)
 		}
 		if attempt == sendMessageAttempts {
 			break

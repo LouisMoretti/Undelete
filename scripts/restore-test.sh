@@ -308,6 +308,15 @@ else
     ko "gzip integrity of the archive"
 fi
 
+# The .sha256 sidecar scripts/backup.sh writes next to every archive must
+# exist and must verify: it is what a transfer or a silent disk corruption is
+# checked against before extracting.
+if [ -f "${archive}.sha256" ] && ( cd "$(dirname "$archive")" && sha256sum -c "$(basename "${archive}.sha256")" >/dev/null 2>&1 ); then
+    ok ".sha256 sidecar of the archive verifies"
+else
+    ko ".sha256 sidecar of the archive verifies"
+fi
+
 # --- Restoring into a distinct and empty TARGET ------------------------------
 # Second container, second name, second database: structurally, the restore
 # cannot land in the source or in an existing database.
@@ -387,9 +396,9 @@ expect_eq "restored outbox payload" "RESTORE-TEST canary payload" \
 rls_forced=$(query "$dst_container" "$dst_db" \
     "SELECT count(*) FROM pg_class
      WHERE relnamespace = 'public'::regnamespace
-       AND relname IN ('messages', 'notification_outbox', 'chats')
+       AND relname IN ('messages', 'notification_outbox', 'chats', 'media_files', 'data_erasure_requests')
        AND relrowsecurity AND relforcerowsecurity")
-expect_eq "FORCE ROW LEVEL SECURITY restored (3 tables)" "3" "$rls_forced"
+expect_eq "FORCE ROW LEVEL SECURITY restored (5 tables)" "5" "$rls_forced"
 
 echo
 echo "restore-test: measured RTO (restore only): ${restore_seconds}s"

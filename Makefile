@@ -1,8 +1,14 @@
-.PHONY: build vet fmt tidy check test-integration test-restore test-restore-media test-coverage up down logs
+.PHONY: build vet fmt tidy check test test-integration test-restore test-restore-media test-coverage up down logs
 
 # The 4 delivery commands, grouped together.
+# gofmt fails the target when a file is unformatted (gofmt -l alone always
+# exits 0); go mod tidy must leave go.mod/go.sum untouched (a dirty diff
+# means the module files were not committed tidy).
 check:
-	cd bot && go mod tidy && go build ./... && go vet ./... && gofmt -l .
+	cd bot && go build ./... && go vet ./... && test -z "$$(gofmt -l .)" && go mod tidy && git diff --exit-code -- go.mod go.sum
+
+test:
+	cd bot && go test ./...
 
 tidy:
 	cd bot && go mod tidy
@@ -14,7 +20,7 @@ vet:
 	cd bot && go vet ./...
 
 fmt:
-	cd bot && gofmt -l .
+	cd bot && gofmt -w .
 
 test-integration:
 	./scripts/test-integration.sh

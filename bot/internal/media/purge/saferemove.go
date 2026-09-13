@@ -201,9 +201,11 @@ func (p *Purger) removeRel(ownerUserID int64, rel, reason string, dryRun bool) (
 }
 
 // statRel inspects a tenant-owned relative path without following anything:
-// symlinks are reported as what they are (S_IFLNK), never traversed. Absence
-// at any level maps to os.ErrNotExist. Used by the reconciliation to decide
-// "stored row, file present or not" without ever resolving a string path.
+// symlinks are never traversed -- opening with O_NOFOLLOW makes a final
+// symlink fail the open (ELOOP, surfaced as ErrUnsafeTarget) and an
+// intermediate one fail the descent. Absence at any level maps to
+// os.ErrNotExist. Used by the reconciliation to decide "stored row, file
+// present or not" without ever resolving a string path.
 func (p *Purger) statRel(ownerUserID int64, rel string) (syscall.Stat_t, error) {
 	dir, base, err := p.openParent(ownerUserID, rel)
 	if err != nil {

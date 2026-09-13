@@ -83,6 +83,11 @@ services:
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS}
       MEDIA_BACKUP_MODE: ${MEDIA_BACKUP_MODE-auto}
       MEDIA_BACKUP_FULL_INTERVAL_DAYS: ${MEDIA_BACKUP_FULL_INTERVAL_DAYS-7}
+      # Optional dead man's switch (e.g. healthchecks.io): pinged after every
+      # fully successful pass (dump AND media). A missed ping means the backups
+      # are NOT happening -- the one failure this system must never sleep
+      # through. Empty by default (no ping). See docs/runbook.md.
+      BACKUP_PING_URL: ${BACKUP_PING_URL-}
     volumes:
       - ./scripts:/scripts:ro
       # Media are read here, never written: this service backs the directory
@@ -98,16 +103,27 @@ services:
         # Daily backup: an immediate pg_dump, then a loop that waits 24h
         # between each pass. No cron to keep things simple and avoid an
         # extra dependency in the image.
+        # Failure discipline: every failure prints a "backup: FATAL" line (grep
+        # for it in `docker compose logs backup`), the loop goes on (tomorrow's
+        # dump must still be taken), and a fully successful pass prints
+        # "backup: OK" and pings BACKUP_PING_URL when set.
         export BACKUP_DIR=/backups
         export MEDIA_DIR=/media
         while true; do
-          sh /scripts/backup.sh
+          failed=0
+          sh /scripts/backup.sh || { echo "backup: FATAL database dump failed (exit $?) -- investigate before the next window" >&2; failed=1; }
           # Media AFTER the dump, never before: backup-media.sh couples its
           # archive to the most recent dump present, so running it first would
           # tie today's media to yesterday's database. A media failure must
           # not abort the loop -- the dump of the next window still has to be
           # taken -- so it is reported and the loop goes on.
-          sh /scripts/backup-media.sh || echo "backup: media backup FAILED (exit $?)" >&2
+          sh /scripts/backup-media.sh || { echo "backup: FATAL media backup failed (exit $?)" >&2; failed=1; }
+          if [ "$failed" -eq 0 ]; then
+            echo "backup: OK daily pass complete"
+            if [ -n "${BACKUP_PING_URL:-}" ]; then
+              wget -q -O /dev/null -T 10 "$BACKUP_PING_URL" || echo "backup: FATAL dead man's switch ping failed" >&2
+            fi
+          fi
           sleep 86400
         done
 

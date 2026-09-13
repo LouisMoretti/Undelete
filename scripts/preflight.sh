@@ -170,18 +170,55 @@ else
 fi
 
 # --- 5. Permissions of data directories ------------------------------------
-# ./backups is a bind mount written by the backup service; ./media is written
-# by the bot, which runs as uid 10001 with a read-only rootfs.
+# ./backups is a bind mount written by the backup service (root in its
+# container); ./media is written by the bot, which runs as uid 10001 with a
+# read-only rootfs. Testing [ -w ] as the invoking user would bless a ./media
+# the bot itself cannot write, so the media directory is checked against the
+# bot's uid explicitly (owner 10001 with owner-write, or other-write).
 for directory in backups media; do
     path="${repo_root}/${directory}"
     if [ ! -d "$path" ]; then
         fail "directory ./${directory} missing: run \`mkdir -p ${path}\`"
+        continue
+    fi
+    if [ "$directory" = "media" ]; then
+        owner_uid="$(stat -c '%u' "$path" 2>/dev/null || echo unknown)"
+        mode="$(stat -c '%a' "$path" 2>/dev/null || echo unknown)"
+        if [ "$owner_uid" = "unknown" ] || [ "$mode" = "unknown" ]; then
+            skip "directory ./media: ownership unreadable on this machine (non-GNU stat?) -- verify manually that uid 10001 can write it"
+            continue
+        fi
+        owner_digit="$(printf '%s' "$mode" | cut -c1)"
+        other_digit="$(printf '%s' "$mode" | cut -c3)"
+        owner_writable="no"
+        other_writable="no"
+        case "$owner_digit" in 2|3|6|7) owner_writable="yes" ;; esac
+        case "$other_digit" in 2|3|6|7) other_writable="yes" ;; esac
+        if { [ "$owner_uid" = "10001" ] && [ "$owner_writable" = "yes" ]; } || [ "$other_writable" = "yes" ]; then
+            ok "directory ./media present and writable by uid 10001 (owner ${owner_uid}, mode ${mode})"
+        else
+            fail "directory ./media not writable by uid 10001 (owner ${owner_uid}, mode ${mode}): run \`chown 10001:10001 ${path}\` (see docs/runbook.md)"
+        fi
     elif [ -w "$path" ]; then
         ok "directory ./${directory} present and writable"
     else
         fail "directory ./${directory} present but not writable"
     fi
 done
+
+# --- 5b. Freshness of the last database dump ---------------------------------
+# A backup that has silently stopped running is exactly what this check must
+# catch: the daily loop takes one dump per 24h, so no archive younger than 49
+# hours means the backups are dead (or never ran -- a fresh install with no
+# dump yet is a SKIP, not a FAIL).
+latest_dump="$(find "${repo_root}/backups" -maxdepth 1 -name 'undelete-*.sql.gz' -type f -mtime -2 2>/dev/null | head -n 1)"
+if [ -n "$latest_dump" ]; then
+    ok "recent database dump present: $(basename "$latest_dump")"
+elif find "${repo_root}/backups" -maxdepth 1 -name 'undelete-*.sql.gz' -type f 2>/dev/null | grep -q .; then
+    fail "no database dump younger than 49h in ./backups: the daily backup loop is not producing -- check \`docker compose logs backup\` for 'backup: FATAL'"
+else
+    skip "no database dump in ./backups yet (first deploy?)"
+fi
 
 # --- 6. PostgreSQL roles ---------------------------------------------------
 # Checks that the owner role answers and that the app role exists without

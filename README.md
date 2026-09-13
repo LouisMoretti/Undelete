@@ -13,12 +13,18 @@ the bot retrieves the original content from the database (saved at the time
 of reception, because the deletion event does not carry the content) and
 notifies the account holder.
 
-## Scope of this phase (Phase 1)
+## Scope
 
-Mono-tenant, text-only messages, plaintext content in the database. The schema
-is already multi-tenant and under Row Level Security (RLS) to prepare for the
-following phases. Media, encryption and GDPR commands are marked
-`// TODO Phase N` in the code, not implemented.
+Mono-tenant (one Telegram Business account holder, guarded by
+`OWNER_TELEGRAM_USER_ID`), with text AND media capture: messages are saved on
+receipt with their attachments downloaded to `./media`, and a deletion is
+notified to the holder with the original content -- text always, media when
+the download completed in time. Content rests in plaintext in the database
+(encryption is an explicit non-goal of this stage, see `docs/runbook.md` and
+the privacy policy). Owner commands: `/privacy`, `/retention` (read and set,
+1-365 days) and `/delete_my_data` (single-use expiring challenge, full tenant
+erasure). The schema is multi-tenant and under Row Level Security (RLS)
+throughout.
 
 ## Telegram setup (3 steps)
 
@@ -147,13 +153,22 @@ caller are respected as-is.
 ## CI
 
 `.github/workflows/ci.yml` runs on every `pull_request` and every `push` to
-`main`, with two jobs:
+`main`, plus a weekly schedule (drift check) and manual dispatch, with five jobs:
 
 - **`lint + unit tests`**: `gofmt -l` (fails on output), `go vet ./...`,
-  `go test ./...` on the `bot/` module.
+  `go mod tidy` check (module files must be committed tidy),
+  `go test ./...` on the `bot/` module with a 70% statement-coverage floor.
 - **`PostgreSQL 16 integration`**: `make test-integration`, which starts its
   own throwaway PostgreSQL 16 container on the runner and runs the integration
   suite then the outbox tests.
+- **`combined coverage (unit + integration)`**: `make test-coverage`, with a
+  75% floor gate.
+- **`docker build`**: builds the production image from `bot/Dockerfile`, so a
+  broken Dockerfile fails here and not on the deployment machine.
+- **`backup restore recipes`** (schedule and manual runs only -- too slow for
+  every PR): `make test-restore` and `make test-restore-media` against
+  throwaway containers; the scripts refuse foreign DSNs and never touch
+  existing volumes.
 
 No secret is used, no real database is exposed: only ephemeral containers with
 throwaway credentials. The `GITHUB_TOKEN` token has `contents: read`.
@@ -162,9 +177,9 @@ throwaway credentials. The `GITHUB_TOKEN` token has `contents: read`.
 branch ruleset* / *Add rule* on `main`) — not automatable from this repository:
 
 1. *Require a pull request before merging*.
-2. *Require status checks to pass before merging*, then select the two checks
-   `lint + unit tests` and `PostgreSQL 16 integration` (they only appear in the
-   list after the workflow has run once).
+2. *Require status checks to pass before merging*, then select the checks
+   `lint + unit tests`, `PostgreSQL 16 integration`, `combined coverage` and
+   `docker build` (they only appear in the list after the workflow has run once).
 3. *Require branches to be up to date before merging*.
 4. Forbid force-pushes on `main`.
 

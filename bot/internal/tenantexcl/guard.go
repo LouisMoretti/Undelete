@@ -1,7 +1,7 @@
 // Package tenantexcl coordinates, per tenant, the erasure of a tenant with
 // the background workers that keep writing that same tenant's data.
 //
-// Without it, three interleavings defeat /delete_my_data, and all three are
+// Without it, four interleavings defeat /delete_my_data, and all four are
 // established by reading the code paths, not by any particular timing:
 //
 //   - the media fetcher loads a batch of pending rows, the erasure deletes
@@ -11,16 +11,20 @@
 //   - the outbox worker claims a job, the erasure deletes the row, then the
 //     worker delivers the payload it already holds and acknowledges a lease
 //     that no longer exists;
+//   - the daily media retention unlinks or requeues while the erasure sweeps
+//     the same subtree (benign by idempotence today, excluded by coordination
+//     so it stays that way);
 //   - two Confirm calls for the same code both enter the erasure: the claim
 //     guarantees a single pending -> consumed transition, not a single
 //     executor.
 //
 // The coordination is a per-tenant readers/writer lock. Workers hold the
 // read side for the whole unit of work they must not be interrupted in the
-// middle of (one fetch batch, one claim -> deliver -> acknowledge cycle);
-// the erasure holds the write side for its whole run (claim -> steps ->
-// complete). An in-flight unit finishes first, then the erasure drains what
-// is left; a unit that starts after the erasure finds nothing to do.
+// middle of (one fetch batch, one claim -> deliver -> acknowledge cycle, one
+// tenant's retention pass); the erasure holds the write side for its whole
+// run (claim -> steps -> complete). An in-flight unit finishes first, then
+// the erasure drains what is left; a unit that starts after the erasure finds
+// nothing to do.
 //
 // The scope is one process: the bot runs a single poller, a single fetcher
 // and a single outbox loop, so an in-memory lock covers every writer. A

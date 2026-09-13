@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync/atomic"
 	"time"
@@ -47,8 +48,22 @@ type Poller struct {
 }
 
 func NewPoller(client *Client, logger *slog.Logger) *Poller {
+	if logger == nil {
+		// A nil logger must not panic the loop on the first network error:
+		// default to discard rather than to trust every caller.
+		logger = slog.New(discardHandler{})
+	}
 	return &Poller{client: client, logger: logger}
 }
+
+// discardHandler drops every record. Used as the last-resort logger when a
+// constructor receives nil: logging nothing beats panicking.
+type discardHandler struct{}
+
+func (discardHandler) Enabled(context.Context, slog.Level) bool  { return false }
+func (discardHandler) Handle(context.Context, slog.Record) error { return nil }
+func (discardHandler) WithAttrs([]slog.Attr) slog.Handler        { return discardHandler{} }
+func (discardHandler) WithGroup(string) slog.Handler             { return discardHandler{} }
 
 // LastSuccessfulPoll returns the time of the last successful getUpdates, or
 // the zero value if no poll has succeeded yet since startup. Serves as a
@@ -76,8 +91,24 @@ func pollWait(backoff time.Duration, err error) time.Duration {
 	return backoff
 }
 
+// ErrPollTimeoutTooShort is wrapped by Run when the HTTP client cannot
+// survive the long-poll wait: the client would cut every getUpdates before
+// Telegram answers, and the bot would spin on errors forever. Failing loudly
+// at startup instead. Exported sentinel so the cause is identifiable with
+// errors.Is rather than by the message text.
+var ErrPollTimeoutTooShort = errors.New("telegram: HTTP client timeout too short for the long-poll wait")
+
 // Run loops until the context is cancelled.
 func (p *Poller) Run(ctx context.Context, handle Handler) error {
+	// The invariant the long poll depends on: the HTTP client must outlive
+	// the 50s server wait, otherwise every poll is cut before Telegram
+	// answers and the bot spins on errors forever. Enforced here, not in a
+	// comment: NewClient is also used for short-timeout unit clients that
+	// must stay fast.
+	if timeout := p.client.httpClient.Timeout; timeout <= pollTimeoutSeconds*time.Second {
+		return fmt.Errorf("%w: timeout %v, long-poll wait %ds", ErrPollTimeoutTooShort, timeout, pollTimeoutSeconds)
+	}
+
 	backoff := minBackoff
 
 	for {

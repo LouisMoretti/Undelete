@@ -88,9 +88,12 @@ func New(repo catalogue, resolver Resolver, downloader Downloader, token string,
 // A transient failure (5xx, rate limit, network) leaves the row pending: the
 // next pass retries it, and nothing is lost. A DEFINITIVE failure -- a file
 // Telegram will never hand over (over the 20 MB getFile ceiling, expired
-// file_id, refused path) -- marks the row purged: the attachment stays
-// catalogued, so the deletion alert can still say a media existed, and the
-// loop stops asking for it forever.
+// file_id, refused path, definitive 4xx from getFile OR from the download
+// itself) -- marks the row purged: the attachment stays catalogued, so the
+// deletion alert can still say a media existed, and the loop stops asking for
+// it forever. Anything else stays pending until the stale-pending sweeper
+// drops it, and that is a deliberate asymmetry: giving up too early loses the
+// media for good.
 func (f *Fetcher) ProcessTenant(ctx context.Context, ownerUserID int64) (int, error) {
 	if f.guard != nil {
 		release, err := f.guard.Shared(ctx, ownerUserID)
@@ -174,6 +177,17 @@ func isDefinitive(err error) bool {
 		return apiErr.Code >= http.StatusBadRequest &&
 			apiErr.Code < http.StatusInternalServerError &&
 			apiErr.Code != http.StatusTooManyRequests
+	}
+	// The download's own HTTP verdict, mirroring the store's retry rule: a
+	// status the download would never retry (expired file, revoked token) is
+	// definitive here too -- the row is catalogued without a file instead of
+	// lingering pending until the stale sweeper drops it without a trace. A
+	// bare ErrHTTP carries no status and stays pending.
+	if status, ok := store.HTTPStatus(err); ok {
+		return status >= http.StatusBadRequest &&
+			status < http.StatusInternalServerError &&
+			status != http.StatusTooManyRequests &&
+			status != http.StatusRequestTimeout
 	}
 	return false
 }

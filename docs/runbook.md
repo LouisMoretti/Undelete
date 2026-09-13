@@ -6,13 +6,6 @@ execution of this procedure**, in order.
 
 All commands are run from the repository root on the VM.
 
-> **Dependencies between PRs.** This runbook references two elements delivered
-> by other PRs in the same stack: the HTTP probes `/livez`, `/readyz` and
-> `/metrics` on port `9090` (**available after the probes PR, #6**) and
-> `make test-restore` + `docs/backup-restore.md` (**available after the
-> test-restore PR, #7**). The affected steps are marked *(after #6)* /
-> *(after #7)* and have an alternative applicable today.
-
 ---
 
 ## 0. Destructive actions — closed list
@@ -50,7 +43,8 @@ sh scripts/preflight.sh
 ```
 
 **Read-only** script (no writes, no deletions), replayable.
-It reports one line per check and exits with code 1 at the first `[ECHEC]`:
+It runs **all** checks and exits with code 1 if any `[FAIL]` line was
+reported:
 
 | Check | Detail |
 |---|---|
@@ -61,7 +55,8 @@ It reports one line per check and exits with code 1 at the first `[ECHEC]`:
 | `BACKUP_RETENTION_DAYS` | integer; absent ⇒ `backup.sh` applies 14 days |
 | distinct DSNs | `DATABASE_URL ≠ MIGRATION_DATABASE_URL`, same rule as `config.Load()` |
 | disk space | threshold `PREFLIGHT_MIN_DISK_GB` (default 2 GB) on the repository FS |
-| `./backups` and `./media` | present and writable (compose bind mounts) |
+| `./backups` and `./media` | present; `./media` writable by uid 10001 (the bot's user -- first setup needs `chown 10001:10001 media`) |
+| dump freshness | an `undelete-*.sql.gz` younger than 49h in `./backups` (the daily loop is dead otherwise; no dump at all is a `[SKIP]`, i.e. first deploy) |
 | PostgreSQL roles | owner role reachable; `undelete_app` exists, `NOSUPERUSER` and `NOBYPASSRLS` |
 | Telegram token | `getMe` on api.telegram.org; **the token is never displayed**, any API output is masked |
 
@@ -102,6 +97,7 @@ the `postgres_data` volume, never on an already-initialized volume.
 
 - [ ] `git status` clean and expected branch/tag (`git log --oneline -1`).
 - [ ] `.env` at `600`, owner = the user who runs compose.
+- [ ] `./media` owned by `10001:10001` (preflight checks it; first setup: `chown 10001:10001 media`).
 - [ ] Disk space: `df -h .` — plan for the database **plus** the dump retention.
 - [ ] `docker compose config` reports no unsubstituted variable.
 - [ ] `make check` green (build + vet + gofmt) on the commit to deploy.
@@ -126,6 +122,14 @@ every 24 h). Before a deployment, force a fresh dump **now**:
 ```bash
 docker compose exec -T -e BACKUP_DIR=/backups backup sh /scripts/backup.sh
 ls -lh backups/ | tail -3
+```
+
+Every dump is written with a `.sha256` sidecar, verified by the script
+itself right after writing. Verify the pair after a forced dump (and any
+time a dump is copied anywhere):
+
+```bash
+cd backups && sha256sum -c undelete-<timestamp>.sql.gz.sha256
 ```
 
 The script purges archives that reached `BACKUP_RETENTION_DAYS` days of age
@@ -163,7 +167,8 @@ explicitly since an `exec` session inherits nothing from the service loop:
 docker compose exec -T -e BACKUP_DIR=/backups -e MEDIA_DIR=/media backup sh /scripts/backup-media.sh
 ```
 
-It writes an archive plus its `MANIFEST`, `.sha256` and `.meta` sidecars, and
+It writes an archive plus its `MANIFEST`, `.sha256`, `.meta` (and, when paths
+had to be excluded, `.skipped`) sidecars, and
 **deletes nothing** — media retention is manual. Exit code `2` means the
 archive was written but some paths were excluded (see the `.skipped` sidecar);
 any other non-zero code means **nothing** was kept — a failed run removes its
@@ -171,6 +176,22 @@ own partial output rather than leaving a truncated archive behind. The files
 are written `0600` and owned by `root` (the container's identity), so reading
 them from the host is a `sudo` matter. Details, retention procedure and
 restore order: `docs/backup-restore.md`.
+
+### Monitoring the backup loop
+
+Every failure of the loop prints a greppable `backup: FATAL` line in the
+service logs; a fully successful pass (dump AND media) prints `backup: OK`:
+
+```bash
+docker compose logs backup | grep -E 'backup: (FATAL|OK)'
+```
+
+A dead loop prints nothing at all -- which is why the optional dead man's
+switch exists: set `BACKUP_PING_URL` in `.env` (e.g. a healthchecks.io check)
+and it is pinged after every fully successful pass. A missed ping means the
+backups are NOT happening, even if nobody reads the logs. Preflight's dump
+freshness check (`undelete-*.sql.gz` younger than 49h) is the second net for
+the same failure: run it daily (see the cron in §5.2).
 
 Note the dump name: it is the rollback point of §3.3.
 
@@ -223,21 +244,18 @@ bot waits for `service_healthy` on Postgres: a slightly slow start is normal.
 
 ### Step 4 — Verification
 
-**a. HTTP probes** *(after #6)* — on `:9090`:
+**a. HTTP probes** — on `:9090`, internal to the Docker network (the port is
+deliberately NOT published, so query them from inside the bot container):
 
 ```bash
-curl -fsS http://localhost:9090/livez  && echo " livez OK"
-curl -fsS http://localhost:9090/readyz && echo " readyz OK"
-curl -fsS http://localhost:9090/metrics | head -20
+docker compose exec bot wget -q -O - http://127.0.0.1:9090/livez  && echo " livez OK"
+docker compose exec bot wget -q -O - http://127.0.0.1:9090/readyz && echo " readyz OK"
+docker compose exec bot wget -q -O - http://127.0.0.1:9090/metrics | head -20
 ```
 
 `/livez` = process alive; `/readyz` = migrations done, application pool open
 and poller started. A persistently red `/readyz` while `/livez` is green ⇒
 look at the database before touching the bot.
-
-*Before #6*, the equivalent check is read in the logs (below) and via
-`docker compose ps` (state `running`, no restart loop:
-`docker compose ps --format '{{.Name}} {{.Status}}'`).
 
 **b. Logs**:
 
@@ -381,7 +399,7 @@ database is corrupted.
 > overwrites the current state and loses any data after the dump.
 
 Detailed procedure: **`docs/backup-restore.md` and `make test-restore`**
-*(after #7)* — these are the references to follow, including to validate the
+-- these are the references to follow, including to validate the
 dump **before** applying it.
 
 Imposed order, whatever the path:
@@ -502,7 +520,7 @@ to "test faster" on the production database.
 
 ```bash
 sh scripts/preflight.sh   # configuration drift, disk, token validity
-make test-restore         # (after #7) restoration of a real dump into a throwable database
+make test-restore         # restoration of a real dump into a throwable database
 make test-restore-media   # restoration of the dump + media pair, and reconciliation
 ```
 
@@ -585,6 +603,6 @@ the next pass repairs on its own. Restarting the bot is always a valid answer.
 | Stop (volume preserved) | `make down` (`docker compose down`, **without `-v`**) |
 | Build + lint | `make check` |
 | Integration tests | `make test-integration` |
-| Restore recipe | `make test-restore` *(after #7)* |
+| Restore recipe | `make test-restore` |
 | Media purge, first rollout | `MEDIA_PURGE_DRY_RUN=true` in `.env`, then §6 |
-| Probes | `curl -fsS localhost:9090/{livez,readyz,metrics}` *(after #6)* |
+| Probes | `docker compose exec bot wget -q -O - http://127.0.0.1:9090/{livez,readyz,metrics}` |

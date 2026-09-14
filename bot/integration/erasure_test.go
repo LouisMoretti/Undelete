@@ -88,7 +88,7 @@ func TestPostgreSQL16Erasure(t *testing.T) {
 	mediaRepo := media.NewRepository(db)
 	// A nil Telegram client is enough: the erasure only ever calls DisableOwner,
 	// which is pure SQL plus the in-memory cache. Nothing here reaches the API.
-	businessSvc := business.NewService(db.Pool, nil, userRepo, 0, logger)
+	businessSvc := business.NewService(db.Pool, nil, userRepo, nil, logger)
 	mediaPurger, err := purge.New(purge.Config{MediaDir: root, Catalogue: mediaRepo, Logger: logger})
 	if err != nil {
 		t.Fatalf("new purger: %v", err)

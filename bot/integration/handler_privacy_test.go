@@ -99,7 +99,7 @@ func TestPrivacyCommandAnswersOnlyTheConnectionOwner(t *testing.T) {
 
 	// client stays nil: the connection row exists, so Resolve never reaches
 	// the Telegram API (cache miss -> DB hit).
-	businessSvc := business.NewService(db.Pool, nil, userRepo, 0, logger)
+	businessSvc := business.NewService(db.Pool, nil, userRepo, nil, logger)
 	sender := &recordingSender{}
 	handler := app.NewHandler(businessSvc, messages.NewRepository(db), media.NewRepository(db), logger,
 		app.WithCommandSender(sender))

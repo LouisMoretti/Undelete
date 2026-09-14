@@ -145,6 +145,22 @@ func NewHandler(businessSvc businessService, messagesRepo messageStore, mediaRep
 	return h
 }
 
+// connectionRefused reports a resolution failure that means "this update has no
+// tenant behind it", as opposed to "resolution did not work this time".
+//
+// The three refusals are the onboarding allowlist (the account holder is not
+// admitted), a revoked connection (Telegram no longer recognises the id) and an
+// owner conflict (the id belongs to another tenant). All three are permanent
+// for this update and must drop it silently: retrying would never succeed, and
+// returning an error would only fill the logs while the poller advances its
+// offset anyway. Every other error is surfaced, so a database outage or a
+// rate-limited API still reads as a failure.
+func connectionRefused(err error) bool {
+	return errors.Is(err, business.ErrOwnerNotAllowed) ||
+		errors.Is(err, business.ErrConnectionUnknown) ||
+		errors.Is(err, business.ErrConnectionOwnerConflict)
+}
+
 // HandleUpdate implements telegram.Handler.
 func (h *Handler) HandleUpdate(ctx context.Context, u telegram.Update) error {
 	switch {
@@ -234,8 +250,8 @@ func (h *Handler) handleControlCommand(ctx context.Context, msg *telegram.Messag
 	}
 	conn, err := h.business.Resolve(ctx, msg.BusinessConnectionID)
 	if err != nil {
-		if errors.Is(err, business.ErrOwnerMismatch) {
-			// Refused by the mono-tenant guard: no owner, no command.
+		if connectionRefused(err) {
+			// No tenant behind this connection: no owner, no command.
 			return true, nil
 		}
 		return false, fmt.Errorf("connection resolution for control command: %w", err)
@@ -309,7 +325,7 @@ func (h *Handler) dropConfirmEdit(ctx context.Context, msg *telegram.Message) (b
 		return false, nil
 	}
 	if _, err := h.business.Resolve(ctx, msg.BusinessConnectionID); err != nil {
-		if errors.Is(err, business.ErrOwnerMismatch) {
+		if connectionRefused(err) {
 			return true, nil
 		}
 		return false, fmt.Errorf("connection resolution for edited command: %w", err)
@@ -345,8 +361,8 @@ func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited
 	}
 	conn, err := h.business.Resolve(ctx, msg.BusinessConnectionID)
 	if err != nil {
-		if errors.Is(err, business.ErrOwnerMismatch) {
-			h.logger.Debug("message ignored: connection refused by the mono-tenant guard",
+		if connectionRefused(err) {
+			h.logger.Debug("message ignored: connection refused (not admitted, revoked, or owned by another tenant)",
 				slog.String("business_connection_id", msg.BusinessConnectionID))
 			return nil, nil
 		}
@@ -427,8 +443,10 @@ func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited
 // Only the holder is answered. A contact who writes /privacy in a monitored
 // chat gets nothing at all: not an answer in the chat, not an answer to
 // themselves, not a notification. Two independent checks stand in the way --
-// the connection resolution, which the mono-tenant guard already filters, and
-// the sender identity compared against the owner of that very connection.
+// the connection resolution, which already refuses anything the onboarding
+// allowlist rejects, and the sender identity compared against the owner of that
+// very connection -- the owner OF THAT CONNECTION, never "an owner", which is
+// what keeps one tenant from answering themselves through another's connection.
 func (h *Handler) answerCommand(ctx context.Context, conn *business.Connection, msg *telegram.Message) {
 	if h.sender == nil {
 		return
@@ -840,7 +858,7 @@ func (h *Handler) handleDeleted(ctx context.Context, del *telegram.BusinessMessa
 	}
 	conn, err := h.business.Resolve(ctx, del.BusinessConnectionID)
 	if err != nil {
-		if errors.Is(err, business.ErrOwnerMismatch) {
+		if connectionRefused(err) {
 			return nil
 		}
 		return fmt.Errorf("connection resolution for deletion: %w", err)

@@ -12,6 +12,7 @@ func validEnv(t *testing.T) {
 	t.Setenv("MIGRATION_DATABASE_URL", "postgres://owner:owner@postgres/undelete")
 	t.Setenv("TELEGRAM_BOT_TOKEN", "not-a-real-bot-token")
 	t.Setenv("OWNER_TELEGRAM_USER_ID", "")
+	t.Setenv("OWNER_ALLOWLIST_TELEGRAM_USER_IDS", "")
 	t.Setenv("HEALTH_ADDR", defaultHealthAddr)
 }
 
@@ -87,16 +88,18 @@ func TestLoadRejectsIdenticalDatabaseURLs(t *testing.T) {
 	}
 }
 
-func TestLoadParsesOwnerGuard(t *testing.T) {
+func TestLoadParsesOwnerAllowlistOfSeveralOwners(t *testing.T) {
 	validEnv(t)
-	t.Setenv("OWNER_TELEGRAM_USER_ID", "123456789")
+	t.Setenv("OWNER_ALLOWLIST_TELEGRAM_USER_IDS", "123456789,987654321")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load() unexpected error: %v", err)
 	}
-	if cfg.OwnerTelegramUserID != 123456789 {
-		t.Fatalf("OwnerTelegramUserID = %d", cfg.OwnerTelegramUserID)
+	if len(cfg.AllowedOwnerTelegramUserIDs) != 2 ||
+		cfg.AllowedOwnerTelegramUserIDs[0] != 123456789 ||
+		cfg.AllowedOwnerTelegramUserIDs[1] != 987654321 {
+		t.Fatalf("AllowedOwnerTelegramUserIDs = %v", cfg.AllowedOwnerTelegramUserIDs)
 	}
 }
 

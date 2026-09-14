@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -10,7 +11,8 @@ func withCleanEnv(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
 		"DATABASE_URL", "MIGRATION_DATABASE_URL", "TELEGRAM_BOT_TOKEN",
-		"OWNER_TELEGRAM_USER_ID", "MEDIA_DIR", "MEDIA_PURGE_DRY_RUN", "HEALTH_ADDR",
+		"OWNER_TELEGRAM_USER_ID", "OWNER_ALLOWLIST_TELEGRAM_USER_IDS",
+		"MEDIA_DIR", "MEDIA_PURGE_DRY_RUN", "HEALTH_ADDR",
 	} {
 		t.Setenv(key, "")
 	}
@@ -48,31 +50,100 @@ func TestLoadRejectsMissingRequiredVars(t *testing.T) {
 	}
 }
 
-// TestLoadRejectsInvalidOwnerGuard pins the mono-tenant guard parsing: a
-// non-numeric OWNER_TELEGRAM_USER_ID must fail startup, never silently
-// disable the filter.
-func TestLoadRejectsInvalidOwnerGuard(t *testing.T) {
-	for _, raw := range []string{"abc", "12.5", "7x7"} {
+// TestLoadRejectsInvalidOwnerAllowlist pins the allowlist parsing: a malformed
+// entry must fail startup, never be skipped. An allowlist silently missing an
+// id would lock its owner out; one silently gaining an id would admit a
+// stranger.
+func TestLoadRejectsInvalidOwnerAllowlist(t *testing.T) {
+	for _, raw := range []string{"abc", "12.5", "7x7", "-42", "+42", "007", "0", "42,abc", "42 abc"} {
 		t.Run(raw, func(t *testing.T) {
 			withValidBase(t)
-			t.Setenv("OWNER_TELEGRAM_USER_ID", raw)
+			t.Setenv("OWNER_ALLOWLIST_TELEGRAM_USER_IDS", raw)
 			if _, err := Load(); err == nil {
-				t.Fatalf("Load() accepted OWNER_TELEGRAM_USER_ID=%q", raw)
+				t.Fatalf("Load() accepted OWNER_ALLOWLIST_TELEGRAM_USER_IDS=%q", raw)
 			}
 		})
 	}
 }
 
-// TestLoadOwnerGuardZeroMeansNoRestriction pins the dev-mode convention: an
-// explicitly empty value (and the unset variable) leaves the filter off.
-func TestLoadOwnerGuardZeroMeansNoRestriction(t *testing.T) {
+// TestLoadEmptyOwnerAllowlistIsOpenOnboarding pins the multi-tenant default: an
+// explicitly empty value (and the unset variable) admits every account holder.
+func TestLoadEmptyOwnerAllowlistIsOpenOnboarding(t *testing.T) {
 	withValidBase(t)
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load(): %v", err)
 	}
-	if cfg.OwnerTelegramUserID != 0 {
-		t.Fatalf("OwnerTelegramUserID = %d, want 0 (no restriction)", cfg.OwnerTelegramUserID)
+	if len(cfg.AllowedOwnerTelegramUserIDs) != 0 {
+		t.Fatalf("AllowedOwnerTelegramUserIDs = %v, want empty (open onboarding)", cfg.AllowedOwnerTelegramUserIDs)
+	}
+}
+
+// TestLoadRejectsObsoleteOwnerGuard is the upgrade guard of issue #17: an
+// operator who upgrades with OWNER_TELEGRAM_USER_ID still in their .env would
+// otherwise keep believing a single account holder is admitted, while the bot
+// had silently switched to open onboarding. Startup must fail and name the
+// replacement.
+//
+// "Set but empty" is the one tolerated shape: docker compose forwards every
+// declared variable, so an unset guard reaches the container as an empty
+// string, and empty meant "no guard" before exactly as it means "open
+// onboarding" now.
+func TestLoadRejectsObsoleteOwnerGuard(t *testing.T) {
+	t.Run("a leftover value fails startup", func(t *testing.T) {
+		withValidBase(t)
+		t.Setenv("OWNER_TELEGRAM_USER_ID", "123456789")
+		_, err := Load()
+		if err == nil {
+			t.Fatal("Load() accepted the obsolete OWNER_TELEGRAM_USER_ID")
+		}
+		if !strings.Contains(err.Error(), "OWNER_ALLOWLIST_TELEGRAM_USER_IDS") {
+			t.Fatalf("Load() error = %v, want it to name the replacement variable", err)
+		}
+	})
+
+	t.Run("set but empty is tolerated", func(t *testing.T) {
+		withValidBase(t)
+		t.Setenv("OWNER_TELEGRAM_USER_ID", "")
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load() with an empty OWNER_TELEGRAM_USER_ID: %v", err)
+		}
+	})
+}
+
+// TestLoadParsesOwnerAllowlist pins the accepted shapes of the list: commas,
+// whitespace, both mixed, and duplicates collapsed rather than refused.
+func TestLoadParsesOwnerAllowlist(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want []int64
+	}{
+		{name: "single id", raw: "123456789", want: []int64{123456789}},
+		{name: "comma separated", raw: "1,2,3", want: []int64{1, 2, 3}},
+		{name: "comma and spaces", raw: " 1, 2 ,3 ", want: []int64{1, 2, 3}},
+		{name: "whitespace separated", raw: "1 2\t3", want: []int64{1, 2, 3}},
+		{name: "empty entries skipped", raw: "1,,2", want: []int64{1, 2}},
+		{name: "duplicates collapsed", raw: "1,2,1", want: []int64{1, 2}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			withValidBase(t)
+			t.Setenv("OWNER_ALLOWLIST_TELEGRAM_USER_IDS", tt.raw)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load(): %v", err)
+			}
+			if len(cfg.AllowedOwnerTelegramUserIDs) != len(tt.want) {
+				t.Fatalf("AllowedOwnerTelegramUserIDs = %v, want %v", cfg.AllowedOwnerTelegramUserIDs, tt.want)
+			}
+			for i, id := range tt.want {
+				if cfg.AllowedOwnerTelegramUserIDs[i] != id {
+					t.Fatalf("AllowedOwnerTelegramUserIDs = %v, want %v", cfg.AllowedOwnerTelegramUserIDs, tt.want)
+				}
+			}
+		})
 	}
 }
 

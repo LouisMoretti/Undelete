@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // Config holds the bot's runtime configuration.
@@ -25,11 +26,19 @@ type Config struct {
 	// TelegramBotToken is the bot token, as provided by BotFather.
 	TelegramBotToken string
 
-	// OwnerTelegramUserID, if non-zero, restricts the bot to a single
-	// Telegram Business owner (mono-tenant guard Phase 1). A Business
-	// connection from a different telegram_user_id is refused.
-	// 0 = no restriction (not recommended outside local dev).
-	OwnerTelegramUserID int64
+	// AllowedOwnerTelegramUserIDs is the onboarding allowlist, read from
+	// OWNER_ALLOWLIST_TELEGRAM_USER_IDS. It replaces the mono-tenant
+	// OWNER_TELEGRAM_USER_ID guard of Phase 1.
+	//
+	// EMPTY means open onboarding: any Telegram Business account holder may
+	// connect the bot, and each one becomes a tenant of their own. A non-empty
+	// list admits exactly those Telegram user ids -- which is how a deployment
+	// that used to be mono-tenant keeps precisely the guarantee it had, by
+	// listing its single holder.
+	//
+	// This is ADMISSION control, never isolation: whatever it contains, every
+	// tenant's data stays behind the same RLS policies keyed on owner_user_id.
+	AllowedOwnerTelegramUserIDs []int64
 
 	// MediaDir is the storage root of the downloaded attachments ("media" by
 	// default, bind-mounted to /app/media by Compose). Every path stored in
@@ -165,13 +174,84 @@ func Load() (*Config, error) {
 			"on messages would be decorative; use the restricted undelete_app role for DATABASE_URL")
 	}
 
-	if raw := os.Getenv("OWNER_TELEGRAM_USER_ID"); raw != "" {
-		id, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid OWNER_TELEGRAM_USER_ID: %w", err)
-		}
-		cfg.OwnerTelegramUserID = id
+	// OWNER_TELEGRAM_USER_ID was the Phase 1 mono-tenant guard. Ignoring a
+	// leftover value would be the one silent failure mode this change can
+	// have: the operator would still believe a single account holder is
+	// admitted, while the bot had in fact switched to open onboarding. It is
+	// therefore a startup error, not a warning.
+	//
+	// "Set but empty" is tolerated on purpose: docker compose passes every
+	// declared variable through, so an unset OWNER_TELEGRAM_USER_ID reaches the
+	// container as an empty string. An empty value meant "no guard" before and
+	// means "open onboarding" now -- the same thing, so there is nothing to
+	// correct.
+	if raw := strings.TrimSpace(os.Getenv("OWNER_TELEGRAM_USER_ID")); raw != "" {
+		return nil, fmt.Errorf("OWNER_TELEGRAM_USER_ID is no longer supported: " +
+			"move that id into OWNER_ALLOWLIST_TELEGRAM_USER_IDS (comma-separated Telegram user ids, " +
+			"empty for open onboarding) and unset OWNER_TELEGRAM_USER_ID")
 	}
 
+	allowed, err := parseOwnerAllowlist(os.Getenv("OWNER_ALLOWLIST_TELEGRAM_USER_IDS"))
+	if err != nil {
+		return nil, err
+	}
+	cfg.AllowedOwnerTelegramUserIDs = allowed
+
 	return cfg, nil
+}
+
+// parseOwnerAllowlist reads OWNER_ALLOWLIST_TELEGRAM_USER_IDS into the list of
+// Telegram user ids allowed to onboard.
+//
+// Accepted separators are commas and any whitespace, so a list can be written
+// on one line or wrapped. Each token must be a canonical, strictly positive
+// decimal integer: no sign, no leading zero, nothing else (same strictness as
+// users.ParseRetentionDays). A malformed entry is refused rather than skipped
+// -- an allowlist silently missing an id would look like it admits an owner it
+// does not, and one silently gaining an id would be worse.
+//
+// An empty (or absent) value yields nil: open onboarding.
+func parseOwnerAllowlist(raw string) ([]int64, error) {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || unicode.IsSpace(r)
+	})
+	if len(fields) == 0 {
+		return nil, nil
+	}
+
+	allowed := make([]int64, 0, len(fields))
+	seen := make(map[int64]struct{}, len(fields))
+	for _, token := range fields {
+		if !isCanonicalPositiveDecimal(token) {
+			return nil, fmt.Errorf("invalid OWNER_ALLOWLIST_TELEGRAM_USER_IDS entry %q: "+
+				"expected a comma-separated list of positive Telegram user ids", token)
+		}
+		id, err := strconv.ParseInt(token, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid OWNER_ALLOWLIST_TELEGRAM_USER_IDS entry %q: %w", token, err)
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		allowed = append(allowed, id)
+	}
+	return allowed, nil
+}
+
+// isCanonicalPositiveDecimal reports whether token is a strictly positive
+// decimal integer written without sign, leading zero or separator.
+func isCanonicalPositiveDecimal(token string) bool {
+	if token == "" || token == "0" {
+		return false
+	}
+	if token[0] == '0' {
+		return false
+	}
+	for i := 0; i < len(token); i++ {
+		if token[i] < '0' || token[i] > '9' {
+			return false
+		}
+	}
+	return true
 }

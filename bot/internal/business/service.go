@@ -13,7 +13,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync"
+	"net/http"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -37,9 +38,27 @@ type Connection struct {
 	IsEnabled           bool
 }
 
-// ErrOwnerMismatch signals a Business connection rejected by the mono-tenant
-// guardrail (OWNER_TELEGRAM_USER_ID).
-var ErrOwnerMismatch = errors.New("business: telegram_user_id does not match OWNER_TELEGRAM_USER_ID")
+// ErrOwnerNotAllowed signals a Business connection whose account holder is not
+// in the onboarding allowlist (OWNER_ALLOWLIST_TELEGRAM_USER_IDS). An empty
+// allowlist is open onboarding and never produces this error.
+var ErrOwnerNotAllowed = errors.New("business: telegram_user_id is not in the owner allowlist")
+
+// ErrConnectionUnknown signals a connection id Telegram does not recognise --
+// the state a connection reaches once the account holder removes the bot from
+// their Business account. It is a refusal, not a failure: the updates Telegram
+// still has buffered for that connection are dropped, and nothing is captured
+// through it ever again.
+var ErrConnectionUnknown = errors.New("business: telegram does not recognise this business connection")
+
+// ErrConnectionOwnerConflict signals an update that would move an existing
+// Business connection to a different owner.
+//
+// Telegram never reuses a connection id across account holders, so this cannot
+// happen in normal operation; if it ever does, it is either a Bot API
+// contract we misread or an attempt to have one tenant's connection start
+// feeding another tenant's rows. Either way the answer is the same: refuse the
+// write, keep the row as it is, and say so loudly.
+var ErrConnectionOwnerConflict = errors.New("business: business connection already belongs to another owner")
 
 // pool is the minimal database surface the service needs. The resolution
 // table lives outside RLS and is queried directly, but an interface -- not
@@ -81,49 +100,84 @@ type Service struct {
 	users  userStore
 	logger *slog.Logger
 
-	ownerFilter int64 // OWNER_TELEGRAM_USER_ID; 0 = no restriction
+	// allowed is the onboarding allowlist, keyed by Telegram user id. An
+	// EMPTY (or nil) allowlist is open onboarding: any Telegram Business
+	// account holder may connect the bot and becomes a tenant of their own.
+	// A non-empty one admits exactly those holders, which is how a deployment
+	// that used to be mono-tenant keeps the guarantee it had.
+	//
+	// The allowlist is about ADMISSION, never about isolation: whatever it
+	// contains, every tenant's data stays behind the same RLS policies, keyed
+	// on the owner_user_id resolved from this table.
+	allowed map[int64]struct{}
 
-	mu    sync.RWMutex
-	cache map[string]Connection
+	cache *connectionCache
 }
 
-func NewService(pool pool, client connectionAPI, usersRepo userStore, ownerFilter int64, logger *slog.Logger) *Service {
-	return &Service{
-		pool:        pool,
-		client:      client,
-		users:       usersRepo,
-		ownerFilter: ownerFilter,
-		logger:      logger,
-		cache:       make(map[string]Connection),
+// Option configures a Service. Used for what only tests need to steer (the
+// cache clock), so production call sites stay a single constructor call.
+type Option func(*Service)
+
+// WithClock replaces the clock the connection cache ages its entries on.
+// Tests use it to cross the TTL without sleeping; production uses time.Now.
+func WithClock(now func() time.Time) Option {
+	return func(s *Service) { s.cache.now = now }
+}
+
+// NewService builds the resolution service. allowedOwnerTelegramUserIDs is the
+// onboarding allowlist (empty = open onboarding, cf. Service.allowed).
+func NewService(pool pool, client connectionAPI, usersRepo userStore, allowedOwnerTelegramUserIDs []int64, logger *slog.Logger, opts ...Option) *Service {
+	allowed := make(map[int64]struct{}, len(allowedOwnerTelegramUserIDs))
+	for _, id := range allowedOwnerTelegramUserIDs {
+		allowed[id] = struct{}{}
 	}
+	s := &Service{
+		pool:    pool,
+		client:  client,
+		users:   usersRepo,
+		allowed: allowed,
+		logger:  logger,
+		cache:   newConnectionCache(connectionCacheTTL, connectionCacheMaxEntries, time.Now),
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Resolve returns the Connection associated with connectionID, trying in
 // order: in-memory cache, database, Telegram API. A connection found via the
 // API is upserted to the database and stored in cache before being returned.
+//
+// Three refusals are distinguished from a failure, because the caller must drop
+// the update instead of retrying it: ErrOwnerNotAllowed (the holder is not
+// admitted), ErrConnectionUnknown (Telegram no longer knows this connection)
+// and ErrConnectionOwnerConflict (the connection belongs to another tenant).
 func (s *Service) Resolve(ctx context.Context, connectionID string) (*Connection, error) {
 	if connectionID == "" {
 		return nil, fmt.Errorf("empty business_connection_id")
 	}
-	s.mu.RLock()
-	if c, ok := s.cache[connectionID]; ok {
-		s.mu.RUnlock()
-		if !s.ownerAllowed(c.OwnerTelegramUserID) {
-			return nil, ErrOwnerMismatch
+	if entry, ok := s.cache.lookup(connectionID); ok {
+		if entry.unknown {
+			return nil, fmt.Errorf("%w: %s", ErrConnectionUnknown, connectionID)
 		}
-		return &c, nil
+		if !s.ownerAllowed(entry.conn.OwnerTelegramUserID) {
+			return nil, ErrOwnerNotAllowed
+		}
+		conn := entry.conn
+		return &conn, nil
 	}
-	s.mu.RUnlock()
 
 	conn, err := s.getFromDB(ctx, connectionID)
 	if err == nil {
-		// The filter must also apply to historical data: a foreign connection
-		// created before the guardrail was enabled must not become authorized
-		// again via the cache or the database after a restart.
+		// The allowlist must also apply to historical data: a connection
+		// persisted while onboarding was open must not stay authorized once
+		// the deployment restricts it again, through the cache or through the
+		// database after a restart.
 		if !s.ownerAllowed(conn.OwnerTelegramUserID) {
-			return nil, ErrOwnerMismatch
+			return nil, ErrOwnerNotAllowed
 		}
-		s.storeInCache(*conn)
+		s.cache.store(*conn)
 		return conn, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
@@ -134,7 +188,22 @@ func (s *Service) Resolve(ctx context.Context, connectionID string) (*Connection
 	// Service comment).
 	apiConn, err := s.client.GetBusinessConnection(ctx, connectionID)
 	if err != nil {
+		if isUnknownConnection(err) {
+			// Revocation, as the Bot API expresses it: the account holder
+			// removed the bot, so the id designates nothing any more. Cached
+			// as a refusal so the updates Telegram still has buffered for it
+			// cost one API call in total rather than one each.
+			s.cache.storeUnknown(connectionID)
+			s.logger.Warn("business connection unknown to Telegram, treated as revoked",
+				slog.String("business_connection_id", connectionID))
+			return nil, fmt.Errorf("%w: %s", ErrConnectionUnknown, connectionID)
+		}
 		return nil, fmt.Errorf("getBusinessConnection %s: %w", connectionID, err)
+	}
+	if apiConn.ID != connectionID {
+		// Caching under apiConn.ID would leave connectionID permanently
+		// unresolved and re-ask Telegram for every single update carrying it.
+		return nil, fmt.Errorf("getBusinessConnection %s answered for connection %q", connectionID, apiConn.ID)
 	}
 
 	resolved, err := s.upsertFromTelegram(ctx, *apiConn)
@@ -142,11 +211,26 @@ func (s *Service) Resolve(ctx context.Context, connectionID string) (*Connection
 		return nil, err
 	}
 	if resolved == nil {
-		// Rejected by the mono-tenant guardrail: no cache/DB entry.
-		return nil, ErrOwnerMismatch
+		// Rejected by the onboarding allowlist: no cache/DB entry.
+		return nil, ErrOwnerNotAllowed
 	}
-	s.storeInCache(*resolved)
+	s.cache.store(*resolved)
 	return resolved, nil
+}
+
+// isUnknownConnection reports a getBusinessConnection refusal that means "no
+// such connection" rather than "try again".
+//
+// The Bot API answers a removed connection with a 400 and a description that
+// has no stable machine-readable form, so the status code is what we key on: a
+// 400 is a refusal of the REQUEST, which for a call whose only parameter is the
+// connection id can only be about that id. 429 (rate limited), 5xx and every
+// transport failure fall through as genuine errors and are retried by the next
+// update -- treating those as a revocation would silently stop capturing for a
+// live tenant.
+func isUnknownConnection(err error) bool {
+	var apiErr *telegram.APIError
+	return errors.As(err, &apiErr) && apiErr.Code == http.StatusBadRequest
 }
 
 // DisableOwner disables every Business connection of one owner and returns how
@@ -180,14 +264,7 @@ func (s *Service) DisableOwner(ctx context.Context, ownerUserID int64) (int64, e
 		return 0, fmt.Errorf("disabling business connections of owner %d: %w", ownerUserID, err)
 	}
 
-	s.mu.Lock()
-	for id, cached := range s.cache {
-		if cached.OwnerUserID == ownerUserID {
-			cached.IsEnabled = false
-			s.cache[id] = cached
-		}
-	}
-	s.mu.Unlock()
+	s.cache.disableOwner(ownerUserID)
 
 	s.logger.Info("business connections disabled for erasure",
 		slog.Int64("owner_user_id", ownerUserID),
@@ -195,14 +272,14 @@ func (s *Service) DisableOwner(ctx context.Context, ownerUserID int64) (int64, e
 	return tag.RowsAffected(), nil
 }
 
+// ownerAllowed applies the onboarding allowlist. An empty allowlist admits
+// every account holder: that is open onboarding, the multi-tenant default.
 func (s *Service) ownerAllowed(telegramUserID int64) bool {
-	return s.ownerFilter == 0 || telegramUserID == s.ownerFilter
-}
-
-func (s *Service) storeInCache(c Connection) {
-	s.mu.Lock()
-	s.cache[c.ID] = c
-	s.mu.Unlock()
+	if len(s.allowed) == 0 {
+		return true
+	}
+	_, ok := s.allowed[telegramUserID]
+	return ok
 }
 
 func (s *Service) getFromDB(ctx context.Context, connectionID string) (*Connection, error) {
@@ -223,20 +300,35 @@ func (s *Service) getFromDB(ctx context.Context, connectionID string) (*Connecti
 }
 
 // HandleBusinessConnection processes the business_connection update: upsert
-// user + connection, welcome message to the owner. Applies the mono-tenant
-// guardrail if OWNER_TELEGRAM_USER_ID is set.
+// user + connection, welcome message to the owner. It is the whole connection
+// lifecycle as Telegram expresses it, in one update type:
+//
+//   - onboarding: the first update for an id creates the owner (users) and the
+//     connection, and welcomes the holder;
+//   - deactivation: is_enabled=false -- the holder switched the bot off for
+//     that connection, or removed the bot altogether, which the Bot API reports
+//     the same way. Capture stops at the next message, the cache included;
+//   - reactivation: is_enabled=true again -- capture resumes, and the holder is
+//     welcomed again.
+//
+// The same three transitions apply to a connection an erasure disabled: nothing
+// here bans an account, reconnecting is always allowed and starts a fresh
+// capture (cf. DisableOwner).
+//
+// Applies the onboarding allowlist (OWNER_ALLOWLIST_TELEGRAM_USER_IDS) if the
+// deployment sets one.
 func (s *Service) HandleBusinessConnection(ctx context.Context, tc telegram.BusinessConnection) error {
 	resolved, err := s.upsertFromTelegram(ctx, tc)
 	if err != nil {
 		return err
 	}
 	if resolved == nil {
-		s.logger.Warn("business connection refused: mono-tenant guardrail",
+		s.logger.Warn("business connection refused: account holder not in the owner allowlist",
 			slog.String("business_connection_id", tc.ID))
 		return nil // silent refusal on the Telegram side: not a processing error
 	}
 
-	s.storeInCache(*resolved)
+	s.cache.store(*resolved)
 
 	if !resolved.IsEnabled {
 		s.logger.Info("business connection disabled",
@@ -273,8 +365,21 @@ func (s *Service) notifyWelcome(ctx context.Context, tc telegram.BusinessConnect
 }
 
 // upsertFromTelegram upserts user + business_connections from a Telegram
-// BusinessConnection. Returns (nil, nil) if the mono-tenant guardrail rejects
+// BusinessConnection. Returns (nil, nil) if the onboarding allowlist rejects
 // the connection (not an error, a business refusal).
+//
+// The upsert deliberately does NOT rewrite owner_user_id. A connection belongs
+// to the account holder it was created for, for its whole life; letting an
+// update move it would mean one tenant's connection could start writing into
+// another tenant's rows -- exactly the isolation multi-tenancy is supposed to
+// hold. The WHERE on the conflict clause is what enforces it in PostgreSQL
+// rather than in Go: of two concurrent writers, the one that would change the
+// owner updates nothing and gets no row back (ErrConnectionOwnerConflict).
+//
+// The owner upsert that precedes it may leave a users row behind when the
+// connection is then refused. That is not a leak of anything: in open
+// onboarding that holder could create the same row with a connection of their
+// own, and under an allowlist they never get this far.
 func (s *Service) upsertFromTelegram(ctx context.Context, tc telegram.BusinessConnection) (*Connection, error) {
 	if tc.ID == "" || tc.User.ID == 0 {
 		return nil, fmt.Errorf("business connection with empty id or zero user id")
@@ -296,15 +401,26 @@ func (s *Service) upsertFromTelegram(ctx context.Context, tc telegram.BusinessCo
 		IsEnabled:           tc.IsEnabled,
 	}
 
-	_, err = s.pool.Exec(ctx, `
+	var storedOwnerUserID int64
+	err = s.pool.QueryRow(ctx, `
 		INSERT INTO business_connections (id, owner_user_id, can_reply, is_enabled, updated_at)
 		VALUES ($1, $2, $3, $4, now())
 		ON CONFLICT (id) DO UPDATE SET
-			owner_user_id = EXCLUDED.owner_user_id,
 			can_reply     = EXCLUDED.can_reply,
 			is_enabled    = EXCLUDED.is_enabled,
 			updated_at    = now()
-	`, c.ID, c.OwnerUserID, c.CanReply, c.IsEnabled)
+		WHERE business_connections.owner_user_id = EXCLUDED.owner_user_id
+		RETURNING owner_user_id
+	`, c.ID, c.OwnerUserID, c.CanReply, c.IsEnabled).Scan(&storedOwnerUserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// No row came back: the conflict target matched an existing connection
+		// whose owner differs. Logged here rather than only at the caller, so
+		// the event is visible even where the error is swallowed as a refusal.
+		s.logger.Warn("business connection refused: it already belongs to another owner",
+			slog.String("business_connection_id", c.ID),
+			slog.Int64("claiming_owner_user_id", c.OwnerUserID))
+		return nil, fmt.Errorf("%w: %s", ErrConnectionOwnerConflict, c.ID)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("upsert business_connections %s: %w", c.ID, err)
 	}

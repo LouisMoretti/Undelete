@@ -51,7 +51,8 @@ reported:
 | `.env` present and loaded | parsed key=value, never sourced; the environment overrides the file, like docker compose |
 | `.env` permissions | expected `600` or `400` (it contains the token and the Postgres passwords) |
 | required variables | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `APP_DB_PASSWORD`, `MIGRATION_DATABASE_URL`, `DATABASE_URL`, `TELEGRAM_BOT_TOKEN` (cf. `.env.example`) |
-| `OWNER_TELEGRAM_USER_ID` | Phase 1 mono-tenant guard; **fails if empty** outside local dev |
+| `OWNER_TELEGRAM_USER_ID` | removed in Phase 3; **fails if still set** — the bot refuses to start with it |
+| `OWNER_ALLOWLIST_TELEGRAM_USER_IDS` | onboarding allowlist; each entry must be a positive Telegram user id. Empty is reported as `OPEN ONBOARDING` and is **not** a failure (§7) |
 | `BACKUP_RETENTION_DAYS` | integer; absent ⇒ `backup.sh` applies 14 days |
 | distinct DSNs | `DATABASE_URL ≠ MIGRATION_DATABASE_URL`, same rule as `config.Load()` |
 | disk space | threshold `PREFLIGHT_MIN_DISK_GB` (default 2 GB) on the repository FS |
@@ -284,8 +285,9 @@ delimiter must stay in column 0 to be copy-pasteable as-is.
 conversation covered by the Business connection.
 
 **2.** Verify its recording (counter, without reading the content). Replace
-`<owner_id>` with the value of `OWNER_TELEGRAM_USER_ID` from `.env` — it does
-not exist in the VM's shell (§1.1).
+`<owner_id>` with the Telegram user id of the account holder you are verifying
+(from `OWNER_ALLOWLIST_TELEGRAM_USER_IDS`, or from the `business connection
+established` log line) — it does not exist in the VM's shell (§1.1).
 
 > **Tenant context, and what the command below really shows.**
 > `messages`, `notification_outbox` and `chats` are in `FORCE ROW LEVEL
@@ -293,9 +295,10 @@ not exist in the VM's shell (§1.1).
 > But `POSTGRES_USER` is *superuser* in the official `postgres` image, and
 > superuser like `BYPASSRLS` bypasses RLS **even with `FORCE`** (cf.
 > `bot/internal/storage/migrations/0001_init.sql`). From this container, the
-> `count(*)` is therefore global, across all tenants: in mono-tenant Phase 1
-> that is the expected result, and a `0` really means "no message
-> captured", not "context not set".
+> `count(*)` is therefore global, **across all tenants**: since Phase 3 that is
+> no longer the same thing as "this holder's messages", so scope it on
+> `owner_user_id` when the instance holds more than one tenant. A `0` really
+> means "no message captured", not "context not set".
 >
 > The `set_config` is kept because it is correct and has no side effect
 > here, and is **essential** as soon as these queries are re-run with a
@@ -587,6 +590,80 @@ Hence the rollout, once, on the first deployment that carries the media purge:
 The purge is idempotent and interruptible: it always unlinks the blob **before**
 marking the row purged, so a crash between the two leaves only a mismatch that
 the next pass repairs on its own. Restarting the bot is always a valid answer.
+
+---
+
+## 7. Mono-tenant to multi-tenant (Phase 3)
+
+Phase 3 removes `OWNER_TELEGRAM_USER_ID` and replaces it with
+`OWNER_ALLOWLIST_TELEGRAM_USER_IDS`. **There is no database migration**: the
+schema has been multi-tenant and under `FORCE ROW LEVEL SECURITY` since
+migration 0001, so nothing on disk changes. What changes is who is admitted, and
+that is a configuration decision to take deliberately.
+
+The bot **refuses to start** while `OWNER_TELEGRAM_USER_ID` still holds a value.
+That refusal is the point: ignoring the leftover would switch the deployment to
+open onboarding without a single line of output, and the operator would keep
+believing one holder is admitted. `scripts/preflight.sh` reports it before the
+deploy rather than in a crash loop afterwards.
+
+### 7.1 Upgrade keeping exactly the guarantee you had (recommended first step)
+
+1. In `.env`, move the id and remove the old variable:
+   ```
+   OWNER_ALLOWLIST_TELEGRAM_USER_IDS=<the value OWNER_TELEGRAM_USER_ID had>
+   # OWNER_TELEGRAM_USER_ID line deleted
+   ```
+2. `sh scripts/preflight.sh` — expect
+   `[ OK ] OWNER_ALLOWLIST_TELEGRAM_USER_IDS: onboarding restricted to 1 account holder(s)`
+   and **no** `OWNER_TELEGRAM_USER_ID` failure.
+3. Deploy as usual (§2). At boot the logs carry
+   `onboarding restricted to an allowlist` with `allowed_owners=1`. The count is
+   logged, never the ids.
+
+This step is behaviour-preserving: the same single holder is admitted, at
+onboarding **and** on historical rows (the allowlist is applied on the cache,
+database and API resolution paths alike).
+
+### 7.2 Opening onboarding
+
+Only when the instance is meant to hold other people's conversations.
+
+1. **Audit what the table already contains.** Before Phase 3, a connection
+   stored while the guard was off stayed refused as long as the guard named
+   somebody else. Emptying the allowlist makes every stored connection live
+   again, so look at them first:
+   ```
+   docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<'SQL'
+   SELECT u.telegram_user_id, count(*) AS connections,
+          count(*) FILTER (WHERE bc.is_enabled) AS enabled
+   FROM business_connections bc JOIN users u ON u.id = bc.owner_user_id
+   GROUP BY u.telegram_user_id ORDER BY 1;
+   SQL
+   ```
+   Any holder you did not expect is a connection that would resume capturing.
+   Disable it explicitly before opening (`UPDATE business_connections SET
+   is_enabled = false WHERE owner_user_id = ...`) — it is not on the destructive
+   list of §0, it deletes nothing, and the holder can reconnect at will.
+2. **Weigh the exposure.** Open onboarding means strangers can have their
+   conversations stored on this disk, under this operator's responsibility. The
+   per-tenant quotas and anti-abuse limits are issue #19 and are **not** in
+   place yet: today nothing bounds how much one tenant can store.
+3. Empty the variable and deploy. At boot the logs carry the warning
+   `onboarding is OPEN: any Telegram Business account holder can connect this
+   bot and become a tenant`, and preflight reports `OPEN ONBOARDING`.
+
+### 7.3 Rollback
+
+Purely configuration: put the ids back into
+`OWNER_ALLOWLIST_TELEGRAM_USER_IDS` (or restore the previous `.env`) and
+`docker compose up -d`. Nothing was migrated, so there is nothing to undo in the
+database. Connections of holders no longer on the list stop resolving at once —
+their rows stay, untouched, and become live again if they are re-listed.
+
+Rolling back to a **pre-Phase-3 image** also works and needs the old variable
+back: that binary does not read `OWNER_ALLOWLIST_TELEGRAM_USER_IDS`, and an
+unset `OWNER_TELEGRAM_USER_ID` would be no guard at all for it.
 
 ---
 

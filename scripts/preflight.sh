@@ -118,16 +118,37 @@ for var in POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB APP_DB_PASSWORD \
     fi
 done
 
-# OWNER_TELEGRAM_USER_ID: optional from config.Load()'s point of view, but
-# it is the Phase 1 mono-tenant guardrail. Empty = any Telegram account can
-# connect the bot in Business mode. Blocking outside local development.
+# OWNER_TELEGRAM_USER_ID: removed in Phase 3. config.Load() refuses to start
+# while it still holds a value, so a leftover entry is a deployment that will
+# not come back up. Reported here, before the deploy, rather than in a crash
+# loop afterwards.
 if [ -n "${OWNER_TELEGRAM_USER_ID:-}" ]; then
-    case "$OWNER_TELEGRAM_USER_ID" in
-        ''|*[!0-9]*) fail "OWNER_TELEGRAM_USER_ID must be an integer (non-numeric value)" ;;
-        *) ok "OWNER_TELEGRAM_USER_ID set (mono-tenant guardrail active)" ;;
-    esac
+    fail "OWNER_TELEGRAM_USER_ID is no longer supported and the bot refuses to start with it set: move that id into OWNER_ALLOWLIST_TELEGRAM_USER_IDS and unset it"
+fi
+
+# OWNER_ALLOWLIST_TELEGRAM_USER_IDS: the onboarding allowlist. Empty is a
+# SUPPORTED mode (open onboarding, real multi-tenant), so it is not a failure --
+# but it is the single configuration choice that decides whose data this
+# instance will hold, so it is never silent either.
+if [ -n "${OWNER_ALLOWLIST_TELEGRAM_USER_IDS:-}" ]; then
+    allowlist_count=0
+    allowlist_valid=1
+    # Commas become spaces so the list splits on either separator, exactly as
+    # config.parseOwnerAllowlist does.
+    for owner_id in $(printf '%s' "$OWNER_ALLOWLIST_TELEGRAM_USER_IDS" | tr ',' ' '); do
+        case "$owner_id" in
+            ''|*[!0-9]*|0|0*)
+                fail "OWNER_ALLOWLIST_TELEGRAM_USER_IDS entry '${owner_id}' is not a positive Telegram user id in canonical decimal form"
+                allowlist_valid=0
+                ;;
+            *) allowlist_count=$((allowlist_count + 1)) ;;
+        esac
+    done
+    if [ "$allowlist_valid" -eq 1 ]; then
+        ok "OWNER_ALLOWLIST_TELEGRAM_USER_IDS: onboarding restricted to ${allowlist_count} account holder(s)"
+    fi
 else
-    fail "OWNER_TELEGRAM_USER_ID empty: no mono-tenant guardrail, any Business connection would be accepted (acceptable in local dev ONLY)"
+    ok "OWNER_ALLOWLIST_TELEGRAM_USER_IDS empty: OPEN ONBOARDING -- any Telegram Business account holder can connect this bot and become a tenant. Intentional in multi-tenant mode; set the list to restrict it."
 fi
 
 # BACKUP_RETENTION_DAYS has a default value in backup.sh (14): being absent

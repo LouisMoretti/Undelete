@@ -5,6 +5,7 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -31,13 +32,27 @@ type scriptedBotAPI struct {
 	t      *testing.T
 	conn   map[string]any
 	bodies [][]byte
-	mu     sync.Mutex
+	// connCalls counts the getBusinessConnection requests. The multi-tenant
+	// suite reads it to prove a revoked connection is asked about ONCE, however
+	// many buffered updates still carry its id.
+	connCalls int
+	mu        sync.Mutex
+}
+
+// calls returns how many getBusinessConnection requests were served so far.
+func (s *scriptedBotAPI) calls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.connCalls
 }
 
 func (s *scriptedBotAPI) handler(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	s.mu.Lock()
 	s.bodies = append(s.bodies, body)
+	if strings.HasSuffix(r.URL.Path, "/getBusinessConnection") {
+		s.connCalls++
+	}
 	s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	if strings.HasSuffix(r.URL.Path, "/getBusinessConnection") {
@@ -81,14 +96,15 @@ func businessConn(id string, userID int64, enabled bool) map[string]any {
 
 // TestPostgreSQL16BusinessResolution proves on a real PostgreSQL 16 the
 // three-level chain of business.Service (cache -> database -> Telegram API)
-// and the mono-tenant guard at every level:
+// and the onboarding allowlist at every level:
 //
 //   - HandleBusinessConnection persists the connection and welcomes the owner;
-//   - a refused connection (guard) persists nothing and sends nothing;
+//   - a connection refused by the allowlist persists nothing and sends nothing;
 //   - Resolve serves from cache (no second HTTP call), then from the database
 //     after a restart (new Service, silent API), then from the API for a
 //     connection never seen (upserted to the database and cached);
-//   - a historical row for a now-guarded owner is refused from the database;
+//   - a historical row for an owner outside the allowlist is refused from the
+//     database;
 //   - a disabled connection is stored but never welcomed.
 func TestPostgreSQL16BusinessResolution(t *testing.T) {
 	adminDSN := requireEnv(t, "POSTGRES_INTEGRATION_ADMIN_DSN")
@@ -129,8 +145,8 @@ func TestPostgreSQL16BusinessResolution(t *testing.T) {
 		return telegram.NewClient("test-token", 5*time.Second, telegram.WithBaseURL(server.URL+"/bot"))
 	}
 	userRepo := users.NewRepository(db.Pool)
-	newService := func(filter int64) *business.Service {
-		return business.NewService(db.Pool, newClient(), userRepo, filter, logger)
+	newService := func(allowed ...int64) *business.Service {
+		return business.NewService(db.Pool, newClient(), userRepo, allowed, logger)
 	}
 	sends := func() int {
 		api.mu.Lock()
@@ -159,7 +175,7 @@ func TestPostgreSQL16BusinessResolution(t *testing.T) {
 
 	t.Run("welcome on a fresh connection", func(t *testing.T) {
 		ctx := phaseContext(t)
-		svc := newService(0)
+		svc := newService()
 		before := sends()
 		if err := svc.HandleBusinessConnection(ctx, telegram.BusinessConnection{
 			ID: "bc-int-1", User: telegram.User{ID: 93101, FirstName: "Louis"},
@@ -187,9 +203,9 @@ func TestPostgreSQL16BusinessResolution(t *testing.T) {
 		}
 	})
 
-	t.Run("guard refusal persists and sends nothing", func(t *testing.T) {
+	t.Run("allowlist refusal persists nothing and sends nothing", func(t *testing.T) {
 		ctx := phaseContext(t)
-		svc := newService(93101) // only Louis's account is allowed
+		svc := newService(93101) // the allowlist admits Louis's account only
 		before := sends()
 		if err := svc.HandleBusinessConnection(ctx, telegram.BusinessConnection{
 			ID: "bc-int-foreign", User: telegram.User{ID: 93102, FirstName: "Mallory"},
@@ -207,7 +223,7 @@ func TestPostgreSQL16BusinessResolution(t *testing.T) {
 
 	t.Run("resolve serves cache then database then API", func(t *testing.T) {
 		ctx := phaseContext(t)
-		svc := newService(0)
+		svc := newService()
 		first, err := svc.Resolve(ctx, "bc-int-1")
 		if err != nil {
 			t.Fatalf("resolve cached: %v", err)
@@ -223,7 +239,7 @@ func TestPostgreSQL16BusinessResolution(t *testing.T) {
 		defer silentServer.Close()
 		restarted := business.NewService(db.Pool,
 			telegram.NewClient("test-token", 5*time.Second, telegram.WithBaseURL(silentServer.URL+"/bot")),
-			userRepo, 0, logger)
+			userRepo, nil, logger)
 		resolved, err := restarted.Resolve(ctx, "bc-int-1")
 		if err != nil {
 			t.Fatalf("resolve from database: %v", err)
@@ -241,7 +257,7 @@ func TestPostgreSQL16BusinessResolution(t *testing.T) {
 		// Unknown connection: the API is the last resort, and the result is
 		// upserted (a second Resolve is a cache hit, no new call).
 		api.conn["bc-int-2"] = businessConn("bc-int-2", 93101, true)
-		withAPI := newService(0)
+		withAPI := newService()
 		viaAPI, err := withAPI.Resolve(ctx, "bc-int-2")
 		if err != nil {
 			t.Fatalf("resolve via API: %v", err)
@@ -254,21 +270,23 @@ func TestPostgreSQL16BusinessResolution(t *testing.T) {
 		}
 	})
 
-	t.Run("historical row for a guarded owner stays refused", func(t *testing.T) {
+	t.Run("historical row outside the allowlist stays refused", func(t *testing.T) {
 		ctx := phaseContext(t)
-		// bc-int-1 belongs to 93101 in the database; enabling the guard for
-		// NOBODY restarts the refusal on historical data too.
-		guarded := business.NewService(db.Pool, newClient(), userRepo, 999999, logger)
-		if _, err := guarded.Resolve(ctx, "bc-int-1"); err == nil {
-			t.Fatal("historical connection for a guarded owner must be refused")
-		} else if !strings.Contains(err.Error(), "does not match") {
-			t.Fatalf("refusal must name the guard, got %v", err)
+		// bc-int-1 belongs to 93101 in the database; restricting onboarding to
+		// somebody else must refuse it from the database too, not only at
+		// onboarding time -- otherwise a connection admitted while onboarding
+		// was open would survive the restriction.
+		restricted := business.NewService(db.Pool, newClient(), userRepo, []int64{999999}, logger)
+		if _, err := restricted.Resolve(ctx, "bc-int-1"); err == nil {
+			t.Fatal("historical connection outside the allowlist must be refused")
+		} else if !errors.Is(err, business.ErrOwnerNotAllowed) {
+			t.Fatalf("refusal must be ErrOwnerNotAllowed, got %v", err)
 		}
 	})
 
 	t.Run("disabled connection is stored but never welcomed", func(t *testing.T) {
 		ctx := phaseContext(t)
-		svc := newService(0)
+		svc := newService()
 		before := sends()
 		if err := svc.HandleBusinessConnection(ctx, telegram.BusinessConnection{
 			ID: "bc-int-off", User: telegram.User{ID: 93101, FirstName: "Louis"},

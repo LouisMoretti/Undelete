@@ -28,7 +28,7 @@ func (f *fakeBusiness) Resolve(_ context.Context, id string) (*business.Connecti
 	if c, ok := f.connections[id]; ok {
 		return c, nil
 	}
-	return nil, business.ErrOwnerMismatch
+	return nil, business.ErrOwnerNotAllowed
 }
 
 func (f *fakeBusiness) HandleBusinessConnection(_ context.Context, tc telegram.BusinessConnection) error {
@@ -145,7 +145,7 @@ func TestSaveMessageGuards(t *testing.T) {
 		msgs := &fakeMessages{}
 		h := NewHandler(biz, msgs, nil, testLogger())
 		if err := h.HandleUpdate(ctx, telegram.Update{BusinessMessage: testMessage()}); err != nil {
-			t.Fatalf("ErrOwnerMismatch must be swallowed, got %v", err)
+			t.Fatalf("ErrOwnerNotAllowed must be swallowed, got %v", err)
 		}
 		if len(msgs.saved) != 0 {
 			t.Fatal("refused connection must save nothing")

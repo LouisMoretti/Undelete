@@ -53,7 +53,7 @@ const (
 	// holder the onboarding allowlist does not admit. Without it, every update
 	// from an unadmitted holder re-runs the whole chain -- one
 	// business_connections read and, for an id no row matches, one
-	// getBusinessConnection -- on the sequential poller goroutine and on the
+	// getBusinessConnection -- on a shard worker of the poller and on the
 	// bot's shared Telegram rate budget.
 	entryRefused
 )

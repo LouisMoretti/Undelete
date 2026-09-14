@@ -72,9 +72,13 @@ type retentionStore interface {
 }
 
 // Handler routes Telegram Business updates to business handling. Its
-// methods are called strictly sequentially by telegram.Poller (constraint
-// #5): no mutex protection is needed here, the call order IS the
-// consistency guarantee.
+// methods are called concurrently by telegram.Poller, one shard worker per
+// (connection, chat) partition (issue #18): updates of one partition arrive
+// in order, updates of different partitions overlap. No mutex protection is
+// needed here because the Handler itself holds no mutable state -- every
+// dependency behind it is already safe for concurrent use (mutex-guarded
+// business cache, pgx pool with per-call InTenant transactions, stateless
+// Telegram client, atomic metrics).
 type Handler struct {
 	business businessService
 	messages messageStore
@@ -481,11 +485,12 @@ func (h *Handler) answerCommand(ctx context.Context, conn *business.Connection, 
 // commandAnswerTimeout bounds the whole answer to one command, every chunk and
 // every Telegram retry included.
 //
-// Why a bound at all: this runs on the poller's single goroutine (the
-// sequential-update-processing invariant), so getUpdates is blocked until it
+// Why a bound at all: this runs on a shard worker of the poller (one FIFO
+// worker per partition, several partitions concurrently), so its partition
+// -- and the offset advancement of its batch -- is blocked until it
 // returns, and telegram.Client retries three times while honouring an
 // unbounded 429 retry_after. Without a ceiling, one /privacy could park the
-// poller on Telegram's backoff and delay the deleted_business_messages updates
+// partition on Telegram's backoff and delay the deleted_business_messages updates
 // that carry content existing nowhere else.
 // Ten seconds is generous for two sendMessage calls and still short enough
 // that a deletion arriving meanwhile is handled within the same poll cycle.
@@ -562,7 +567,7 @@ func (h *Handler) sendCommandAnswer(ctx context.Context, conn *business.Connecti
 }
 
 // erasureTimeout bounds the deletion itself, which -- like the answer it
-// precedes -- runs on the poller's single goroutine.
+// precedes -- runs on a shard worker of the poller.
 //
 // It is much larger than commandAnswerTimeout because it covers a different
 // kind of work: several bounded DELETEs and the unlinking of every attachment

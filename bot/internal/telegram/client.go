@@ -160,10 +160,10 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeoutSeconds in
 
 const sendMessageAttempts = 3
 
-// sendMessageMaxWait bounds one 429-mandated sleep. SendMessage runs on the
-// sequential poller goroutine for the welcome message (with a context that
-// carries no deadline): an uncapped retry_after would freeze ALL capture for
-// its whole duration, the exact threat the poller caps at pollWait. A
+// sendMessageMaxWait bounds one 429-mandated sleep. SendMessage runs on a
+// shard worker of the poller for the welcome message (with a context that
+// carries no deadline): an uncapped retry_after would freeze that partition
+// for its whole duration, the exact threat the poller caps at pollWait. A
 // truncated wait may draw another 429, which is what the attempt budget
 // absorbs.
 const sendMessageMaxWait = time.Minute

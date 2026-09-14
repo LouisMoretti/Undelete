@@ -204,15 +204,18 @@ The Compose healthcheck of the `bot` service queries `/livez` and not `/readyz`:
 liveness must depend on neither Postgres nor Telegram, otherwise an external
 incident would restart a perfectly healthy bot in a loop.
 
-Exposed metrics (counters, except the last one which is a gauge):
+Exposed metrics (counters, except `undelete_outbox_backlog` which is a gauge):
 `undelete_updates_total`, `undelete_update_errors_total`,
 `undelete_outbox_retries_total`, `undelete_outbox_failed_total`,
-`undelete_deletions_total`, `undelete_outbox_backlog`.
+`undelete_deletions_total`, `undelete_outbox_backlog`,
+`undelete_quota_drops_total`, `undelete_quota_warnings_total`.
 
-`undelete_outbox_failed_total` counts alerts abandoned permanently
-(non-replayable 4xx, or exhausted attempts). They leave
-`undelete_outbox_backlog`, which only counts `pending`/`processing`: without
-this counter, a wave of failures would read as a simple backlog decrease.
+`undelete_outbox_failed_total` counts alerts that exhausted the fast lane
+(10 attempts) and entered the slow lane: they are deferred with a fresh
+budget after 6h, never abandoned. `undelete_outbox_backlog` counts
+`pending`/`processing`/`failed`: `failed` rows are undelivered work, even
+while parked until their resweep deadline — excluding them would drop the
+gauge to zero precisely when every alert is stuck.
 
 No series has a label, and the list of names is hard-coded: cardinality is
 bounded by construction and no identifier, name, message text or token can end
@@ -339,7 +342,10 @@ branch ruleset* / *Add rule* on `main`) — not automatable from this repository
                               ▼
                         PostgreSQL 16
   users / business_connections / chats / messages / notification_outbox
-             (FORCE RLS on content and per-tenant outbox)
+        / media_files / data_erasure_requests
+     (FORCE RLS on messages, notification_outbox, chats, media_files
+      and data_erasure_requests; users and business_connections are
+      resolution tables without RLS)
 ```
 
 - **`db/init/01-app-role.sh`** creates the application role `undelete_app`
@@ -348,7 +354,8 @@ branch ruleset* / *Add rule* on `main`) — not automatable from this repository
 - **`storage.RunMigrations`** applies `internal/storage/migrations/*.sql`
   with the owner DSN, at boot, before opening the application pool.
 - **`storage.DB.InTenant`** is the only legitimate entry point to the
-  `chats`, `messages` and `notification_outbox` tables: it sets
+  `messages`, `notification_outbox`, `chats`, `media_files` and
+  `data_erasure_requests` tables: it sets
   `app.current_owner_user_id` to `LOCAL` (transaction scope) before any
   query.
 - **Durable outbox**: `deleted_at` and the notification chunks are written in

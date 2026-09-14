@@ -86,9 +86,10 @@ func (db *DB) Close() {
 // transaction of another tenant that happens to grab the same physical
 // connection.
 //
-// This is the ONLY legitimate entry point for any query against the messages
-// table (protected by FORCE ROW LEVEL SECURITY). Never query messages
-// directly through db.Pool.
+// This is the ONLY legitimate entry point for any query against the RLS
+// tables (messages, notification_outbox, chats, media_files and
+// data_erasure_requests, all protected by FORCE ROW LEVEL SECURITY). Never
+// query them directly through db.Pool.
 func (db *DB) InTenant(ctx context.Context, ownerID int64, fn func(pgx.Tx) error) error {
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {

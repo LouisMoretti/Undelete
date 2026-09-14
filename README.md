@@ -333,9 +333,14 @@ branch ruleset* / *Add rule* on `main`) — not automatable from this repository
    cannot be a global `DELETE` through the bare pool: with `FORCE RLS` and
    no context set, the query would succeed and delete zero rows, without any
    error. `PurgeExpired` loops tenant by tenant.
-5. **Sequential update processing.** A parallel worker pool could
-   process a deletion before the corresponding message. Future
-   scaling will use sharding on `chat_id`, never an unordered pool.
+5. **Sharded update processing.** Updates execute sharded by
+   `(business_connection_id, chat_id)` with a strict FIFO order per
+   partition -- a deletion can never overtake its message -- never an
+   unordered pool. Submission is fair across partitions (a full slow shard
+   never head-of-line-blocks idle ones), but the next fetch waits for the
+   slowest partition of the current batch, bounded by the handler ceilings
+   (command 10s, welcome 30s, erasure 60s): one slow tenant stalls global
+   freshness, it never deadlocks the loop.
 6. **`message_ids` is an array.** A batch deletion arrives in a single
    `deleted_business_messages` update.
 7. **Alerts are sent FROM the bot**, without `business_connection_id`: that

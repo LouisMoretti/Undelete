@@ -18,6 +18,7 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/metrics"
 	"github.com/LouisMoretti/Undelete/bot/internal/privacy"
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
+	"github.com/LouisMoretti/Undelete/bot/internal/tenantexcl"
 	"github.com/LouisMoretti/Undelete/bot/internal/users"
 )
 
@@ -102,7 +103,16 @@ type Handler struct {
 	// read from the environment here: the answer has to quote the value this
 	// deployment actually purges its dumps with.
 	backupRetentionDays int
-	logger              *slog.Logger
+	// guard is the per-tenant exclusion shared with the erasure (exclusive
+	// side), the media fetcher, the outbox worker and the media retention.
+	// The save paths (saveMessage, handleDeleted) hold its shared side
+	// around resolve-recheck-write, so a save that resolved its connection
+	// before an erasure disabled it either commits before the erasure's
+	// delete step or is skipped after it -- never resurrected behind it.
+	// Nil disables the exclusion (unit tests without an erasure to race);
+	// production always wires the process guard.
+	guard  *tenantexcl.Guard
+	logger *slog.Logger
 }
 
 // Option configures a Handler. Used for what is optional by construction (the
@@ -134,6 +144,15 @@ func WithRetention(store retentionStore, backupRetentionDays int) Option {
 		h.retention = store
 		h.backupRetentionDays = backupRetentionDays
 	}
+}
+
+// WithTenantGuard wires the per-tenant exclusion shared with the erasure:
+// the save paths hold its shared side while the erasure holds the exclusive
+// side for its whole run. Without it a save that resolved enabled before the
+// erasure disabled the tenant can commit after the erasure's delete step and
+// resurrect data the owner was told is gone.
+func WithTenantGuard(guard *tenantexcl.Guard) Option {
+	return func(h *Handler) { h.guard = guard }
 }
 
 func NewHandler(businessSvc businessService, messagesRepo messageStore, mediaRepo mediaCatalogue, logger *slog.Logger, opts ...Option) *Handler {
@@ -377,6 +396,18 @@ func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited
 			slog.String("business_connection_id", conn.ID))
 		return nil, nil
 	}
+	// The connection above may have resolved before an erasure disabled it:
+	// re-resolve under the tenant exclusion before writing (cf. rechecked).
+	conn, release, err := h.rechecked(ctx, msg.BusinessConnectionID, conn)
+	if err != nil {
+		return nil, err
+	}
+	if conn == nil {
+		return nil, nil
+	}
+	if release != nil {
+		defer release()
+	}
 
 	var fromUserID *int64
 	fromDisplay := ""
@@ -426,6 +457,73 @@ func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited
 		slog.Bool("edited", edited))
 
 	return conn, nil
+}
+
+// rechecked re-resolves the connection under the shared side of the tenant
+// exclusion and reports whether the save unit may proceed.
+//
+// The first Resolve (which learned the tenant) may predate an erasure's
+// DisableOwner, and the shard workers run saves concurrently with the
+// erasure: without the exclusion, the write below could commit after the
+// erasure's delete step and resurrect data the owner was told is gone.
+// Holding Shared serialises the unit against the erasure's Exclusive -- the
+// unit either completes first (its commit lands before the delete) or waits
+// and then re-reads the now-disabled connection and skips. The
+// re-resolution must not trust the first one: the disabled state DisableOwner
+// patched into the cache is what the second lookup is served (cf.
+// business.Service.DisableOwner), so a stale enabled never reaches the write.
+//
+// The returned release must be called once the save unit completed (the write
+// itself stays under the exclusion); a nil connection means the save must be
+// skipped. Callers must release before running anything that takes the
+// exclusive side (an erasure confirmation) on the same goroutine. With a nil
+// guard the connection is returned as-is with a nil release.
+func (h *Handler) rechecked(ctx context.Context, connectionID string, conn *business.Connection) (*business.Connection, func(), error) {
+	fresh, release, err := h.enterSave(ctx, connectionID, conn)
+	if err != nil {
+		return nil, nil, err
+	}
+	if fresh == nil {
+		return nil, nil, nil
+	}
+	if !fresh.IsEnabled {
+		if release != nil {
+			release()
+		}
+		h.logger.Debug("save skipped: connection disabled under tenant exclusion",
+			slog.String("business_connection_id", fresh.ID))
+		return nil, nil, nil
+	}
+	return fresh, release, nil
+}
+
+// enterSave holds the shared side of the tenant exclusion for one save unit
+// and re-resolves the connection under it (cf. rechecked for why the second
+// lookup is load-bearing). Unlike rechecked it applies no enabled gate: a
+// deletion mark is not a capture, so handleDeleted serialises its write the
+// same way but still serves disabled connections exactly as before.
+//
+// The returned release must be called once the save unit completed; with a
+// nil guard the connection is returned as-is with a nil release.
+func (h *Handler) enterSave(ctx context.Context, connectionID string, conn *business.Connection) (*business.Connection, func(), error) {
+	if h.guard == nil {
+		return conn, nil, nil
+	}
+	release, err := h.guard.Shared(ctx, conn.OwnerUserID)
+	if err != nil {
+		return nil, nil, err
+	}
+	fresh, err := h.business.Resolve(ctx, connectionID)
+	if err != nil {
+		release()
+		if connectionRefused(err) {
+			h.logger.Debug("save skipped: connection refused under tenant exclusion",
+				slog.String("business_connection_id", connectionID))
+			return nil, nil, nil
+		}
+		return nil, nil, fmt.Errorf("connection re-resolution under tenant exclusion: %w", err)
+	}
+	return fresh, release, nil
 }
 
 // answerCommand answers the commands the account holder types in a chat
@@ -867,6 +965,20 @@ func (h *Handler) handleDeleted(ctx context.Context, del *telegram.BusinessMessa
 			return nil
 		}
 		return fmt.Errorf("connection resolution for deletion: %w", err)
+	}
+	// Same race as saveMessage (cf. enterSave): the deletion mark is a
+	// tenant write that must not land behind the erasure's delete step. No
+	// enabled gate here -- a deletion mark is not a capture, so disabled
+	// connections are still served exactly as before, only serialised.
+	conn, release, err := h.enterSave(ctx, del.BusinessConnectionID, conn)
+	if err != nil {
+		return err
+	}
+	if conn == nil {
+		return nil
+	}
+	if release != nil {
+		defer release()
 	}
 
 	found, err := h.messages.MarkDeleted(ctx, conn.OwnerUserID, conn.OwnerTelegramUserID, del.BusinessConnectionID, del.Chat.ID, del.MessageIDs)

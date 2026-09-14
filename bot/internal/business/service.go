@@ -112,7 +112,19 @@ type Service struct {
 	allowed map[int64]struct{}
 
 	cache *connectionCache
+	// welcomeTimeout bounds the welcome message send (cf. notifyWelcome).
+	// Overridable in tests only; production uses defaultWelcomeTimeout.
+	welcomeTimeout time.Duration
 }
+
+// welcomeTimeout bounds the welcome message send: without it one welcome
+// could park its shard partition for the whole SendMessage retry budget
+// (three attempts honouring up to a minute of 429 wait each), delaying the
+// offset advancement of its batch. Thirty seconds tolerates a slow send
+// while keeping the partition stall within the handler ceilings the
+// slow-shard strategy documents. A lost welcome is benign: the connection is
+// already persisted, and the failure is logged, never replayed.
+const defaultWelcomeTimeout = 30 * time.Second
 
 // Option configures a Service. Used for what only tests need to steer (the
 // cache clock), so production call sites stay a single constructor call.
@@ -124,6 +136,13 @@ func WithClock(now func() time.Time) Option {
 	return func(s *Service) { s.cache.now = now }
 }
 
+// WithWelcomeTimeout replaces the bound on the welcome message send. Tests
+// use it to prove the bound without waiting out the production value;
+// production never uses this option.
+func WithWelcomeTimeout(d time.Duration) Option {
+	return func(s *Service) { s.welcomeTimeout = d }
+}
+
 // NewService builds the resolution service. allowedOwnerTelegramUserIDs is the
 // onboarding allowlist (empty = open onboarding, cf. Service.allowed).
 func NewService(pool pool, client connectionAPI, usersRepo userStore, allowedOwnerTelegramUserIDs []int64, logger *slog.Logger, opts ...Option) *Service {
@@ -132,12 +151,13 @@ func NewService(pool pool, client connectionAPI, usersRepo userStore, allowedOwn
 		allowed[id] = struct{}{}
 	}
 	s := &Service{
-		pool:    pool,
-		client:  client,
-		users:   usersRepo,
-		allowed: allowed,
-		logger:  logger,
-		cache:   newConnectionCache(connectionCacheTTL, connectionCacheMaxEntries, time.Now),
+		pool:           pool,
+		client:         client,
+		users:          usersRepo,
+		allowed:        allowed,
+		logger:         logger,
+		cache:          newConnectionCache(connectionCacheTTL, connectionCacheMaxEntries, time.Now),
+		welcomeTimeout: defaultWelcomeTimeout,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -192,7 +212,10 @@ func (s *Service) Resolve(ctx context.Context, connectionID string) (*Connection
 			s.cache.storeRefused(connectionID, conn.OwnerTelegramUserID)
 			return nil, ErrOwnerNotAllowed
 		}
-		s.cache.store(*conn)
+		// storeDB, not store: this row was read from the database, so the
+		// read may predate a concurrent DisableOwner -- a stale enabled row
+		// must not overwrite the disabled entry the erasure just patched in.
+		s.cache.storeDB(*conn)
 		return conn, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
@@ -370,7 +393,10 @@ func (s *Service) HandleBusinessConnection(ctx context.Context, tc telegram.Busi
 	return nil
 }
 
-// notifyWelcome sends the welcome alert to the owner.
+// notifyWelcome sends the welcome alert to the owner, bounded by
+// welcomeTimeout (cf. the constant): this runs on a shard worker of the
+// poller, so an unbounded send would park the partition -- and its batch's
+// offset advancement -- on Telegram's backoff.
 //
 // Constraint #7: never a BusinessConnectionID here, lest this message be sent
 // AS the owner in a monitored conversation. Failure is logged without
@@ -381,6 +407,12 @@ func (s *Service) HandleBusinessConnection(ctx context.Context, tc telegram.Busi
 // testable on the production path itself, without a database (cf.
 // TestWelcomeAlertContract).
 func (s *Service) notifyWelcome(ctx context.Context, tc telegram.BusinessConnection) {
+	timeout := s.welcomeTimeout
+	if timeout <= 0 {
+		timeout = defaultWelcomeTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	if err := s.client.SendMessage(ctx, telegram.BuildWelcomeMessageRequest(tc.UserChatID, tc.User.ID)); err != nil {
 		s.logger.Error("failed to send welcome message", slog.String("error", err.Error()))
 	}

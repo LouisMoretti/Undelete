@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -80,6 +81,15 @@ type shardRequest struct {
 	done chan<- error
 }
 
+// ErrUpdateNotSubmitted marks an update Dispatch never submitted to its
+// partition: the submit (or the wait) was aborted by context cancellation
+// first. It wraps the context error. The caller must not advance its offset
+// over such a slot -- no worker ever saw the update, so no server-side
+// acknowledgement covers it. Slots that WERE submitted report the handler's
+// own error instead (a handler observing cancellation reports a context
+// error, which stays a per-update signal like any other failure).
+var ErrUpdateNotSubmitted = errors.New("telegram: update never submitted")
+
 // Dispatcher runs Handler concurrently across partitions while preserving a
 // strict FIFO order inside each partition.
 //
@@ -92,10 +102,20 @@ type shardRequest struct {
 // the execution overlaps.
 //
 // Slow-shard strategy: a parked partition delays the offset advancement of
-// its own batch (the next getUpdates waits), but never the other partitions
-// of that batch. The wait is bounded by the handler's own ceilings (the
-// command and erasure timeouts in app): a slow tenant stalls freshness, it
-// never deadlocks the loop and never loses an update.
+// its own batch, but never the submission of the other partitions of that
+// batch (Dispatch submits every update whose shard has room first, and only
+// then blocks on the full ones). Two costs remain, both inherent to the
+// single Telegram offset rather than to this dispatcher:
+//
+//   - per-batch barrier: the NEXT getUpdates waits for the slowest partition
+//     of the CURRENT batch, so one slow tenant stalls global freshness (not
+//     just its own partition) until its batch completes. Concurrent
+//     partitions still overlap within the batch; the barrier only gates when
+//     the next batch is fetched.
+//   - bounded wait: that stall is bounded by the handler's own ceilings --
+//     the command answers (10s), the welcome send (30s) and the erasure
+//     (60s). A slow tenant stalls freshness, it never deadlocks the loop
+//     and never loses an update.
 type Dispatcher struct {
 	handler Handler
 	logger  *slog.Logger
@@ -157,11 +177,21 @@ func (d *Dispatcher) serve(req shardRequest) (err error) {
 // waits for all of them to complete. The returned slice is aligned with
 // updates: errs[i] is the handler error for updates[i] (nil on success).
 //
-// The submit blocks when the target shard queue is full, applying bounded
-// backpressure to the caller (the getUpdates loop) instead of buffering
-// without limit. A cancelled context aborts both the submit and the wait:
-// pending slots report ctx.Err(), and updates never submitted keep their
-// zero value in the slice -- the caller must not advance its offset over
+// The submit applies bounded backpressure to the caller (the getUpdates loop)
+// instead of buffering without limit: at most numShards*(shardQueueDepth+1)
+// updates are ever held, and submitting past a full shard queue blocks.
+// Submission is fair: a first non-blocking pass submits every update whose
+// shard has room, so a full slow shard never head-of-line-blocks the updates
+// of idle shards behind it in the batch; a second pass then submits the
+// deferred updates in batch order, blocking as needed. Per-partition order
+// is preserved throughout: once an update of a partition is deferred, every
+// later update of that same partition is deferred too, so the two passes
+// concatenate in batch order on every shard.
+//
+// A cancelled context aborts both the submit and the wait: slots submitted
+// already report the handler's own error, while updates never submitted
+// report ErrUpdateNotSubmitted (wrapping the context error) and keep no
+// other trace in the slice -- the caller must not advance its offset over
 // them. In practice the poller returns on cancellation right after, so the
 // process redelivers them on restart from the last offset Telegram acked.
 func (d *Dispatcher) Dispatch(ctx context.Context, updates []Update) []error {
@@ -171,15 +201,47 @@ func (d *Dispatcher) Dispatch(ctx context.Context, updates []Update) []error {
 	}
 
 	pending := make([]chan error, len(updates))
+	deferredReq := make([]shardRequest, len(updates))
+	deferredDone := make([]chan error, len(updates))
+	var deferred []int
+	// deferredShard remembers the partitions already deferred in this batch:
+	// trying a later update of the same partition in the first pass could
+	// submit it ahead of the deferred one if the worker drained meanwhile,
+	// inverting the partition order.
+	deferredShard := make(map[int]bool)
 	for i, u := range updates {
 		done := make(chan error, 1)
 		req := shardRequest{update: u, ctx: ctx, done: done}
+		idx := shardIndex(ShardKey(u))
+		if deferredShard[idx] {
+			deferredReq[i] = req
+			deferredDone[i] = done
+			deferred = append(deferred, i)
+			continue
+		}
 		select {
-		case d.shards[shardIndex(ShardKey(u))] <- req:
+		case d.shards[idx] <- req:
 			pending[i] = done
 		case <-ctx.Done():
 			for j := i; j < len(updates); j++ {
-				errs[j] = ctx.Err()
+				errs[j] = fmt.Errorf("%w (update %d): %w", ErrUpdateNotSubmitted, updates[j].UpdateID, ctx.Err())
+			}
+			d.collect(ctx, updates, pending, errs)
+			return errs
+		default:
+			deferredShard[idx] = true
+			deferredReq[i] = req
+			deferredDone[i] = done
+			deferred = append(deferred, i)
+		}
+	}
+	for pos, i := range deferred {
+		select {
+		case d.shards[shardIndex(ShardKey(updates[i]))] <- deferredReq[i]:
+			pending[i] = deferredDone[i]
+		case <-ctx.Done():
+			for _, j := range deferred[pos:] {
+				errs[j] = fmt.Errorf("%w (update %d): %w", ErrUpdateNotSubmitted, updates[j].UpdateID, ctx.Err())
 			}
 			d.collect(ctx, updates, pending, errs)
 			return errs

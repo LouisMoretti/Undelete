@@ -165,8 +165,13 @@ func (p *Poller) Run(ctx context.Context, handle Handler) error {
 		// over the batch only once all of them have completed. A handler
 		// error is still per-update signal, and the offset still advances
 		// past it: a poisoned update can delay the batch, never freeze the
-		// bot. On shutdown the context aborts the wait; unprocessed updates
-		// stay unacknowledged server-side and are redelivered on restart.
+		// bot. On shutdown the context aborts the wait; the offset then
+		// advances only over the contiguous submitted prefix: Dispatch
+		// reports ErrUpdateNotSubmitted for updates no worker ever saw,
+		// and advancing over those would skip work no server-side
+		// acknowledgement covers. The process exits right after, so the
+		// next run redelivers from the last acked offset; every capture
+		// write is idempotent.
 		errs := dispatcher.Dispatch(ctx, updates)
 		for i, u := range updates {
 			if err := errs[i]; err != nil {
@@ -174,6 +179,13 @@ func (p *Poller) Run(ctx context.Context, handle Handler) error {
 				p.logger.Error("update handling failed",
 					slog.Int64("update_id", u.UpdateID),
 					slog.String("error", err.Error()))
+				if errors.Is(err, ErrUpdateNotSubmitted) {
+					// Aborted before this update reached a worker (and
+					// therefore everything past it too): stop the
+					// acknowledgement here, the redelivery replays from
+					// this update.
+					break
+				}
 			}
 			// The offset advances EVEN IF the handler failed. Explicit
 			// constraint: if we only advanced the offset on success, an

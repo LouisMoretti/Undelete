@@ -102,17 +102,55 @@ the poller advances past it like past a refused connection, and the drop is
 logged with ids only plus counted in `undelete_quota_drops_total`. Deletions
 already stored are still alerted and `/delete_my_data` still works -- an
 erasure must work precisely when the tenant is over quota. At
-`QUOTA_WARN_PERCENT` (default 80) of a limit the pre-saturation alert fires
-once per crossing (log plus `undelete_quota_warnings_total`), and a fresh
-refusal alerts once more, so the operator hears "approaching" and then "now
-dropping" without one log line per update under sustained saturation.
+`QUOTA_WARN_PERCENT` (default 80) of a volume limit (stored messages,
+catalogued media files, stored media bytes -- never the capture rate) the
+pre-saturation alert fires once per crossing (log plus
+`undelete_quota_warnings_total`), and a fresh volume refusal alerts once more,
+so the operator hears "approaching" and then "now dropping" without one log
+line per update under sustained saturation. A rate refusal only increments
+`undelete_quota_drops_total` and logs at Debug: under a rate flood a warning
+per refusal would be the flood.
+
+Quota and commands: the erasure lifecycle bypasses the quota -- a
+`/delete_my_data` confirmation (which carries a code and is never saved) and a
+bare `/delete_my_data` on a disabled connection are served without consulting
+the tracker, so an erasure resumes past quota. Every other owner command on an
+enabled connection (`/privacy`, `/retention`, a bare `/delete_my_data` with
+nothing to keep secret) flows through the capture first: past quota the
+message is dropped before command parsing, so the command goes silently
+unanswered. The silence is deliberate -- answering past quota would spend the
+Telegram budget the quota protects -- and the command is retried by typing it
+again once captures flow.
+
+Ledger accounting is approximate by design. The message admission is taken
+before the tenant-exclusion recheck and before the write: an update skipped as
+disabled-after-admit, or a write that fails after admission (message or media
+row), leaves its ledger unit counted with no database row behind it. Moving
+the admission after the guard would hold the Shared side across the resync
+database reads -- a saturated tenant's slow source would then delay its own
+(and only its own, the guard is per-tenant) erasure path -- so the drift is
+accepted instead: tiny in production (only in-flight updates racing an
+erasure or disable) and self-healing on the next over-quota resync. Edits and
+Telegram redeliveries consume message units without adding rows: an edit is
+admitted exactly like a new capture (rate and volume), while the message store
+is an idempotent upsert, so an edit-heavy tenant or a redelivered burst can
+reach the ledger limit while the database sits far below it. The next
+over-quota admission then pays the re-verification (three COUNT/SUM queries)
+and at most one minute of memoised drops before healing. The byte quota is
+enforced at batch granularity for the same reason: a download that starts
+under quota may push the tenant over it, and the next download is refused.
 
 The enforcement is in-memory with the database as the source of truth: the
 first touch of a tenant seeds its counters (which is also what makes a restart
 safe), and a tenant the ledger calls over quota is re-verified before being
 refused, then memoised for a minute -- retention purges and erasures shrink
 the truth behind the tracker's back, and the next admission resyncs instead of
-refusing forever. A saturated tenant never blocks the others: admissions take
+refusing forever. A failing source fails open: while the database is away every
+admission still pays its three seeding/re-verification queries (which fail)
+and the unseeded ledger counts up in memory, then the resync overwrites the
+counters on recovery -- no data is lost by refusing, and the write that
+follows fails loudly on its own. A saturated tenant never blocks the others:
+admissions take
 no lock across database reads, and the outbox (100 jobs per tenant per tick)
 and media fetch (one batch per tenant per pass) loops visit tenants in order.
 

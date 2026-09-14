@@ -44,6 +44,38 @@
 // refused connection. Deletion marks, commands and lifecycle paths never
 // consult the tracker -- a deletion mark is not a capture, and an erasure
 // must work precisely when the tenant is over quota.
+//
+// The Warn flag fires on the crossing call of a VOLUME quota (stored messages,
+// catalogued media files, stored media bytes) and on a fresh (non-memoised)
+// volume refusal. The capture-rate path never warns: under a rate flood a
+// warning per refusal would be the flood, so a rate refusal only feeds the
+// drops counter (logged at Debug by the caller).
+//
+// # Accounting approximations (accepted, self-healing)
+//
+// The ledger counts admissions, not committed rows, and three shapes of drift
+// follow:
+//
+//   - admitted before the guard: the handler admits before the tenant-exclusion
+//     recheck and before the write, so a save skipped as disabled-after-admit
+//     or a write that fails after admission leaves its unit counted with no
+//     row behind it. Moving the admission after the guard would hold the
+//     Shared side across the resync database reads -- worse than the drift --
+//     so the cost is accepted: only in-flight updates racing an erasure or
+//     disable, healed by the next over-quota resync.
+//   - edits and redeliveries: an edit is admitted exactly like a new capture,
+//     while the message store is an idempotent upsert, so edits and Telegram
+//     redeliveries consume message units without adding rows. An edit-heavy
+//     tenant can reach the ledger limit while the database sits far below it;
+//     the next over-quota admission re-verifies (three COUNT/SUM queries) and
+//     heals, at most one minute of memoised drops.
+//   - outage fail-open: a failing source leaves the ledger unseeded and the
+//     caller fails OPEN -- every admission still pays its three
+//     seeding/re-verification queries (which fail) and the counters grow in
+//     memory (int64s only, no leak, meaningless until the resync overwrites
+//     them on recovery). The per-update cost during a database outage is
+//     therefore three failing queries per admission, never a refusal: the
+//     write that follows fails loudly on its own.
 package quotas
 
 import (
@@ -140,8 +172,10 @@ func (l Limits) Validate() error {
 }
 
 // warnThreshold returns the usage at which the pre-saturation alert fires.
-// Exact integer math (quotient and remainder handled separately) so neither
-// an absurd limit overflows the product nor a small limit floors to zero.
+// Exact integer math (quotient and remainder handled separately) so an absurd
+// limit never overflows the product. A tiny limit can still floor to zero
+// (limit 1 at 50% warns on the first admission): safe direction, comment said
+// otherwise before.
 func (l Limits) warnThreshold(limit int64) int64 {
 	percent := int64(l.WarnPercent)
 	return limit/100*percent + (limit%100)*percent/100
@@ -162,8 +196,9 @@ type Admission struct {
 	// explicitly at the call site -- never an error to the poller.
 	Allowed bool
 	// Warn tells the caller to emit the pre-saturation alert NOW (log with
-	// ids only, quota metric): the usage just crossed the warn threshold, or
-	// this is a fresh (non-memoised) refusal. True at most once per crossing
+	// ids only, quota metric): a VOLUME quota usage just crossed the warn
+	// threshold, or this is a fresh (non-memoised) volume refusal. The
+	// capture rate never warns. True at most once per crossing
 	// and at most once per recheckInterval per blocked quota -- never per
 	// update under sustained saturation.
 	Warn bool
@@ -380,9 +415,10 @@ func allowLocked(te *tenant, kind QuotaKind, limit, threshold int64, inc bool) A
 		switch kind {
 		case QuotaMediaFiles:
 			te.mediaFiles++
-		case QuotaMediaBytes:
-			te.mediaBytes++
 		default:
+			// QuotaMessages. QuotaMediaBytes never arrives with inc=true:
+			// AdmitMediaBytes gates with inc=false and the bytes land via
+			// AddMediaBytes, so there is no byte reservation to count here.
 			te.messages++
 		}
 	}

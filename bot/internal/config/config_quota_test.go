@@ -85,10 +85,26 @@ func TestLoadQuotaOverrides(t *testing.T) {
 	}
 }
 
-// TestLoadRejectsInvalidQuotas pins the fail-fast contract: a malformed,
-// zero, negative or out-of-range quota refuses to start rather than running
-// an unbounded tenant silently.
+// TestLoadQuotaTrimsSurroundingSpaces pins the trimming both sides agree on:
+// config.Load trims before parsing and preflight trims before its case, so
+// " 1000 " is accepted by both rather than blocking a deployment that would
+// start fine.
+func TestLoadQuotaTrimsSurroundingSpaces(t *testing.T) {
+	validEnv(t)
+	t.Setenv("QUOTA_MAX_MESSAGES_PER_TENANT", " 1000 ")
+	t.Setenv("QUOTA_WARN_PERCENT", " 80 ")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load with surrounded spaces: %v", err)
+	}
+	if cfg.QuotaMaxMessages != 1000 || cfg.QuotaWarnPercent != 80 {
+		t.Fatalf("trimmed quotas = (%d,%d), want (1000,80)", cfg.QuotaMaxMessages, cfg.QuotaWarnPercent)
+	}
+}
 func TestLoadRejectsInvalidQuotas(t *testing.T) {
+	// Fail-fast contract: a malformed, non-canonical, zero, negative or
+	// out-of-range quota refuses to start rather than running an unbounded
+	// tenant silently.
 	for _, tc := range []struct {
 		name string
 		env  string
@@ -97,13 +113,20 @@ func TestLoadRejectsInvalidQuotas(t *testing.T) {
 		{"messages malformed", "QUOTA_MAX_MESSAGES_PER_TENANT", "a lot"},
 		{"messages zero", "QUOTA_MAX_MESSAGES_PER_TENANT", "0"},
 		{"messages negative", "QUOTA_MAX_MESSAGES_PER_TENANT", "-5"},
+		{"messages leading zero", "QUOTA_MAX_MESSAGES_PER_TENANT", "007"},
+		{"messages plus sign", "QUOTA_MAX_MESSAGES_PER_TENANT", "+5"},
+		{"messages overflow int64", "QUOTA_MAX_MESSAGES_PER_TENANT", "99999999999999999999999"},
+		{"messages max int64 plus one", "QUOTA_MAX_MESSAGES_PER_TENANT", "9223372036854775808"},
 		{"media files zero", "QUOTA_MAX_MEDIA_FILES_PER_TENANT", "0"},
 		{"media bytes malformed", "QUOTA_MAX_MEDIA_BYTES_PER_TENANT", "5GiB"},
 		{"media bytes negative", "QUOTA_MAX_MEDIA_BYTES_PER_TENANT", "-1"},
 		{"rate zero", "QUOTA_CAPTURES_PER_MINUTE_PER_TENANT", "0"},
+		{"rate leading zero", "QUOTA_CAPTURES_PER_MINUTE_PER_TENANT", "0300"},
 		{"warn zero", "QUOTA_WARN_PERCENT", "0"},
 		{"warn hundred", "QUOTA_WARN_PERCENT", "100"},
 		{"warn malformed", "QUOTA_WARN_PERCENT", "eighty"},
+		{"warn leading zero", "QUOTA_WARN_PERCENT", "080"},
+		{"warn plus sign", "QUOTA_WARN_PERCENT", "+80"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			validEnv(t)

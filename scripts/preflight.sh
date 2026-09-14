@@ -209,8 +209,12 @@ else
 fi
 
 # Per-tenant quotas (issue #19). Absent keeps the bot's generous default
-# (shown in parentheses); a non-numeric or non-positive value fails the
-# deploy, because config.Load() would refuse to start with it.
+# (shown in parentheses); a non-canonical, non-positive or overflowing value
+# fails the deploy, because config.Load() would refuse to start with it.
+# Canonical means digits only, no sign, no leading zero -- the same rule
+# config.parseCanonicalPositiveInt64 enforces -- and the int64 range is
+# compared as a digit STRING (exceeds_int64, as for the allowlist above):
+# the shell's own arithmetic cannot represent the overflow it must detect.
 for quota_spec in \
     "QUOTA_MAX_MESSAGES_PER_TENANT:100000" \
     "QUOTA_MAX_MEDIA_FILES_PER_TENANT:10000" \
@@ -222,20 +226,32 @@ for quota_spec in \
     if [ -z "$quota_value" ]; then
         ok "${quota_var} not set: the bot will apply ${quota_default}"
     else
-        case "$quota_value" in
-            ''|*[!0-9]*|0|0*) fail "${quota_var} must be a strictly positive integer (got '${quota_value}')" ;;
-            *) ok "${quota_var}=${quota_value}" ;;
+        # config.Load() trims surrounding whitespace before parsing, so the
+        # comparison runs on the trimmed value on both sides.
+        quota_trimmed="$(printf '%s' "$quota_value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        case "$quota_trimmed" in
+            ''|*[!0-9]*|0|0*) fail "${quota_var} must be a strictly positive integer in canonical decimal form (digits only, no sign, no leading zero; got '${quota_value}')" ;;
+            *)
+                if exceeds_int64 "$quota_trimmed"; then
+                    fail "${quota_var}='${quota_value}' does not fit in a signed 64-bit integer (maximum ${INT64_MAX}): the bot refuses to start with it"
+                else
+                    ok "${quota_var}=${quota_trimmed}"
+                fi
+                ;;
         esac
     fi
 done
 if [ -n "${QUOTA_WARN_PERCENT:-}" ]; then
-    case "$QUOTA_WARN_PERCENT" in
-        ''|*[!0-9]*)
-            fail "QUOTA_WARN_PERCENT must be an integer between 1 and 99 (got '${QUOTA_WARN_PERCENT}')"
+    warn_trimmed="$(printf '%s' "$QUOTA_WARN_PERCENT" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    case "$warn_trimmed" in
+        ''|*[!0-9]*|0|0*)
+            fail "QUOTA_WARN_PERCENT must be an integer between 1 and 99 in canonical decimal form (got '${QUOTA_WARN_PERCENT}')"
             ;;
         *)
-            if [ "$QUOTA_WARN_PERCENT" -ge 1 ] && [ "$QUOTA_WARN_PERCENT" -le 99 ]; then
-                ok "QUOTA_WARN_PERCENT=${QUOTA_WARN_PERCENT}"
+            if [ "${#warn_trimmed}" -gt 2 ]; then
+                fail "QUOTA_WARN_PERCENT must be an integer between 1 and 99 (got '${QUOTA_WARN_PERCENT}')"
+            elif [ "$warn_trimmed" -ge 1 ] && [ "$warn_trimmed" -le 99 ]; then
+                ok "QUOTA_WARN_PERCENT=${warn_trimmed}"
             else
                 fail "QUOTA_WARN_PERCENT must be an integer between 1 and 99 (got '${QUOTA_WARN_PERCENT}')"
             fi

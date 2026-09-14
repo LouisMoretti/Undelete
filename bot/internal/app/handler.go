@@ -417,6 +417,12 @@ func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited
 	// OwnerUserID -- never by a chat or sender id from the message -- and
 	// applies to the tenant as a whole, never to a selection of chats
 	// (constraint #8: no chat_id condition anywhere on the capture path).
+	// The admission stays here rather than after the recheck below: holding
+	// Shared across the tracker's resync reads would trade a tiny accepted
+	// drift (a save skipped as disabled-after-admit, or a write that fails
+	// after admission, leaves its ledger unit with no row -- healed by the
+	// next over-quota resync) for a saturated tenant's slow source delaying
+	// its own erasure path.
 	if h.quota != nil {
 		if !h.admitQuota(conn.OwnerUserID, conn.ID, "message", h.quota.AdmitCapture(ctx, conn.OwnerUserID)) {
 			return nil, nil
@@ -579,6 +585,9 @@ func (h *Handler) admitQuota(ownerUserID int64, connectionID string, what string
 		return true
 	}
 	metrics.AddQuotaDrops(1)
+	// The rate path never sets Warn (quotas.AdmitCapture), so the second
+	// operand is defensive today: it keeps a future rate warning -- which
+	// would be a flood -- on the Debug path even if the tracker ever asked.
 	if adm.Warn && adm.Quota != quotas.QuotaCaptureRate {
 		h.logger.Warn("capture dropped: tenant quota exceeded",
 			slog.Int64("owner_user_id", ownerUserID),

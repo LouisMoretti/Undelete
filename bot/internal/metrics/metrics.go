@@ -32,9 +32,12 @@ type Counters struct {
 	// quotaDrops counts captures dropped by a per-tenant quota (issue #19):
 	// messages, media attachments and media downloads refused past a limit.
 	quotaDrops atomic.Int64
-	// quotaWarnings counts pre-saturation alerts: usages crossing the warn
-	// threshold, and fresh quota refusals. At most one per crossing and one
-	// per fresh block -- never per update under sustained saturation.
+	// quotaWarnings counts pre-saturation alerts of the volume quotas (stored
+	// messages, catalogued media files, stored media bytes): usages crossing
+	// the warn threshold, and fresh volume refusals. The capture rate never
+	// warns (a flood must not emit a warning per refusal). At most one per
+	// crossing and one per fresh block -- never per update under sustained
+	// saturation.
 	quotaWarnings atomic.Int64
 }
 
@@ -56,9 +59,9 @@ func (c *Counters) AddDeletions(n int64)     { c.deletions.Add(n) }
 // lives in the logs, which quote ids and quota names without user content.
 func (c *Counters) AddQuotaDrops(n int64) { c.quotaDrops.Add(n) }
 
-// AddQuotaWarnings counts pre-saturation alerts (threshold crossings and
-// fresh refusals), the operator signal that a tenant is about to -- or has
-// just started to -- lose captures.
+// AddQuotaWarnings counts volume-quota pre-saturation alerts (threshold
+// crossings and fresh volume refusals, never rate refusals), the operator
+// signal that a tenant is about to -- or has just started to -- lose captures.
 func (c *Counters) AddQuotaWarnings(n int64) { c.quotaWarnings.Add(n) }
 
 // AddOutboxFailed counts alerts PERMANENTLY ABANDONED. Without this series, an
@@ -139,7 +142,7 @@ var allSeries = []series{
 	},
 	{
 		name:  "undelete_quota_warnings_total",
-		help:  "Total number of per-tenant quota pre-saturation alerts (threshold crossings and fresh refusals).",
+		help:  "Total number of per-tenant volume-quota pre-saturation alerts (threshold crossings and fresh volume refusals, never rate refusals).",
 		kind:  "counter",
 		value: func(c *Counters) int64 { return c.quotaWarnings.Load() },
 	},

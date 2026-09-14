@@ -654,7 +654,12 @@ Only when the instance is meant to hold other people's conversations.
    quotas" in the README -- but they bound the *volume*, not the *nature* of
    what strangers store: review the QUOTA_* variables in `.env.example`
    before opening, and watch `undelete_quota_drops_total` and
-   `undelete_quota_warnings_total` after.
+   `undelete_quota_warnings_total` after. `undelete_quota_warnings_total`
+   counts volume-quota crossings and fresh volume refusals only: a rate flood
+   moves `undelete_quota_drops_total` alone, by design. While the database is
+   away the tracker fails open -- every admission still pays its three
+   seeding/re-verification queries (which fail) and the unseeded ledger counts
+   up in memory until the resync overwrites it on recovery.
 3. Empty the variable and deploy. At boot the logs carry the warning
    `onboarding is OPEN: any Telegram Business account holder can connect this
    bot and become a tenant`, and preflight reports `OPEN ONBOARDING`.

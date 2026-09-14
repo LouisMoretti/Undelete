@@ -157,23 +157,17 @@ func Load() (*Config, error) {
 	}
 	for _, q := range quotaInts {
 		if raw := strings.TrimSpace(os.Getenv(q.env)); raw != "" {
-			value, err := strconv.ParseInt(raw, 10, 64)
+			value, err := parseCanonicalPositiveInt64(raw)
 			if err != nil {
-				return nil, fmt.Errorf("invalid %s (expected a positive integer): %w", q.env, err)
-			}
-			if value <= 0 {
-				return nil, fmt.Errorf("invalid %s: %d; expected a positive number", q.env, value)
+				return nil, fmt.Errorf("invalid %s: %w", q.env, err)
 			}
 			*q.field = value
 		}
 	}
 	if raw := strings.TrimSpace(os.Getenv("QUOTA_WARN_PERCENT")); raw != "" {
-		percent, err := strconv.Atoi(raw)
+		percent, err := parseCanonicalWarnPercent(raw)
 		if err != nil {
-			return nil, fmt.Errorf("invalid QUOTA_WARN_PERCENT (expected an integer between 1 and 99): %w", err)
-		}
-		if percent <= 0 || percent >= 100 {
-			return nil, fmt.Errorf("invalid QUOTA_WARN_PERCENT: %d; expected between 1 and 99", percent)
+			return nil, fmt.Errorf("invalid QUOTA_WARN_PERCENT: %w", err)
 		}
 		cfg.QuotaWarnPercent = percent
 	}
@@ -323,6 +317,43 @@ func parseOwnerAllowlist(raw string) ([]int64, error) {
 		allowed = append(allowed, id)
 	}
 	return allowed, nil
+}
+
+// parseCanonicalPositiveInt64 parses a per-tenant quota value: a strictly
+// positive decimal integer in canonical form -- digits only, no sign, no
+// leading zero -- that fits in an int64. Same rule as isCanonicalPositiveDecimal
+// (and scripts/preflight.sh): "007", "+5" or an int64 overflow is refused
+// rather than coerced, so preflight and boot agree on every value instead of
+// one accepting what the other refuses (issue #19 review F1, same class as
+// the #17 allowlist parity fix).
+func parseCanonicalPositiveInt64(raw string) (int64, error) {
+	if !isCanonicalPositiveDecimal(raw) {
+		return 0, fmt.Errorf("expected a positive integer in canonical decimal form (digits only, no sign, no leading zero), got %q", raw)
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("expected a positive integer that fits in a signed 64-bit integer, got %q: %w", raw, err)
+	}
+	if value <= 0 {
+		return 0, fmt.Errorf("expected a positive number, got %d", value)
+	}
+	return value, nil
+}
+
+// parseCanonicalWarnPercent parses QUOTA_WARN_PERCENT: a canonical positive
+// decimal integer (same rule as the quotas above) between 1 and 99.
+func parseCanonicalWarnPercent(raw string) (int, error) {
+	if !isCanonicalPositiveDecimal(raw) {
+		return 0, fmt.Errorf("expected an integer between 1 and 99 in canonical decimal form, got %q", raw)
+	}
+	percent, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("expected an integer between 1 and 99, got %q: %w", raw, err)
+	}
+	if percent <= 0 || percent >= 100 {
+		return 0, fmt.Errorf("%d; expected between 1 and 99", percent)
+	}
+	return percent, nil
 }
 
 // isCanonicalPositiveDecimal reports whether token is a strictly positive

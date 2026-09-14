@@ -522,7 +522,7 @@ docker compose logs -f bot   # View the logs
 |-------|-------------|
 | **Phase 1** (done) | Mono-tenant, plaintext text, RLS in place. |
 | **Phase 2** | Media (`media_files` table + local storage), GDPR commands (`/privacy` shipped, `/delete_my_data` still to come). |
-| **Phase 3** (in progress) | Real multi-tenancy: `OWNER_TELEGRAM_USER_ID` replaced by `OWNER_ALLOWLIST_TELEGRAM_USER_IDS`, connection lifecycle, bounded/expiring resolution cache, RLS + `InTenant` audits — issue #17, on this branch. Per-chat sharding (#18) and per-tenant quotas (#19) are **not** done, so the phase is not complete. |
+| **Phase 3** (in progress) | Real multi-tenancy: `OWNER_TELEGRAM_USER_ID` replaced by `OWNER_ALLOWLIST_TELEGRAM_USER_IDS`, connection lifecycle, bounded/expiring resolution cache, RLS + `InTenant` audits — issue #17; per-chat sharding (#18); per-tenant quotas and anti-abuse limits (#19, on this branch). |
 | **Phase 4** | Content encryption (`text_encrypted BYTEA`, AES-256-GCM, per-tenant key). |
 
 ---

@@ -85,6 +85,75 @@ deactivation, so it is handled by that row. One holder may keep **several**
 connections at once; all of them resolve to the same tenant, which is what makes
 `/delete_my_data` cover the whole account rather than one connection.
 
+### Per-tenant quotas
+
+Open onboarding means strangers can store their conversations on this disk, so
+each tenant is bounded: stored messages (`QUOTA_MAX_MESSAGES_PER_TENANT`,
+default 100000), catalogued media files (`QUOTA_MAX_MEDIA_FILES_PER_TENANT`,
+default 10000), stored media bytes (`QUOTA_MAX_MEDIA_BYTES_PER_TENANT`,
+default 5 GiB) and captures per sliding minute
+(`QUOTA_CAPTURES_PER_MINUTE_PER_TENANT`, default 300). Every quota is keyed by
+the internal `owner_user_id` the connection resolved to -- never by anything
+read from the update, so no identifier can be spoofed into another tenant's
+budget -- and applies to the tenant as a whole, never to a selection of chats.
+
+Past a quota the capture is **dropped explicitly**: the update costs no write,
+the poller advances past it like past a refused connection, and the drop is
+logged with ids only plus counted in `undelete_quota_drops_total`. Deletions
+already stored are still alerted and `/delete_my_data` still works -- an
+erasure must work precisely when the tenant is over quota. At
+`QUOTA_WARN_PERCENT` (default 80) of a volume limit (stored messages,
+catalogued media files, stored media bytes -- never the capture rate) the
+pre-saturation alert fires once per crossing (log plus
+`undelete_quota_warnings_total`), and a fresh volume refusal alerts once more,
+so the operator hears "approaching" and then "now dropping" without one log
+line per update under sustained saturation. A rate refusal only increments
+`undelete_quota_drops_total` and logs at Debug: under a rate flood a warning
+per refusal would be the flood.
+
+Quota and commands: the erasure lifecycle bypasses the quota -- a
+`/delete_my_data` confirmation (which carries a code and is never saved) and a
+bare `/delete_my_data` on a disabled connection are served without consulting
+the tracker, so an erasure resumes past quota. Every other owner command on an
+enabled connection (`/privacy`, `/retention`, a bare `/delete_my_data` with
+nothing to keep secret) flows through the capture first: past quota the
+message is dropped before command parsing, so the command goes silently
+unanswered. The silence is deliberate -- answering past quota would spend the
+Telegram budget the quota protects -- and the command is retried by typing it
+again once captures flow.
+
+Ledger accounting is approximate by design. The message admission is taken
+before the tenant-exclusion recheck and before the write: an update skipped as
+disabled-after-admit, or a write that fails after admission (message or media
+row), leaves its ledger unit counted with no database row behind it. Moving
+the admission after the guard would hold the Shared side across the resync
+database reads -- a saturated tenant's slow source would then delay its own
+(and only its own, the guard is per-tenant) erasure path -- so the drift is
+accepted instead: tiny in production (only in-flight updates racing an
+erasure or disable) and self-healing on the next over-quota resync. Edits and
+Telegram redeliveries consume message units without adding rows: an edit is
+admitted exactly like a new capture (rate and volume), while the message store
+is an idempotent upsert, so an edit-heavy tenant or a redelivered burst can
+reach the ledger limit while the database sits far below it. The next
+over-quota admission then pays the re-verification (three COUNT/SUM queries)
+and at most one minute of memoised drops before healing. The byte quota is
+enforced at batch granularity for the same reason: a download that starts
+under quota may push the tenant over it, and the next download is refused.
+
+The enforcement is in-memory with the database as the source of truth: the
+first touch of a tenant seeds its counters (which is also what makes a restart
+safe), and a tenant the ledger calls over quota is re-verified before being
+refused, then memoised for a minute -- retention purges and erasures shrink
+the truth behind the tracker's back, and the next admission resyncs instead of
+refusing forever. A failing source fails open: while the database is away every
+admission still pays its three seeding/re-verification queries (which fail)
+and the unseeded ledger counts up in memory, then the resync overwrites the
+counters on recovery -- no data is lost by refusing, and the write that
+follows fails loudly on its own. A saturated tenant never blocks the others:
+admissions take
+no lock across database reads, and the outbox (100 jobs per tenant per tick)
+and media fetch (one batch per tenant per pass) loops visit tenants in order.
+
 ## Telegram setup (3 steps)
 
 1. **Create the bot** via [@BotFather](https://t.me/BotFather): `/newbot`,
@@ -484,8 +553,7 @@ receives and the text reviewed here cannot describe two different policies.
 - **Phase 3 (this task)**: real multi-tenancy — several simultaneous account
   holders, the `OWNER_TELEGRAM_USER_ID` guard replaced by
   `OWNER_ALLOWLIST_TELEGRAM_USER_IDS`, connection lifecycle (onboarding,
-  deactivation, reactivation, revocation), and an executable audit of the
-  RLS/`InTenant` surface. Per-chat sharding (#18) and per-tenant quotas (#19)
-  remain open.
+  deactivation, reactivation, revocation), an executable audit of the
+  RLS/`InTenant` surface, per-chat sharding (#18) and per-tenant quotas (#19).
 - **Phase 4**: content encryption (`text_encrypted BYTEA`, AES-256-GCM,
   per-tenant key) replacing plaintext `text_content`.

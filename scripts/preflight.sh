@@ -208,6 +208,59 @@ else
     ok "BACKUP_RETENTION_DAYS not set: backup.sh will apply 14 days"
 fi
 
+# Per-tenant quotas (issue #19). Absent keeps the bot's generous default
+# (shown in parentheses); a non-canonical, non-positive or overflowing value
+# fails the deploy, because config.Load() would refuse to start with it.
+# Canonical means digits only, no sign, no leading zero -- the same rule
+# config.parseCanonicalPositiveInt64 enforces -- and the int64 range is
+# compared as a digit STRING (exceeds_int64, as for the allowlist above):
+# the shell's own arithmetic cannot represent the overflow it must detect.
+for quota_spec in \
+    "QUOTA_MAX_MESSAGES_PER_TENANT:100000" \
+    "QUOTA_MAX_MEDIA_FILES_PER_TENANT:10000" \
+    "QUOTA_MAX_MEDIA_BYTES_PER_TENANT:5368709120" \
+    "QUOTA_CAPTURES_PER_MINUTE_PER_TENANT:300"; do
+    quota_var="${quota_spec%%:*}"
+    quota_default="${quota_spec#*:}"
+    eval "quota_value=\${${quota_var}:-}"
+    if [ -z "$quota_value" ]; then
+        ok "${quota_var} not set: the bot will apply ${quota_default}"
+    else
+        # config.Load() trims surrounding whitespace before parsing, so the
+        # comparison runs on the trimmed value on both sides.
+        quota_trimmed="$(printf '%s' "$quota_value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        case "$quota_trimmed" in
+            ''|*[!0-9]*|0|0*) fail "${quota_var} must be a strictly positive integer in canonical decimal form (digits only, no sign, no leading zero; got '${quota_value}')" ;;
+            *)
+                if exceeds_int64 "$quota_trimmed"; then
+                    fail "${quota_var}='${quota_value}' does not fit in a signed 64-bit integer (maximum ${INT64_MAX}): the bot refuses to start with it"
+                else
+                    ok "${quota_var}=${quota_trimmed}"
+                fi
+                ;;
+        esac
+    fi
+done
+if [ -n "${QUOTA_WARN_PERCENT:-}" ]; then
+    warn_trimmed="$(printf '%s' "$QUOTA_WARN_PERCENT" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    case "$warn_trimmed" in
+        ''|*[!0-9]*|0|0*)
+            fail "QUOTA_WARN_PERCENT must be an integer between 1 and 99 in canonical decimal form (got '${QUOTA_WARN_PERCENT}')"
+            ;;
+        *)
+            if [ "${#warn_trimmed}" -gt 2 ]; then
+                fail "QUOTA_WARN_PERCENT must be an integer between 1 and 99 (got '${QUOTA_WARN_PERCENT}')"
+            elif [ "$warn_trimmed" -ge 1 ] && [ "$warn_trimmed" -le 99 ]; then
+                ok "QUOTA_WARN_PERCENT=${warn_trimmed}"
+            else
+                fail "QUOTA_WARN_PERCENT must be an integer between 1 and 99 (got '${QUOTA_WARN_PERCENT}')"
+            fi
+            ;;
+    esac
+else
+    ok "QUOTA_WARN_PERCENT not set: the bot will apply 80"
+fi
+
 # --- 3. App DSN != owner DSN -----------------------------------------------
 # Same rule as config.Load(): identical DSNs => the bot would run with the
 # owner role and FORCE ROW LEVEL SECURITY would become decorative.

@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"github.com/LouisMoretti/Undelete/bot/internal/quotas"
 )
 
 // Config holds the bot's runtime configuration.
@@ -70,6 +72,22 @@ type Config struct {
 	// These endpoints expose no user content, but they remain intended for
 	// the internal network: do not publish them as-is.
 	HealthAddr string
+
+	// QuotaMaxMessages caps the stored message rows of one tenant
+	// (QUOTA_MAX_MESSAGES_PER_TENANT).
+	QuotaMaxMessages int64
+	// QuotaMaxMediaFiles caps the catalogued media rows of one tenant
+	// (QUOTA_MAX_MEDIA_FILES_PER_TENANT).
+	QuotaMaxMediaFiles int64
+	// QuotaMaxMediaBytes caps the stored blob bytes of one tenant
+	// (QUOTA_MAX_MEDIA_BYTES_PER_TENANT).
+	QuotaMaxMediaBytes int64
+	// QuotaCapturesPerMinute caps the captured messages per sliding minute
+	// of one tenant (QUOTA_CAPTURES_PER_MINUTE_PER_TENANT).
+	QuotaCapturesPerMinute int64
+	// QuotaWarnPercent is the usage percentage (1-99) at which the
+	// pre-saturation alert fires once per crossing (QUOTA_WARN_PERCENT).
+	QuotaWarnPercent int
 }
 
 // defaultHealthAddr: dedicated monitoring port, distinct from any
@@ -87,6 +105,19 @@ const defaultMediaDir = "media"
 // survive in a dump.
 const defaultBackupRetentionDays = 14
 
+// Default per-tenant quotas (issue #19), mirrored in .env.example and
+// scripts/preflight.sh. Generous for a personal instance, operator-tunable:
+// ~years of message capture, gigabytes of media, a rate far above what a
+// human group produces. quotas.DefaultLimits is the same set: the two must
+// stay equal, and QuotaLimits is what enforces it in one place.
+const (
+	defaultQuotaMaxMessages       = 100000
+	defaultQuotaMaxMediaFiles     = 10000
+	defaultQuotaMaxMediaBytes     = 5 << 30
+	defaultQuotaCapturesPerMinute = 300
+	defaultQuotaWarnPercent       = 80
+)
+
 // Load reads the configuration from the environment and validates it.
 //
 // Refuses to start if DatabaseURL == MigrationDatabaseURL: if the two DSNs
@@ -98,12 +129,47 @@ const defaultBackupRetentionDays = 14
 // just completely open.
 func Load() (*Config, error) {
 	cfg := &Config{
-		DatabaseURL:          os.Getenv("DATABASE_URL"),
-		MigrationDatabaseURL: os.Getenv("MIGRATION_DATABASE_URL"),
-		TelegramBotToken:     os.Getenv("TELEGRAM_BOT_TOKEN"),
-		HealthAddr:           defaultHealthAddr,
-		MediaDir:             defaultMediaDir,
-		BackupRetentionDays:  defaultBackupRetentionDays,
+		DatabaseURL:            os.Getenv("DATABASE_URL"),
+		MigrationDatabaseURL:   os.Getenv("MIGRATION_DATABASE_URL"),
+		TelegramBotToken:       os.Getenv("TELEGRAM_BOT_TOKEN"),
+		HealthAddr:             defaultHealthAddr,
+		MediaDir:               defaultMediaDir,
+		BackupRetentionDays:    defaultBackupRetentionDays,
+		QuotaMaxMessages:       defaultQuotaMaxMessages,
+		QuotaMaxMediaFiles:     defaultQuotaMaxMediaFiles,
+		QuotaMaxMediaBytes:     defaultQuotaMaxMediaBytes,
+		QuotaCapturesPerMinute: defaultQuotaCapturesPerMinute,
+		QuotaWarnPercent:       defaultQuotaWarnPercent,
+	}
+
+	// Per-tenant quotas (issue #19). Same strictness as BACKUP_RETENTION_DAYS
+	// above: an absent variable keeps the generous default, a malformed or
+	// non-positive one fails at startup rather than running an unbounded
+	// tenant silently.
+	quotaInts := []struct {
+		env   string
+		field *int64
+	}{
+		{"QUOTA_MAX_MESSAGES_PER_TENANT", &cfg.QuotaMaxMessages},
+		{"QUOTA_MAX_MEDIA_FILES_PER_TENANT", &cfg.QuotaMaxMediaFiles},
+		{"QUOTA_MAX_MEDIA_BYTES_PER_TENANT", &cfg.QuotaMaxMediaBytes},
+		{"QUOTA_CAPTURES_PER_MINUTE_PER_TENANT", &cfg.QuotaCapturesPerMinute},
+	}
+	for _, q := range quotaInts {
+		if raw := strings.TrimSpace(os.Getenv(q.env)); raw != "" {
+			value, err := parseCanonicalPositiveInt64(raw)
+			if err != nil {
+				return nil, fmt.Errorf("invalid %s: %w", q.env, err)
+			}
+			*q.field = value
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("QUOTA_WARN_PERCENT")); raw != "" {
+		percent, err := parseCanonicalWarnPercent(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid QUOTA_WARN_PERCENT: %w", err)
+		}
+		cfg.QuotaWarnPercent = percent
 	}
 
 	// Same parse rule as preflight.sh applies to the same variable: an integer,
@@ -200,6 +266,20 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
+// QuotaLimits returns the configured per-tenant quotas as the tracker reads
+// them. The construction cannot fail: Load validated every field above, and
+// the defaults are quotas.DefaultLimits by construction -- pinned by
+// TestQuotaLimitsMatchDefaults.
+func (c *Config) QuotaLimits() quotas.Limits {
+	return quotas.Limits{
+		MaxMessages:       c.QuotaMaxMessages,
+		MaxMediaFiles:     c.QuotaMaxMediaFiles,
+		MaxMediaBytes:     c.QuotaMaxMediaBytes,
+		CapturesPerMinute: c.QuotaCapturesPerMinute,
+		WarnPercent:       c.QuotaWarnPercent,
+	}
+}
+
 // parseOwnerAllowlist reads OWNER_ALLOWLIST_TELEGRAM_USER_IDS into the list of
 // Telegram user ids allowed to onboard.
 //
@@ -237,6 +317,43 @@ func parseOwnerAllowlist(raw string) ([]int64, error) {
 		allowed = append(allowed, id)
 	}
 	return allowed, nil
+}
+
+// parseCanonicalPositiveInt64 parses a per-tenant quota value: a strictly
+// positive decimal integer in canonical form -- digits only, no sign, no
+// leading zero -- that fits in an int64. Same rule as isCanonicalPositiveDecimal
+// (and scripts/preflight.sh): "007", "+5" or an int64 overflow is refused
+// rather than coerced, so preflight and boot agree on every value instead of
+// one accepting what the other refuses (issue #19 review F1, same class as
+// the #17 allowlist parity fix).
+func parseCanonicalPositiveInt64(raw string) (int64, error) {
+	if !isCanonicalPositiveDecimal(raw) {
+		return 0, fmt.Errorf("expected a positive integer in canonical decimal form (digits only, no sign, no leading zero), got %q", raw)
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("expected a positive integer that fits in a signed 64-bit integer, got %q: %w", raw, err)
+	}
+	if value <= 0 {
+		return 0, fmt.Errorf("expected a positive number, got %d", value)
+	}
+	return value, nil
+}
+
+// parseCanonicalWarnPercent parses QUOTA_WARN_PERCENT: a canonical positive
+// decimal integer (same rule as the quotas above) between 1 and 99.
+func parseCanonicalWarnPercent(raw string) (int, error) {
+	if !isCanonicalPositiveDecimal(raw) {
+		return 0, fmt.Errorf("expected an integer between 1 and 99 in canonical decimal form, got %q", raw)
+	}
+	percent, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("expected an integer between 1 and 99, got %q: %w", raw, err)
+	}
+	if percent <= 0 || percent >= 100 {
+		return 0, fmt.Errorf("%d; expected between 1 and 99", percent)
+	}
+	return percent, nil
 }
 
 // isCanonicalPositiveDecimal reports whether token is a strictly positive

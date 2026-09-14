@@ -9,7 +9,7 @@
 //
 // Deliberate corollary: the exposed series have NO labels, the list of names
 // is fixed and hardcoded in RenderPrometheus. Cardinality is therefore
-// bounded by construction (one series per name, six in total), without any
+// bounded by construction (one series per name, eight in total), without any
 // runtime guardrail being necessary.
 package metrics
 
@@ -29,6 +29,16 @@ type Counters struct {
 	outboxFailed  atomic.Int64
 	deletions     atomic.Int64
 	outboxBacklog atomic.Int64
+	// quotaDrops counts captures dropped by a per-tenant quota (issue #19):
+	// messages, media attachments and media downloads refused past a limit.
+	quotaDrops atomic.Int64
+	// quotaWarnings counts pre-saturation alerts of the volume quotas (stored
+	// messages, catalogued media files, stored media bytes): usages crossing
+	// the warn threshold, and fresh volume refusals. The capture rate never
+	// warns (a flood must not emit a warning per refusal). At most one per
+	// crossing and one per fresh block -- never per update under sustained
+	// saturation.
+	quotaWarnings atomic.Int64
 }
 
 // std is the instance used by the binary. The counters are atomic: the poller
@@ -43,6 +53,16 @@ func (c *Counters) AddUpdates(n int64)       { c.updates.Add(n) }
 func (c *Counters) AddUpdateErrors(n int64)  { c.updateErrors.Add(n) }
 func (c *Counters) AddOutboxRetries(n int64) { c.outboxRetries.Add(n) }
 func (c *Counters) AddDeletions(n int64)     { c.deletions.Add(n) }
+
+// AddQuotaDrops counts captures refused past a per-tenant quota. No label
+// carries the tenant or the quota kind (see the package rule): the breakdown
+// lives in the logs, which quote ids and quota names without user content.
+func (c *Counters) AddQuotaDrops(n int64) { c.quotaDrops.Add(n) }
+
+// AddQuotaWarnings counts volume-quota pre-saturation alerts (threshold
+// crossings and fresh volume refusals, never rate refusals), the operator
+// signal that a tenant is about to -- or has just started to -- lose captures.
+func (c *Counters) AddQuotaWarnings(n int64) { c.quotaWarnings.Add(n) }
 
 // AddOutboxFailed counts alerts PERMANENTLY ABANDONED. Without this series, an
 // alert in permanent failure leaves no metric trace: it leaves
@@ -61,6 +81,8 @@ func AddOutboxRetries(n int64) { std.AddOutboxRetries(n) }
 func AddOutboxFailed(n int64)  { std.AddOutboxFailed(n) }
 func AddDeletions(n int64)     { std.AddDeletions(n) }
 func SetOutboxBacklog(n int64) { std.SetOutboxBacklog(n) }
+func AddQuotaDrops(n int64)    { std.AddQuotaDrops(n) }
+func AddQuotaWarnings(n int64) { std.AddQuotaWarnings(n) }
 
 // ContentType is the MIME type of the Prometheus text exposition.
 const ContentType = "text/plain; version=0.0.4; charset=utf-8"
@@ -111,6 +133,18 @@ var allSeries = []series{
 		help:  "Number of outbox alerts still to be delivered (pending or processing).",
 		kind:  "gauge",
 		value: func(c *Counters) int64 { return c.outboxBacklog.Load() },
+	},
+	{
+		name:  "undelete_quota_drops_total",
+		help:  "Total number of captures dropped past a per-tenant quota (messages, media attachments, media downloads).",
+		kind:  "counter",
+		value: func(c *Counters) int64 { return c.quotaDrops.Load() },
+	},
+	{
+		name:  "undelete_quota_warnings_total",
+		help:  "Total number of per-tenant volume-quota pre-saturation alerts (threshold crossings and fresh volume refusals, never rate refusals).",
+		kind:  "counter",
+		value: func(c *Counters) int64 { return c.quotaWarnings.Load() },
 	},
 }
 

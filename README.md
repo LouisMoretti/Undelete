@@ -45,7 +45,7 @@ A refusal is **memoised like a revocation**, for the cache's TTL: an unadmitted
 holder who connects the bot to their own Business account and then types costs
 one `business_connections` read (and, for an id no row matches, one
 `getBusinessConnection`) in total rather than one per message — those calls run
-on the sequential poller goroutine and on the Telegram rate budget the admitted
+on a shard worker of the poller and on the Telegram rate budget the admitted
 tenants share. The memo carries the refusal and the holder it names, never a
 tenant key, and it is re-checked against the allowlist rather than served on
 trust.
@@ -249,8 +249,11 @@ branch ruleset* / *Add rule* on `main`) — not automatable from this repository
                               │
                               ▼
                     ┌───────────────────┐
-                    │  telegram.Poller  │  sequential, backoff, offset
-                    └─────────┬─────────┘  advances even if the handler fails
+                    │  telegram.Poller  │  single fetch, backoff, offset;
+                    └─────────┬─────────┘  sharded execution per (connection,
+                              │ Update     chat), order kept per partition;
+                              │            offset advances even if the handler
+                              │            fails
                               │ Update
                               ▼
                     ┌───────────────────┐
@@ -330,9 +333,14 @@ branch ruleset* / *Add rule* on `main`) — not automatable from this repository
    cannot be a global `DELETE` through the bare pool: with `FORCE RLS` and
    no context set, the query would succeed and delete zero rows, without any
    error. `PurgeExpired` loops tenant by tenant.
-5. **Sequential update processing.** A parallel worker pool could
-   process a deletion before the corresponding message. Future
-   scaling will use sharding on `chat_id`, never an unordered pool.
+5. **Sharded update processing.** Updates execute sharded by
+   `(business_connection_id, chat_id)` with a strict FIFO order per
+   partition -- a deletion can never overtake its message -- never an
+   unordered pool. Submission is fair across partitions (a full slow shard
+   never head-of-line-blocks idle ones), but the next fetch waits for the
+   slowest partition of the current batch, bounded by the handler ceilings
+   (command 10s, welcome 30s, erasure 60s): one slow tenant stalls global
+   freshness, it never deadlocks the loop.
 6. **`message_ids` is an array.** A batch deletion arrives in a single
    `deleted_business_messages` update.
 7. **Alerts are sent FROM the bot**, without `business_connection_id`: that

@@ -150,11 +150,13 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	// One per-tenant exclusion for the whole process, shared by the erasure
-	// (exclusive side) and the three background writers (shared side): the
-	// media fetcher must not land a blob after the erasure swept the disk,
-	// the outbox worker must not deliver an alert the erasure drained, and
-	// the daily media retention must not interleave with an erasure in
-	// flight. It is also what serialises two concurrent erasures of one tenant.
+	// (exclusive side) and the writers that must not interleave with it
+	// (shared side): the media fetcher must not land a blob after the erasure
+	// swept the disk, the outbox worker must not deliver an alert the erasure
+	// drained, the poller save path must not commit a message behind the
+	// erasure's delete step, and the daily media retention must not
+	// interleave with an erasure in flight. It is also what serialises two
+	// concurrent erasures of one tenant.
 	guard := tenantexcl.New()
 	fetcher := fetch.New(mediaRepo, client, downloader, cfg.TelegramBotToken, logger, guard)
 
@@ -206,7 +208,12 @@ func run(logger *slog.Logger) error {
 	handler := app.NewHandler(businessSvc, messagesRepo, mediaRepo, logger,
 		app.WithCommandSender(client),
 		app.WithDataEraser(eraser, cfg.BackupRetentionDays),
-		app.WithRetention(usersRepo, cfg.BackupRetentionDays))
+		app.WithRetention(usersRepo, cfg.BackupRetentionDays),
+		// Shared side of the erasure exclusion around the save unit: a
+		// message resolved as enabled before the erasure disabled the tenant
+		// either commits before the erasure's delete step or is skipped
+		// after it, never resurrected behind it.
+		app.WithTenantGuard(guard))
 
 	poller := telegram.NewPoller(client, logger)
 

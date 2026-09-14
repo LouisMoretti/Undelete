@@ -32,8 +32,8 @@ type Counters struct {
 }
 
 // std is the instance used by the binary. The counters are atomic: the poller
-// is sequential, but the outbox and the backlog loop run in their own
-// goroutines and write concurrently.
+// runs its shard workers, and the outbox and the backlog loop run in their
+// own goroutines, all writing concurrently.
 var std = &Counters{}
 
 // Default returns the package instance, to pass to the health server.

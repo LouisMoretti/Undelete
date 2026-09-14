@@ -53,7 +53,7 @@ const (
 	// holder the onboarding allowlist does not admit. Without it, every update
 	// from an unadmitted holder re-runs the whole chain -- one
 	// business_connections read and, for an id no row matches, one
-	// getBusinessConnection -- on the sequential poller goroutine and on the
+	// getBusinessConnection -- on a shard worker of the poller and on the
 	// bot's shared Telegram rate budget.
 	entryRefused
 )
@@ -88,15 +88,25 @@ type connectionCache struct {
 	// order holds *cacheEntry, most recently used at the front. The eviction
 	// victim is therefore always order.Back().
 	order *list.List
+	// disabledOwners remembers the owners DisableOwner turned off, so that
+	// a stale database read (predating the disable) cannot resurrect their
+	// connections as enabled even when no cache entry existed to patch --
+	// disableOwner patches entries, but an entry only exists for a
+	// connection resolved within the TTL. A fresh enabled state (a
+	// reconnect, which Telegram reports now) clears the marker through
+	// store. One entry per erased owner, cleared on reconnect: erasure is a
+	// rare deliberate act, so the set stays tiny.
+	disabledOwners map[int64]struct{}
 }
 
 func newConnectionCache(ttl time.Duration, max int, now func() time.Time) *connectionCache {
 	return &connectionCache{
-		ttl:   ttl,
-		max:   max,
-		now:   now,
-		byID:  make(map[string]*list.Element),
-		order: list.New(),
+		ttl:            ttl,
+		max:            max,
+		now:            now,
+		byID:           make(map[string]*list.Element),
+		order:          list.New(),
+		disabledOwners: make(map[int64]struct{}),
 	}
 }
 
@@ -121,8 +131,60 @@ func (c *connectionCache) lookup(id string) (cacheEntry, bool) {
 }
 
 // store memoises a resolved connection.
+//
+// Fresh states only: the caller describes the connection as Telegram reports
+// it right now (HandleBusinessConnection, or the API upsert of a database
+// miss), including a reconnect that legitimately re-enables a connection an
+// erasure disabled. A connection re-read from the database must go through
+// storeDB instead: that read may predate a DisableOwner.
+//
+// An enabled store clears the owner's disabled marker (a reconnect is a fresh
+// user intent, newer than any disable); a disabled store records it, so the
+// marker also tracks deactivations Telegram reports, not just erasures.
 func (c *connectionCache) store(conn Connection) {
-	c.put(cacheEntry{id: conn.ID, conn: conn})
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if conn.IsEnabled {
+		delete(c.disabledOwners, conn.OwnerUserID)
+	} else {
+		c.disabledOwners[conn.OwnerUserID] = struct{}{}
+	}
+	c.putLocked(cacheEntry{id: conn.ID, conn: conn})
+}
+
+// storeDB memoises a connection freshly read from the database. Unlike
+// store, it never lets a disabled connection resolve as enabled again:
+//
+//   - it refuses the enabled-over-disabled transition on an existing entry;
+//   - it downgrades an enabled row to disabled when the owner carries a
+//     disabled marker but no entry existed to patch.
+//
+// Both cover the same TOCTOU: the Resolve chain is cache lookup -> database
+// read -> store, and the database read may return the pre-disable row while
+// a DisableOwner commits between the read and the store. Storing
+// unconditionally would resurrect an enabled entry (or create one) that every
+// later Resolve would be served until the TTL, while the table says disabled.
+// No mutex closes this: it is a read-modify-write ordering, not a data race.
+// A genuine reconnect still re-enables through store (its state comes from
+// Telegram now, not from a predating read).
+func (c *connectionCache) storeDB(conn Connection) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !conn.IsEnabled {
+		c.putLocked(cacheEntry{id: conn.ID, conn: conn})
+		return
+	}
+	if element, ok := c.byID[conn.ID]; ok {
+		if existing := element.Value.(*cacheEntry); existing.kind == entryResolved && !existing.conn.IsEnabled {
+			return
+		}
+	}
+	if _, marked := c.disabledOwners[conn.OwnerUserID]; marked {
+		conn.IsEnabled = false
+	}
+	c.putLocked(cacheEntry{id: conn.ID, conn: conn})
 }
 
 // storeUnknown memoises the fact that Telegram does not recognise id.
@@ -140,7 +202,11 @@ func (c *connectionCache) storeRefused(id string, ownerTelegramUserID int64) {
 func (c *connectionCache) put(entry cacheEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.putLocked(entry)
+}
 
+// putLocked inserts or replaces one entry. The caller holds the mutex.
+func (c *connectionCache) putLocked(entry cacheEntry) {
 	entry.expiresAt = c.now().Add(c.ttl)
 	if element, ok := c.byID[entry.id]; ok {
 		*element.Value.(*cacheEntry) = entry
@@ -156,7 +222,9 @@ func (c *connectionCache) put(entry cacheEntry) {
 }
 
 // disableOwner marks every cached connection of one owner as disabled, without
-// evicting them.
+// evicting them, and remembers the owner as disabled so that a stale database
+// read predating this call cannot resurrect their connections as enabled
+// through storeDB -- even for connections this cache never held an entry for.
 //
 // Not an optimisation: Resolve answers from this cache before reading the
 // database, so a connection disabled in PostgreSQL alone would keep resolving
@@ -168,6 +236,7 @@ func (c *connectionCache) disableOwner(ownerUserID int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.disabledOwners[ownerUserID] = struct{}{}
 	for _, element := range c.byID {
 		entry := element.Value.(*cacheEntry)
 		if entry.kind == entryResolved && entry.conn.OwnerUserID == ownerUserID {

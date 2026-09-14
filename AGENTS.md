@@ -24,7 +24,7 @@
 ## Critical Constraints (do not violate)
 1. **Two separate DSNs required**: `MIGRATION_DATABASE_URL` (owner) ≠ `DATABASE_URL` (app role). `config.Load()` fails if equal.
 2. **Explicit `allowed_updates`**: `business_connection`, `business_message`, `edited_business_message`, `deleted_business_messages`. Without these, Telegram sends nothing.
-3. **Sequential update processing**: `Poller` handles updates one at a time. Parallel processing would race deletions before message persistence.
+3. **Sharded update processing**: `Poller` fetches sequentially (single owner of the Telegram offset) and executes sharded by `(business_connection_id, chat_id)` via `telegram.Dispatcher` (32 workers, FIFO per partition, bounded queues). Order is guaranteed INSIDE a partition, never globally: a deletion can never overtake its message (same partition), while unrelated chats run concurrently. Handler and its dependencies must stay safe for concurrent use.
 4. **`InTenant` is the ONLY path to `messages`/`notification_outbox`**: sets `app.current_owner_user_id` LOCAL per transaction. `PurgeExpired` loops tenant-by-tenant. Enforced by `bot/internal/storage/tenantsurface_test.go`: only `storage`/`users` may hold a pool, only the four repositories may name an RLS table, only `storage`/`cmd/bot` may reach `DB.Pool` — each allowlist exact.
 5. **FORCE ROW LEVEL SECURITY** on `messages`. `ENABLE` alone doesn't apply to table owner.
 6. **Alerts sent WITHOUT `business_connection_id`**: that field would send as the owner into the monitored chat.

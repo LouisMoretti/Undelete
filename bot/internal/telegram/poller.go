@@ -23,18 +23,26 @@ const (
 type Handler func(ctx context.Context, update Update) error
 
 // Poller performs the getUpdates long polling and delivers updates to a
-// Handler strictly sequentially.
+// Handler sharded by chat.
 //
-// Non-negotiable constraint 5: Telegram delivers updates in emission order.
-// A parallel worker pool could process a deleted_business_messages BEFORE the
-// corresponding business_message (two concurrent goroutines, execution order
-// not guaranteed): the deletion would then find nothing in the database even
-// though the message definitely exists on Telegram's side. This loop therefore
-// stays deliberately sequential, one update processed at a time. Future
-// scaling will come through sharding on chat_id (several independent
-// pollers/handlers, each responsible for a subset of chats, order preserved
-// INSIDE each shard), never through an unordered worker pool on a single
-// stream.
+// Fetch stays single and sequential: this loop is the only owner of the
+// Telegram offset, so the acknowledgement order (and therefore the redelivery
+// on crash) is exactly what it was when every update was handled inline.
+// Execution is sharded instead: each fetched batch is dispatched to a
+// Dispatcher, whose workers run different (connection, chat) partitions
+// concurrently while preserving a strict FIFO order inside each partition.
+//
+// Why this split, and not a worker pool on the stream: a pool could process
+// a deleted_business_messages BEFORE the corresponding business_message (two
+// concurrent goroutines, execution order not guaranteed): the deletion would
+// then find nothing in the database even though the message definitely
+// exists on Telegram's side. Sharding on (connection, chat) keeps the save,
+// the edit and the deletion of one chat on one FIFO worker, so that order
+// can never invert, while two unrelated chats never wait on each other.
+// Non-negotiable constraint 5 (Telegram delivers updates in emission order)
+// is therefore honoured per partition rather than globally: the global order
+// was only ever a means to the per-chat one, and the global form is what
+// capped the throughput of every tenant on the slowest one.
 type Poller struct {
 	client *Client
 	logger *slog.Logger
@@ -111,6 +119,12 @@ func (p *Poller) Run(ctx context.Context, handle Handler) error {
 
 	backoff := minBackoff
 
+	// The shard workers live as long as the run: one fixed set of
+	// goroutines, never one per update. The Handler is called from them from
+	// now on and must be safe for concurrent use (cf. NewDispatcher).
+	dispatcher := NewDispatcher(handle, p.logger)
+	defer dispatcher.Stop()
+
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -145,12 +159,33 @@ func (p *Poller) Run(ctx context.Context, handle Handler) error {
 		p.lastSuccessUnixNano.Store(time.Now().UnixNano())
 		metrics.AddUpdates(int64(len(updates)))
 
-		for _, u := range updates {
-			if err := handle(ctx, u); err != nil {
+		// Sharded execution, sequential acknowledgement: every update of the
+		// batch is processed on its partition's FIFO worker (partitions
+		// concurrently, each partition in order), and the offset advances
+		// over the batch only once all of them have completed. A handler
+		// error is still per-update signal, and the offset still advances
+		// past it: a poisoned update can delay the batch, never freeze the
+		// bot. On shutdown the context aborts the wait; the offset then
+		// advances only over the contiguous submitted prefix: Dispatch
+		// reports ErrUpdateNotSubmitted for updates no worker ever saw,
+		// and advancing over those would skip work no server-side
+		// acknowledgement covers. The process exits right after, so the
+		// next run redelivers from the last acked offset; every capture
+		// write is idempotent.
+		errs := dispatcher.Dispatch(ctx, updates)
+		for i, u := range updates {
+			if err := errs[i]; err != nil {
 				metrics.AddUpdateErrors(1)
 				p.logger.Error("update handling failed",
 					slog.Int64("update_id", u.UpdateID),
 					slog.String("error", err.Error()))
+				if errors.Is(err, ErrUpdateNotSubmitted) {
+					// Aborted before this update reached a worker (and
+					// therefore everything past it too): stop the
+					// acknowledgement here, the redelivery replays from
+					// this update.
+					break
+				}
 			}
 			// The offset advances EVEN IF the handler failed. Explicit
 			// constraint: if we only advanced the offset on success, an

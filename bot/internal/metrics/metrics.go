@@ -64,10 +64,11 @@ func (c *Counters) AddQuotaDrops(n int64) { c.quotaDrops.Add(n) }
 // signal that a tenant is about to -- or has just started to -- lose captures.
 func (c *Counters) AddQuotaWarnings(n int64) { c.quotaWarnings.Add(n) }
 
-// AddOutboxFailed counts alerts PERMANENTLY ABANDONED. Without this series, an
-// alert in permanent failure leaves no metric trace: it leaves
-// undelete_outbox_backlog (which only counts pending/processing) without
-// being delivered, and a spike of 4xx would read as a simple backlog decline.
+// AddOutboxFailed counts alerts that exhausted the fast lane and entered
+// the slow lane (deferred with a fresh budget after 6h, never abandoned).
+// Without this series, a slow-lane alert leaves no metric trace: it stays in
+// undelete_outbox_backlog (which counts pending/processing/failed) without
+// being delivered, and a spike of deferred alerts would read as plain backlog.
 func (c *Counters) AddOutboxFailed(n int64) { c.outboxFailed.Add(n) }
 
 // SetOutboxBacklog publishes the number of outbox rows still to be delivered.
@@ -130,7 +131,7 @@ var allSeries = []series{
 	},
 	{
 		name:  "undelete_outbox_backlog",
-		help:  "Number of outbox alerts still to be delivered (pending or processing).",
+		help:  "Number of outbox alerts still to be delivered (pending, processing or failed).",
 		kind:  "gauge",
 		value: func(c *Counters) int64 { return c.outboxBacklog.Load() },
 	},

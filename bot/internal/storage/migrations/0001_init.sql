@@ -100,11 +100,6 @@ CREATE POLICY tenant_isolation ON messages
     USING (owner_user_id = NULLIF(current_setting('app.current_owner_user_id', true), '')::bigint)
     WITH CHECK (owner_user_id = NULLIF(current_setting('app.current_owner_user_id', true), '')::bigint);
 
--- TODO Phase 2: media_files table (chat_id, message_id, Telegram file_id,
--- local path under ./media, mime_type) linked to messages by the quadruple;
--- retention/purge to be extended to delete the corresponding files on disk,
--- not just the rows.
-
--- TODO Phase 2+: GDPR commands (/delete_my_data, /privacy) -> full deletion
--- functions by owner_user_id, to be documented in the README (privacy
--- section) in relation to BACKUP_RETENTION_DAYS.
+-- Historical note: the Phase 2 media catalogue lives in 0004_media_files.sql
+-- and the GDPR erasure/policy commands in 0006_data_erasure_requests.sql
+-- (plus internal/erasure and internal/privacy). Kept here for history only.

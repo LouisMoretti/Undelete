@@ -21,19 +21,17 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/users"
 )
 
-// Record represents a message to save. Phase 1: text only.
-//
-// TODO Phase 2: add the fields needed for media (Telegram file_id, local
-// path under ./media, mime_type) and propagate them to a separate
-// media_files table (see the TODO in migration 0001).
+// Record represents a message to save. Media attachments are catalogued in
+// the separate media_files table (migration 0004); this record carries the
+// text side plus the chat label upserted alongside it.
 type Record struct {
 	BusinessConnectionID string
 	ChatID               int64
 	MessageID            int64
 	FromUserID           *int64
 	FromDisplay          string
-	// MessageType is always "text" in Phase 1; the column already exists in
-	// the database so no migration is needed when media arrives.
+	// MessageType is the type of the first attachment when the message
+	// carries media (photo, video, ...), "text" otherwise.
 	MessageType  string
 	TextContent  string
 	TelegramDate int64

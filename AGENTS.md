@@ -25,9 +25,10 @@
 1. **Two separate DSNs required**: `MIGRATION_DATABASE_URL` (owner) ≠ `DATABASE_URL` (app role). `config.Load()` fails if equal.
 2. **Explicit `allowed_updates`**: `business_connection`, `business_message`, `edited_business_message`, `deleted_business_messages`. Without these, Telegram sends nothing.
 3. **Sequential update processing**: `Poller` handles updates one at a time. Parallel processing would race deletions before message persistence.
-4. **`InTenant` is the ONLY path to `messages`/`notification_outbox`**: sets `app.current_owner_user_id` LOCAL per transaction. `PurgeExpired` loops tenant-by-tenant.
+4. **`InTenant` is the ONLY path to `messages`/`notification_outbox`**: sets `app.current_owner_user_id` LOCAL per transaction. `PurgeExpired` loops tenant-by-tenant. Enforced by `bot/internal/storage/tenantsurface_test.go`: only `storage`/`users` may hold a pool, only the four repositories may name an RLS table, only `storage`/`cmd/bot` may reach `DB.Pool` — each allowlist exact.
 5. **FORCE ROW LEVEL SECURITY** on `messages`. `ENABLE` alone doesn't apply to table owner.
 6. **Alerts sent WITHOUT `business_connection_id`**: that field would send as the owner into the monitored chat.
+7. **A Business connection never changes owner** (constraint 9 in the README): the upsert in `business/service.go` guards its `ON CONFLICT` clause on `owner_user_id`, so an update claiming an existing connection for another holder writes nothing (`ErrConnectionOwnerConflict`).
 
 ## Operations
 - `docs/runbook.md` is the reference procedure: preflight → backup → migration → rollout → verification, plus rollback, secret rotation and staging recipe. Follow its order.
@@ -43,7 +44,7 @@
 
 ## Environment
 - Copy `.env.example` → `.env`, fill in tokens/passwords
-- `OWNER_TELEGRAM_USER_ID` — mono-tenant guard. Empty in dev only.
+- `OWNER_ALLOWLIST_TELEGRAM_USER_IDS` — onboarding allowlist (comma/space separated Telegram user ids). **Empty = open onboarding**: any Business account holder can connect and becomes a tenant. `OWNER_TELEGRAM_USER_ID` was removed in Phase 3 and `config.Load()` now **fails** if it still holds a value.
 - `BACKUP_RETENTION_DAYS` — daily pg_dump retention (media archives are **not** purged automatically)
 - `BACKUP_PING_URL` — optional dead man's switch pinged after every fully successful backup pass (dump AND media)
 - `MEDIA_BACKUP_MODE` (`auto`) / `MEDIA_BACKUP_FULL_INTERVAL_DAYS` (`7`) — media full/incremental cadence
@@ -53,5 +54,6 @@
 - Outbox: `deleted_at` + notification chunks written atomically; worker processes leases with exponential backoff, honours 429 `retry_after` exactly (stored, never slept). Fast lane: 10 attempts (≈8.5 min of backoff cumulated); then `failed` + 6h slow-lane resweep with a fresh budget -- an alert is deferred, never abandoned. `failed` rows do not block later chunks. The backlog gauge counts `failed` too (undelivered work, even while parked in the slow lane).
 - Retention purge runs daily, separate from poller loop (poller must stay responsive). The media retention takes the shared side of the tenant exclusion per tenant; `EraseTenant` takes none (erasure holds the exclusive side while calling it -- re-acquiring would self-deadlock).
 - Media retention (`internal/media/purge`) extends that daily cycle to `./media`: the blob is unlinked BEFORE the row is marked `purged`, so a crash between the two leaves only the mismatch the catalogue can detect on its own. The reconciliation repairs both directions (row without file, file without row), always bounded per run and resumed by cursor. `MEDIA_PURGE_DRY_RUN=true` logs without deleting.
+- Multi-tenancy: `business.Service` resolves a connection through cache → database → Telegram API. The cache is **bounded (4096 entries, LRU) and expiring (1 min)**: open onboarding makes the id space stranger-driven, and a connection disabled out of band must stop being served as enabled. `DisableOwner` patches it synchronously (an erasure cannot wait a minute). A connection Telegram answers `400` for is memoised as revoked, and a connection whose holder the onboarding allowlist refuses is memoised as refused (same TTL, no tenant key, re-checked on lookup) so an unadmitted holder cannot re-run the whole chain per update
 - Commands (`/privacy`): read from `business_message` only — `allowed_updates` never delivers a plain `message`. That the holder's own outgoing messages arrive as `business_message` is read from the Bot API contract and has not been exercised against a real Business account in this repository — verify it manually on a real account before relying on it. Answered ONLY to the sender when they are the owner of the connection the command arrived through, as a direct message without `business_connection_id`. The answer is cut on paragraph boundaries (never mid-word) and every message is labelled `Privacy policy (i/n)`, label included in the 4096-unit budget, so a delivery that stops short reads as incomplete; the whole send is bounded by `commandAnswerTimeout` because it runs on the poller's goroutine. The policy has one source of truth, `internal/privacy/policy.md`, embedded with `go:embed`; its version and effective date are parsed back from it, never duplicated in Go
 - Logs: `slog` JSON, never contain message content

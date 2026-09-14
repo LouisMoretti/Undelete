@@ -181,8 +181,8 @@ func TestPrivacyCommandIgnoresEveryoneButTheOwner(t *testing.T) {
 	}
 }
 
-// TestPrivacyCommandIgnoredOnRefusedConnections: a connection the mono-tenant
-// guard rejects, or one that is disabled, provides no owner to answer.
+// TestPrivacyCommandIgnoredOnRefusedConnections: a connection the onboarding
+// allowlist rejects, or one that is disabled, provides no owner to answer.
 func TestPrivacyCommandIgnoredOnRefusedConnections(t *testing.T) {
 	disabled := enabledConn()
 	disabled.IsEnabled = false
@@ -192,8 +192,8 @@ func TestPrivacyCommandIgnoredOnRefusedConnections(t *testing.T) {
 		biz  *fakeBusiness
 	}{
 		{
-			name: "connection refused by the mono-tenant guard",
-			biz:  &fakeBusiness{resolveErr: map[string]error{"bc-1": business.ErrOwnerMismatch}},
+			name: "connection refused by the onboarding allowlist",
+			biz:  &fakeBusiness{resolveErr: map[string]error{"bc-1": business.ErrOwnerNotAllowed}},
 		},
 		{
 			name: "disabled connection",

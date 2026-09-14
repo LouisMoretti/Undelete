@@ -8,16 +8,20 @@ As soon as the account holder connects the bot to their Telegram Business
 account, the bot automatically saves messages from **all private
 conversations that this Business connection gives it access to**. There is no
 conversation selector on the `undelete` side: no list of chats to check, no
-allowlist, no per-conversation preference. When Telegram reports a deletion,
+per-conversation allowlist, no per-conversation preference. (The one allowlist
+this bot does have, `OWNER_ALLOWLIST_TELEGRAM_USER_IDS`, decides which ACCOUNT
+HOLDERS may connect at all -- never which of their chats are captured.) When Telegram reports a deletion,
 the bot retrieves the original content from the database (saved at the time
 of reception, because the deletion event does not carry the content) and
 notifies the account holder.
 
 ## Scope
 
-Mono-tenant (one Telegram Business account holder, guarded by
-`OWNER_TELEGRAM_USER_ID`), with text AND media capture: messages are saved on
-receipt with their attachments downloaded to `./media`, and a deletion is
+Multi-tenant: several Telegram Business account holders at once, each an
+isolated tenant. Onboarding is controlled by `OWNER_ALLOWLIST_TELEGRAM_USER_IDS`
+(empty = open onboarding, a list of Telegram user ids = only those holders).
+Text AND media capture: messages are saved on receipt
+with their attachments downloaded to `./media`, and a deletion is
 notified to the holder with the original content -- text always, media when
 the download completed in time. Content rests in plaintext in the database
 (encryption is an explicit non-goal of this stage, see `docs/runbook.md` and
@@ -25,6 +29,61 @@ the privacy policy). Owner commands: `/privacy`, `/retention` (read and set,
 1-365 days) and `/delete_my_data` (single-use expiring challenge, full tenant
 erasure). The schema is multi-tenant and under Row Level Security (RLS)
 throughout.
+
+## Onboarding modes and tenant isolation
+
+`OWNER_ALLOWLIST_TELEGRAM_USER_IDS` is the only knob that decides **whose data
+this instance holds**. It is comma- or space-separated, and each entry is a
+Telegram user id in canonical decimal form.
+
+| Value | Mode | Effect |
+|---|---|---|
+| empty / unset | **open onboarding** | any Telegram Business account holder can connect the bot and becomes a tenant of their own |
+| `123,456` | **restricted** | only those holders are admitted; every other `business_connection` is refused, persisting nothing and answering nothing |
+
+A refusal is **memoised like a revocation**, for the cache's TTL: an unadmitted
+holder who connects the bot to their own Business account and then types costs
+one `business_connections` read (and, for an id no row matches, one
+`getBusinessConnection`) in total rather than one per message — those calls run
+on the sequential poller goroutine and on the Telegram rate budget the admitted
+tenants share. The memo carries the refusal and the holder it names, never a
+tenant key, and it is re-checked against the allowlist rather than served on
+trust.
+
+The allowlist is **admission control, never isolation**. Whatever it contains,
+each tenant's rows stay behind the same `FORCE ROW LEVEL SECURITY` policies,
+keyed on `owner_user_id` and reachable only through `storage.DB.InTenant`. Two
+audits keep that true as the code changes:
+
+- `bot/internal/storage/tenantsurface_test.go` (unit) — only `storage` and
+  `users` may hold a database pool, only the four repositories may name an
+  RLS-protected table, and nothing outside `storage`/`cmd/bot` may reach
+  `DB.Pool`. Each allowlist in it is exact: a stale entry fails too.
+- `bot/integration/multi_tenant_test.go` (integration) — three tenants on a real
+  PostgreSQL 16: every cross-tenant read returns zero, every cross-tenant write
+  is refused, and the connection lifecycle is walked end to end.
+
+`OWNER_TELEGRAM_USER_ID` (the Phase 1 mono-tenant guard) **no longer exists**.
+The bot refuses to start while it is still set to a value, rather than silently
+switching that deployment to open onboarding — see "Mono-tenant to multi-tenant"
+in `docs/runbook.md` for the migration.
+
+### Connection lifecycle
+
+Telegram expresses the whole lifecycle through one update type,
+`business_connection`:
+
+| Transition | Wire signal | Effect |
+|---|---|---|
+| onboarding | first update for an id, `is_enabled: true` | `users` + `business_connections` rows created, holder welcomed |
+| deactivation | `is_enabled: false` | capture stops at the next message, in the database **and** in the in-memory cache |
+| reactivation | `is_enabled: true` again | capture resumes, holder welcomed again |
+| revocation | the id stops being recognised (`getBusinessConnection` answers `400`) | the connection is refused, the refusal is memoised so the updates Telegram still has buffered cost one API call in total |
+
+Removing the bot from a Business account is reported by Telegram as a
+deactivation, so it is handled by that row. One holder may keep **several**
+connections at once; all of them resolve to the same tenant, which is what makes
+`/delete_my_data` cover the whole account rather than one connection.
 
 ## Telegram setup (3 steps)
 
@@ -285,6 +344,14 @@ branch ruleset* / *Add rule* on `main`) — not automatable from this repository
    conversation. The `chats` table is no exception to anything: it stores a
    label to make alerts readable, with no activation flag, and is never
    consulted to decide what to save or notify.
+9. **A Business connection never changes owner.** The upsert in
+   `business/service.go` guards its `ON CONFLICT` clause on `owner_user_id`:
+   an update claiming an existing connection for a different account holder
+   writes nothing and is refused (`ErrConnectionOwnerConflict`). Telegram never
+   reuses a connection id across holders, so this cannot happen in normal
+   operation — and if it ever does, it is one tenant's connection starting to
+   feed another tenant's rows, which is exactly the isolation multi-tenancy
+   exists to hold.
 
 ## Commands
 
@@ -403,10 +470,14 @@ receives and the text reviewed here cannot describe two different policies.
 
 ## Roadmap by phases
 
-- **Phase 1 (this task)**: mono-tenant, plaintext text, RLS in place.
+- **Phase 1**: mono-tenant, plaintext text, RLS in place.
 - **Phase 2**: media (`media_files` table, backup of `./media` separately
   from SQL dumps), GDPR commands (`/privacy` and `/delete_my_data` shipped).
-- **Phase 3**: real multi-tenancy (several simultaneous account holders,
-  removal of the `OWNER_TELEGRAM_USER_ID` guard).
+- **Phase 3 (this task)**: real multi-tenancy — several simultaneous account
+  holders, the `OWNER_TELEGRAM_USER_ID` guard replaced by
+  `OWNER_ALLOWLIST_TELEGRAM_USER_IDS`, connection lifecycle (onboarding,
+  deactivation, reactivation, revocation), and an executable audit of the
+  RLS/`InTenant` surface. Per-chat sharding (#18) and per-tenant quotas (#19)
+  remain open.
 - **Phase 4**: content encryption (`text_encrypted BYTEA`, AES-256-GCM,
   per-tenant key) replacing plaintext `text_content`.

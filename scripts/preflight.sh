@@ -118,16 +118,83 @@ for var in POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB APP_DB_PASSWORD \
     fi
 done
 
-# OWNER_TELEGRAM_USER_ID: optional from config.Load()'s point of view, but
-# it is the Phase 1 mono-tenant guardrail. Empty = any Telegram account can
-# connect the bot in Business mode. Blocking outside local development.
+# OWNER_TELEGRAM_USER_ID: removed in Phase 3. config.Load() refuses to start
+# while it still holds a value, so a leftover entry is a deployment that will
+# not come back up. Reported here, before the deploy, rather than in a crash
+# loop afterwards.
 if [ -n "${OWNER_TELEGRAM_USER_ID:-}" ]; then
-    case "$OWNER_TELEGRAM_USER_ID" in
-        ''|*[!0-9]*) fail "OWNER_TELEGRAM_USER_ID must be an integer (non-numeric value)" ;;
-        *) ok "OWNER_TELEGRAM_USER_ID set (mono-tenant guardrail active)" ;;
-    esac
+    fail "OWNER_TELEGRAM_USER_ID is no longer supported and the bot refuses to start with it set: move that id into OWNER_ALLOWLIST_TELEGRAM_USER_IDS and unset it"
+fi
+
+# INT64_MAX is the largest value strconv.ParseInt accepts for a Telegram user
+# id, i.e. the largest one config.parseOwnerAllowlist admits. A longer run of
+# digits is a value the bot refuses to start with.
+INT64_MAX='9223372036854775807'
+
+# exceeds_int64 reports (exit 0) whether a canonical decimal string -- digits
+# only, no sign, no leading zero, as the case below has already established --
+# is greater than INT64_MAX.
+#
+# The comparison is done on the digit STRING, never with `[ -gt ]` or $((...)):
+# a value past the 64-bit range is exactly what the shell's own arithmetic
+# cannot represent, so asking it would be asking the overflow to report itself.
+# Digit count alone is not enough either -- 9999999999999999999 overflows with
+# the same 19 digits as the maximum -- so at equal length the first differing
+# digit decides, one single-digit comparison at a time.
+exceeds_int64() {
+    _value="$1"
+    if [ "${#_value}" -gt "${#INT64_MAX}" ]; then return 0; fi
+    if [ "${#_value}" -lt "${#INT64_MAX}" ]; then return 1; fi
+    _rest="$_value"
+    _limit="$INT64_MAX"
+    while [ -n "$_rest" ]; do
+        # "${x%"${x#?}"}" is the first character of $x in pure POSIX: strip the
+        # tail that remains once the first character is removed.
+        _digit="${_rest%"${_rest#?}"}"
+        _limit_digit="${_limit%"${_limit#?}"}"
+        if [ "$_digit" -gt "$_limit_digit" ]; then return 0; fi
+        if [ "$_digit" -lt "$_limit_digit" ]; then return 1; fi
+        _rest="${_rest#?}"
+        _limit="${_limit#?}"
+    done
+    return 1
+}
+
+# OWNER_ALLOWLIST_TELEGRAM_USER_IDS: the onboarding allowlist. Empty is a
+# SUPPORTED mode (open onboarding, real multi-tenant), so it is not a failure --
+# but it is the single configuration choice that decides whose data this
+# instance will hold, so it is never silent either.
+if [ -n "${OWNER_ALLOWLIST_TELEGRAM_USER_IDS:-}" ]; then
+    allowlist_count=0
+    allowlist_valid=1
+    # Commas become spaces so the list splits on either separator, exactly as
+    # config.parseOwnerAllowlist does.
+    for owner_id in $(printf '%s' "$OWNER_ALLOWLIST_TELEGRAM_USER_IDS" | tr ',' ' '); do
+        case "$owner_id" in
+            ''|*[!0-9]*|0|0*)
+                fail "OWNER_ALLOWLIST_TELEGRAM_USER_IDS entry '${owner_id}' is not a positive Telegram user id in canonical decimal form"
+                allowlist_valid=0
+                ;;
+            *)
+                # Digits alone are not enough: config.Load() parses each entry
+                # with strconv.ParseInt into an int64 and refuses to start on
+                # overflow. Accepting it here would be a green preflight
+                # followed by a crash-looping deploy -- the one outcome this
+                # check exists to prevent.
+                if exceeds_int64 "$owner_id"; then
+                    fail "OWNER_ALLOWLIST_TELEGRAM_USER_IDS entry '${owner_id}' does not fit in a signed 64-bit integer (maximum ${INT64_MAX}): the bot refuses to start with it"
+                    allowlist_valid=0
+                else
+                    allowlist_count=$((allowlist_count + 1))
+                fi
+                ;;
+        esac
+    done
+    if [ "$allowlist_valid" -eq 1 ]; then
+        ok "OWNER_ALLOWLIST_TELEGRAM_USER_IDS: onboarding restricted to ${allowlist_count} account holder(s)"
+    fi
 else
-    fail "OWNER_TELEGRAM_USER_ID empty: no mono-tenant guardrail, any Business connection would be accepted (acceptable in local dev ONLY)"
+    ok "OWNER_ALLOWLIST_TELEGRAM_USER_IDS empty: OPEN ONBOARDING -- any Telegram Business account holder can connect this bot and become a tenant. Intentional in multi-tenant mode; set the list to restrict it."
 fi
 
 # BACKUP_RETENTION_DAYS has a default value in backup.sh (14): being absent

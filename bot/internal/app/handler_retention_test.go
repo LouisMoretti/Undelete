@@ -289,14 +289,14 @@ func TestRetentionAppliesToTheResolvedTenantOnly(t *testing.T) {
 	}
 }
 
-// TestRetentionIgnoredOnARefusedConnection: a connection the mono-tenant guard
+// TestRetentionIgnoredOnARefusedConnection: a connection the onboarding allowlist
 // rejects provides no owner, so even a well-formed command is dropped before
 // the save -- silently, exactly as the capture would keep it.
 func TestRetentionIgnoredOnARefusedConnection(t *testing.T) {
 	sender := &fakeSender{}
 	store := &fakeRetention{days: map[int64]int{11: 7}}
 	msgs := &fakeMessages{}
-	biz := &fakeBusiness{resolveErr: map[string]error{"bc-1": business.ErrOwnerMismatch}}
+	biz := &fakeBusiness{resolveErr: map[string]error{"bc-1": business.ErrOwnerNotAllowed}}
 	h := NewHandler(biz, msgs, &fakeMedia{}, testLogger(),
 		WithCommandSender(sender), WithRetention(store, 14))
 

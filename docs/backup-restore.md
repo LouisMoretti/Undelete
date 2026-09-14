@@ -524,14 +524,19 @@ Step-by-step procedure, to be done **towards a new target**:
    ```sql
    SELECT version FROM schema_migrations ORDER BY version;
    SELECT count(*) FROM users;
-   SELECT count(*) FROM messages;
+   -- Per tenant, not globally: a dump is only exhaustive if EVERY holder came
+   -- back. A total that looks right while one tenant is missing is exactly the
+   -- failure this line exists to catch.
+   SELECT owner_user_id, count(*) FROM messages GROUP BY 1 ORDER BY 1;
    SELECT relname, relrowsecurity, relforcerowsecurity
      FROM pg_class
      WHERE relnamespace = 'public'::regnamespace
-       AND relname IN ('messages', 'notification_outbox', 'chats');
+       AND relname IN ('messages', 'notification_outbox', 'chats',
+                       'media_files', 'data_erasure_requests');
    ```
-   `relforcerowsecurity` must be true for the three tables: without it,
-   multi-tenant isolation no longer holds.
+   `relforcerowsecurity` must be true for all five tables: without it,
+   multi-tenant isolation no longer holds. The list is the same one the
+   `internal/storage/tenantsurface_test.go` audit enforces.
 7. **Switch over.** Point `MIGRATION_DATABASE_URL` and `DATABASE_URL` at the
    restored database, point the `./media` bind mount at the restored tree,
    restart the bot, and **only once the service is verified** decide the fate

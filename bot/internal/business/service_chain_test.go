@@ -42,27 +42,62 @@ func (r fakeRow) Scan(dest ...any) error {
 	return nil
 }
 
-// fakePool scripts the two statements the service issues: the resolution
-// SELECT (queryConn/queryErr) and the writes (execTag/execErr). Any
-// unexpected call fails the test, so a test that must not touch the database
-// simply leaves the zero value.
+// fakeOwnerRow scans the owner_user_id the connection upsert returns. An
+// upsert refused by the owner guard of the ON CONFLICT clause returns no row,
+// which pgx reports as ErrNoRows: that is exactly what upsertErr scripts.
+type fakeOwnerRow struct {
+	ownerUserID int64
+	err         error
+}
+
+func (r fakeOwnerRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	if len(dest) != 1 {
+		return fmt.Errorf("fakeOwnerRow: %d destinations, want 1", len(dest))
+	}
+	owner, ok := dest[0].(*int64)
+	if !ok {
+		return fmt.Errorf("fakeOwnerRow: unexpected destination type %T", dest[0])
+	}
+	*owner = r.ownerUserID
+	return nil
+}
+
+// fakePool scripts the three statements the service issues: the resolution
+// SELECT (queryConn/queryErr), the connection upsert (upsertErr) and the
+// DisableOwner UPDATE (execTag/execErr). Any unexpected call fails the test,
+// so a test that must not touch the database simply leaves the zero value.
+//
+// The two QueryRow statements are told apart by their argument count: the
+// resolution takes the connection id alone, the upsert takes the four columns
+// it writes.
 type fakePool struct {
 	t         *testing.T
 	queryConn Connection
 	queryErr  error
 	queried   []string
+	upsertErr error
 	execTag   pgconn.CommandTag
 	execErr   error
 	executed  []string
 }
 
 func (p *fakePool) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {
-	if len(args) != 1 {
-		p.t.Fatalf("QueryRow args = %v, want the connection id", args)
+	switch len(args) {
+	case 1:
+		id, _ := args[0].(string)
+		p.queried = append(p.queried, id)
+		return fakeRow{conn: p.queryConn, err: p.queryErr}
+	case 4:
+		owner, _ := args[1].(int64)
+		p.executed = append(p.executed, "upsert")
+		return fakeOwnerRow{ownerUserID: owner, err: p.upsertErr}
+	default:
+		p.t.Fatalf("QueryRow args = %v, want the connection id or the four upsert columns", args)
+		return nil
 	}
-	id, _ := args[0].(string)
-	p.queried = append(p.queried, id)
-	return fakeRow{conn: p.queryConn, err: p.queryErr}
 }
 
 func (p *fakePool) Exec(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
@@ -81,13 +116,17 @@ func (u *fakeUsers) UpsertByTelegramID(_ context.Context, telegramUserID int64) 
 }
 
 type fakeAPI struct {
-	conn     *telegram.BusinessConnection
-	connErr  error
-	requests []telegram.SendMessageRequest
-	sendErr  error
+	conn *telegram.BusinessConnection
+	// connCalls counts the getBusinessConnection calls, which is how the
+	// negative-caching tests prove a refusal is memoised rather than re-asked.
+	connCalls int
+	connErr   error
+	requests  []telegram.SendMessageRequest
+	sendErr   error
 }
 
 func (a *fakeAPI) GetBusinessConnection(_ context.Context, id string) (*telegram.BusinessConnection, error) {
+	a.connCalls++
 	if a.connErr != nil {
 		return nil, a.connErr
 	}
@@ -116,8 +155,8 @@ func apiConn(id string, userID int64, enabled bool) *telegram.BusinessConnection
 func TestResolveServesCacheWithoutTouchingDBOrAPI(t *testing.T) {
 	pool := &fakePool{t: t, queryErr: errors.New("database must not be touched")}
 	api := &fakeAPI{connErr: errors.New("API must not be touched")}
-	svc := NewService(pool, api, &fakeUsers{}, 0, testLogger())
-	svc.storeInCache(Connection{ID: "bc-cached", OwnerUserID: 7, OwnerTelegramUserID: 700, CanReply: true, IsEnabled: true})
+	svc := NewService(pool, api, &fakeUsers{}, nil, testLogger())
+	svc.cache.store(Connection{ID: "bc-cached", OwnerUserID: 7, OwnerTelegramUserID: 700, CanReply: true, IsEnabled: true})
 
 	conn, err := svc.Resolve(context.Background(), "bc-cached")
 	if err != nil {
@@ -137,7 +176,7 @@ func TestResolveFallsBackToDBThenCaches(t *testing.T) {
 	stored := Connection{ID: "bc-db", OwnerUserID: 7, OwnerTelegramUserID: 700, CanReply: true, IsEnabled: true}
 	pool := &fakePool{t: t, queryConn: stored}
 	api := &fakeAPI{connErr: errors.New("API must not be touched")}
-	svc := NewService(pool, api, &fakeUsers{}, 0, testLogger())
+	svc := NewService(pool, api, &fakeUsers{}, nil, testLogger())
 
 	first, err := svc.Resolve(context.Background(), "bc-db")
 	if err != nil || first.OwnerUserID != 7 {
@@ -161,7 +200,7 @@ func TestResolveFallsBackToAPIUpsertsAndCaches(t *testing.T) {
 	pool := &fakePool{t: t, queryErr: pgx.ErrNoRows, execTag: pgconn.NewCommandTag("INSERT 0 1")}
 	people := &fakeUsers{nextID: 7}
 	api := &fakeAPI{conn: apiConn("bc-new", 700, true)}
-	svc := NewService(pool, api, people, 0, testLogger())
+	svc := NewService(pool, api, people, nil, testLogger())
 
 	conn, err := svc.Resolve(context.Background(), "bc-new")
 	if err != nil {
@@ -184,27 +223,27 @@ func TestResolveFallsBackToAPIUpsertsAndCaches(t *testing.T) {
 	}
 }
 
-// TestMonoTenantGuardAppliesAtEveryLevel pins the filter on all three
-// resolution paths: cache, database and API. A foreign connection created
-// before the guardrail was enabled must not become authorized after a
-// restart.
-func TestMonoTenantGuardAppliesAtEveryLevel(t *testing.T) {
+// TestOwnerAllowlistAppliesAtEveryLevel pins the allowlist on all three
+// resolution paths: cache, database and API. A connection persisted while
+// onboarding was open must not become authorized again after a restart once
+// the deployment restricts onboarding.
+func TestOwnerAllowlistAppliesAtEveryLevel(t *testing.T) {
 	foreign := Connection{ID: "bc-foreign", OwnerUserID: 9, OwnerTelegramUserID: 900, IsEnabled: true}
 
 	t.Run("cache", func(t *testing.T) {
 		pool := &fakePool{t: t, queryErr: errors.New("database must not be touched")}
-		svc := NewService(pool, &fakeAPI{}, &fakeUsers{}, 700, testLogger())
-		svc.storeInCache(foreign)
-		if _, err := svc.Resolve(context.Background(), "bc-foreign"); !errors.Is(err, ErrOwnerMismatch) {
-			t.Fatalf("cached foreign Resolve = %v, want ErrOwnerMismatch", err)
+		svc := NewService(pool, &fakeAPI{}, &fakeUsers{}, []int64{700}, testLogger())
+		svc.cache.store(foreign)
+		if _, err := svc.Resolve(context.Background(), "bc-foreign"); !errors.Is(err, ErrOwnerNotAllowed) {
+			t.Fatalf("cached foreign Resolve = %v, want ErrOwnerNotAllowed", err)
 		}
 	})
 
 	t.Run("database", func(t *testing.T) {
 		pool := &fakePool{t: t, queryConn: foreign}
-		svc := NewService(pool, &fakeAPI{connErr: errors.New("API must not be touched")}, &fakeUsers{}, 700, testLogger())
-		if _, err := svc.Resolve(context.Background(), "bc-foreign"); !errors.Is(err, ErrOwnerMismatch) {
-			t.Fatalf("database foreign Resolve = %v, want ErrOwnerMismatch", err)
+		svc := NewService(pool, &fakeAPI{connErr: errors.New("API must not be touched")}, &fakeUsers{}, []int64{700}, testLogger())
+		if _, err := svc.Resolve(context.Background(), "bc-foreign"); !errors.Is(err, ErrOwnerNotAllowed) {
+			t.Fatalf("database foreign Resolve = %v, want ErrOwnerNotAllowed", err)
 		}
 		if len(pool.executed) != 0 {
 			t.Fatal("a refused connection must not be upserted")
@@ -215,9 +254,9 @@ func TestMonoTenantGuardAppliesAtEveryLevel(t *testing.T) {
 		pool := &fakePool{t: t, queryErr: pgx.ErrNoRows}
 		people := &fakeUsers{nextID: 9}
 		api := &fakeAPI{conn: apiConn("bc-foreign", 900, true)}
-		svc := NewService(pool, api, people, 700, testLogger())
-		if _, err := svc.Resolve(context.Background(), "bc-foreign"); !errors.Is(err, ErrOwnerMismatch) {
-			t.Fatalf("API foreign Resolve = %v, want ErrOwnerMismatch", err)
+		svc := NewService(pool, api, people, []int64{700}, testLogger())
+		if _, err := svc.Resolve(context.Background(), "bc-foreign"); !errors.Is(err, ErrOwnerNotAllowed) {
+			t.Fatalf("API foreign Resolve = %v, want ErrOwnerNotAllowed", err)
 		}
 		if len(people.seen) != 0 || len(pool.executed) != 0 {
 			t.Fatal("a refused connection must create neither user nor connection row")
@@ -233,16 +272,16 @@ func TestServiceSurfacesDependencyFailures(t *testing.T) {
 	t.Run("database read error aborts resolution", func(t *testing.T) {
 		pool := &fakePool{t: t, queryErr: errors.New("connection reset")}
 		api := &fakeAPI{connErr: errors.New("API must not be reached")}
-		svc := NewService(pool, api, &fakeUsers{}, 0, testLogger())
+		svc := NewService(pool, api, &fakeUsers{}, nil, testLogger())
 		if _, err := svc.Resolve(context.Background(), "bc-x"); err == nil {
 			t.Fatal("Resolve over a broken database = nil, want error")
 		}
 	})
 
 	t.Run("database write error aborts API fallback", func(t *testing.T) {
-		pool := &fakePool{t: t, queryErr: pgx.ErrNoRows, execErr: errors.New("disk full")}
+		pool := &fakePool{t: t, queryErr: pgx.ErrNoRows, upsertErr: errors.New("disk full")}
 		api := &fakeAPI{conn: apiConn("bc-new", 700, true)}
-		svc := NewService(pool, api, &fakeUsers{nextID: 7}, 0, testLogger())
+		svc := NewService(pool, api, &fakeUsers{nextID: 7}, nil, testLogger())
 		if _, err := svc.Resolve(context.Background(), "bc-new"); err == nil {
 			t.Fatal("Resolve with a failing upsert = nil, want error")
 		}
@@ -251,7 +290,7 @@ func TestServiceSurfacesDependencyFailures(t *testing.T) {
 	t.Run("welcome failure does not fail the connection", func(t *testing.T) {
 		pool := &fakePool{t: t, execTag: pgconn.NewCommandTag("INSERT 0 1")}
 		api := &fakeAPI{sendErr: errors.New("chat not found")}
-		svc := NewService(pool, api, &fakeUsers{nextID: 7}, 0, testLogger())
+		svc := NewService(pool, api, &fakeUsers{nextID: 7}, nil, testLogger())
 		if err := svc.HandleBusinessConnection(context.Background(), *apiConn("bc-w", 700, true)); err != nil {
 			t.Fatalf("a lost welcome must not fail processing, got %v", err)
 		}
@@ -263,10 +302,10 @@ func TestServiceSurfacesDependencyFailures(t *testing.T) {
 // with the UPDATE, entry by entry, while other owners are untouched.
 func TestDisableOwnerDisablesCache(t *testing.T) {
 	pool := &fakePool{t: t, execTag: pgconn.NewCommandTag("UPDATE 2")}
-	svc := NewService(pool, &fakeAPI{}, &fakeUsers{}, 0, testLogger())
-	svc.storeInCache(Connection{ID: "bc-a1", OwnerUserID: 7, OwnerTelegramUserID: 700, IsEnabled: true})
-	svc.storeInCache(Connection{ID: "bc-a2", OwnerUserID: 7, OwnerTelegramUserID: 700, IsEnabled: true})
-	svc.storeInCache(Connection{ID: "bc-b1", OwnerUserID: 8, OwnerTelegramUserID: 800, IsEnabled: true})
+	svc := NewService(pool, &fakeAPI{}, &fakeUsers{}, nil, testLogger())
+	svc.cache.store(Connection{ID: "bc-a1", OwnerUserID: 7, OwnerTelegramUserID: 700, IsEnabled: true})
+	svc.cache.store(Connection{ID: "bc-a2", OwnerUserID: 7, OwnerTelegramUserID: 700, IsEnabled: true})
+	svc.cache.store(Connection{ID: "bc-b1", OwnerUserID: 8, OwnerTelegramUserID: 800, IsEnabled: true})
 
 	changed, err := svc.DisableOwner(context.Background(), 7)
 	if err != nil || changed != 2 {
@@ -295,7 +334,7 @@ func TestHandleBusinessConnectionWelcomesOnlyWhenEnabled(t *testing.T) {
 	t.Run("enabled welcomes once", func(t *testing.T) {
 		pool := &fakePool{t: t, execTag: pgconn.NewCommandTag("INSERT 0 1")}
 		api := &fakeAPI{}
-		svc := NewService(pool, api, &fakeUsers{nextID: 7}, 0, testLogger())
+		svc := NewService(pool, api, &fakeUsers{nextID: 7}, nil, testLogger())
 
 		if err := svc.HandleBusinessConnection(context.Background(), *apiConn("bc-w", 700, true)); err != nil {
 			t.Fatalf("HandleBusinessConnection: %v", err)
@@ -311,7 +350,7 @@ func TestHandleBusinessConnectionWelcomesOnlyWhenEnabled(t *testing.T) {
 	t.Run("disabled sends nothing", func(t *testing.T) {
 		pool := &fakePool{t: t, execTag: pgconn.NewCommandTag("INSERT 0 1")}
 		api := &fakeAPI{}
-		svc := NewService(pool, api, &fakeUsers{nextID: 7}, 0, testLogger())
+		svc := NewService(pool, api, &fakeUsers{nextID: 7}, nil, testLogger())
 
 		if err := svc.HandleBusinessConnection(context.Background(), *apiConn("bc-d", 700, false)); err != nil {
 			t.Fatalf("HandleBusinessConnection: %v", err)
@@ -324,7 +363,7 @@ func TestHandleBusinessConnectionWelcomesOnlyWhenEnabled(t *testing.T) {
 	t.Run("refused is silent", func(t *testing.T) {
 		pool := &fakePool{t: t}
 		api := &fakeAPI{}
-		svc := NewService(pool, api, &fakeUsers{}, 700, testLogger())
+		svc := NewService(pool, api, &fakeUsers{}, []int64{700}, testLogger())
 
 		if err := svc.HandleBusinessConnection(context.Background(), *apiConn("bc-x", 900, true)); err != nil {
 			t.Fatalf("refused connection must be a silent nil, got %v", err)

@@ -94,7 +94,7 @@ func TestHandlerCataloguesPhotoAttachment(t *testing.T) {
 	// client stays nil: business.Service.Resolve is satisfied by the row just
 	// inserted (cache miss -> DB hit) and never reaches the Telegram API for
 	// a connection that already exists.
-	businessSvc := business.NewService(db.Pool, nil, userRepo, 0, logger)
+	businessSvc := business.NewService(db.Pool, nil, userRepo, nil, logger)
 	messagesRepo := messages.NewRepository(db)
 	mediaRepo := media.NewRepository(db)
 	handler := app.NewHandler(businessSvc, messagesRepo, mediaRepo, logger)

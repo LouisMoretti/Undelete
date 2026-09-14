@@ -45,7 +45,7 @@
 2. **Automatically saves** all messages from private conversations accessible through this connection.
 3. **Detects message deletions** and **notifies the owner** by restoring the original content (because the deletion event does not carry the content).
 4. **Manages data retention** (configurable per user, between 1 and 365 days).
-5. **Guarantees multi-tenant isolation** (even though Phase 1 is mono-tenant) via **Row Level Security (RLS)** in PostgreSQL.
+5. **Guarantees multi-tenant isolation** via **Row Level Security (RLS)** in PostgreSQL, audited statically (`internal/storage/tenantsurface_test.go`) and against a real PostgreSQL with three tenants (`integration/multi_tenant_test.go`).
 
 ---
 
@@ -160,7 +160,9 @@ bot/
     1. **In-memory cache** (for already-seen connections).
     2. **Database** (`business_connections`).
     3. **Telegram API** (`getBusinessConnection`) → **DB upsert** if new.
-  - **Mono-tenant guard**: If `OWNER_TELEGRAM_USER_ID` is set, refuses connections from other users (`ErrOwnerMismatch`).
+  - **Onboarding allowlist**: if `OWNER_ALLOWLIST_TELEGRAM_USER_IDS` is non-empty, refuses connections from every other account holder (`ErrOwnerNotAllowed`). Empty = open onboarding (multi-tenant). Applied on all three resolution levels, historical rows included. The refusal is memoised for the cache's TTL, like a revocation, so an unadmitted holder costs one database read (and at most one `getBusinessConnection`) rather than one per update; the entry holds the refusal and the Telegram id it names, never an `owner_user_id`, and is re-checked against the allowlist on lookup.
+  - **Connection lifecycle**: onboarding, deactivation, reactivation (all three carried by `business_connection`) and revocation (`getBusinessConnection` answering `400`, memoised as `ErrConnectionUnknown`). A connection never changes owner (`ErrConnectionOwnerConflict`).
+  - **Resolution cache**: bounded (4096 entries, LRU) and expiring (1 min), so an out-of-band change to `business_connections` cannot be served indefinitely and the id space cannot grow without limit under open onboarding.
   - `HandleBusinessConnection`: Processes the `business_connection` update (upsert user + connection, sends a welcome message).
   - **No RLS** on `business_connections` (resolution table, queried before the `owner_user_id` is known).
 
@@ -262,7 +264,7 @@ bot/
 - **Validation**:
   - `DATABASE_URL != MIGRATION_DATABASE_URL` (otherwise RLS is decorative).
   - `HEALTH_ADDR`: Must be in `host:port` format or empty.
-  - `OWNER_TELEGRAM_USER_ID`: Optional (mono-tenant guard).
+  - `OWNER_ALLOWLIST_TELEGRAM_USER_IDS`: Optional (onboarding allowlist; empty = open onboarding). `OWNER_TELEGRAM_USER_ID` was removed in Phase 3 and now fails startup if still set.
 
 ---
 
@@ -489,7 +491,7 @@ undelete_outbox_failed_total    # Abandoned alerts
      TELEGRAM_BOT_TOKEN=...
      DATABASE_URL=postgres://undelete_app:...@postgres:5432/undelete?sslmode=disable
      MIGRATION_DATABASE_URL=postgres://postgres:...@postgres:5432/undelete?sslmode=disable
-     OWNER_TELEGRAM_USER_ID=...  # Optional (mono-tenant)
+     OWNER_ALLOWLIST_TELEGRAM_USER_IDS=...  # Optional (empty = open onboarding)
      HEALTH_ADDR=:9090
      BACKUP_RETENTION_DAYS=7
      ```
@@ -518,9 +520,9 @@ docker compose logs -f bot   # View the logs
 
 | Phase | Description |
 |-------|-------------|
-| **Phase 1** (current) | Mono-tenant, plaintext text, RLS in place. |
+| **Phase 1** (done) | Mono-tenant, plaintext text, RLS in place. |
 | **Phase 2** | Media (`media_files` table + local storage), GDPR commands (`/privacy` shipped, `/delete_my_data` still to come). |
-| **Phase 3** | Real multi-tenancy (removal of the `OWNER_TELEGRAM_USER_ID` guard). |
+| **Phase 3** (in progress) | Real multi-tenancy: `OWNER_TELEGRAM_USER_ID` replaced by `OWNER_ALLOWLIST_TELEGRAM_USER_IDS`, connection lifecycle, bounded/expiring resolution cache, RLS + `InTenant` audits — issue #17, on this branch. Per-chat sharding (#18) and per-tenant quotas (#19) are **not** done, so the phase is not complete. |
 | **Phase 4** | Content encryption (`text_encrypted BYTEA`, AES-256-GCM, per-tenant key). |
 
 ---

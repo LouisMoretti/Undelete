@@ -125,7 +125,17 @@ func run(logger *slog.Logger) error {
 	messagesRepo := messages.NewRepository(db)
 	outboxRepo := outbox.NewRepository(db)
 	mediaRepo := media.NewRepository(db)
-	businessSvc := business.NewService(db.Pool, client, usersRepo, cfg.OwnerTelegramUserID, logger)
+	businessSvc := business.NewService(db.Pool, client, usersRepo, cfg.AllowedOwnerTelegramUserIDs, logger)
+	// Which onboarding mode this process runs in is the one configuration fact
+	// an operator must be able to confirm from the logs after a rollout. The
+	// COUNT is logged, never the ids: an allowlist is a list of real Telegram
+	// account holders.
+	if len(cfg.AllowedOwnerTelegramUserIDs) == 0 {
+		logger.Warn("onboarding is OPEN: any Telegram Business account holder can connect this bot and become a tenant")
+	} else {
+		logger.Info("onboarding restricted to an allowlist",
+			slog.Int("allowed_owners", len(cfg.AllowedOwnerTelegramUserIDs)))
+	}
 
 	// Dedicated HTTP client for the downloads: a media transfer must not share
 	// the connection pool of the long-polling client, whose timeout is sized

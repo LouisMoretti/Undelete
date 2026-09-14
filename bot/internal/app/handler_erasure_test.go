@@ -306,14 +306,14 @@ func TestErasureWithoutAnEraserIsInert(t *testing.T) {
 	}
 }
 
-// TestErasureIgnoredOnARefusedConnection: a connection the mono-tenant guard
+// TestErasureIgnoredOnARefusedConnection: a connection the onboarding allowlist
 // rejects provides no owner, so even a well-formed confirmation from the
 // configured owner id is dropped before the save -- silently, exactly as the
 // capture would keep it.
 func TestErasureIgnoredOnARefusedConnection(t *testing.T) {
 	sender := &fakeSender{}
 	eraser := &fakeEraser{}
-	biz := &fakeBusiness{resolveErr: map[string]error{"bc-1": business.ErrOwnerMismatch}}
+	biz := &fakeBusiness{resolveErr: map[string]error{"bc-1": business.ErrOwnerNotAllowed}}
 	h := NewHandler(biz, &fakeMessages{}, &fakeMedia{}, testLogger(),
 		WithCommandSender(sender), WithDataEraser(eraser, 14))
 

@@ -208,6 +208,43 @@ else
     ok "BACKUP_RETENTION_DAYS not set: backup.sh will apply 14 days"
 fi
 
+# Per-tenant quotas (issue #19). Absent keeps the bot's generous default
+# (shown in parentheses); a non-numeric or non-positive value fails the
+# deploy, because config.Load() would refuse to start with it.
+for quota_spec in \
+    "QUOTA_MAX_MESSAGES_PER_TENANT:100000" \
+    "QUOTA_MAX_MEDIA_FILES_PER_TENANT:10000" \
+    "QUOTA_MAX_MEDIA_BYTES_PER_TENANT:5368709120" \
+    "QUOTA_CAPTURES_PER_MINUTE_PER_TENANT:300"; do
+    quota_var="${quota_spec%%:*}"
+    quota_default="${quota_spec#*:}"
+    eval "quota_value=\${${quota_var}:-}"
+    if [ -z "$quota_value" ]; then
+        ok "${quota_var} not set: the bot will apply ${quota_default}"
+    else
+        case "$quota_value" in
+            ''|*[!0-9]*|0|0*) fail "${quota_var} must be a strictly positive integer (got '${quota_value}')" ;;
+            *) ok "${quota_var}=${quota_value}" ;;
+        esac
+    fi
+done
+if [ -n "${QUOTA_WARN_PERCENT:-}" ]; then
+    case "$QUOTA_WARN_PERCENT" in
+        ''|*[!0-9]*)
+            fail "QUOTA_WARN_PERCENT must be an integer between 1 and 99 (got '${QUOTA_WARN_PERCENT}')"
+            ;;
+        *)
+            if [ "$QUOTA_WARN_PERCENT" -ge 1 ] && [ "$QUOTA_WARN_PERCENT" -le 99 ]; then
+                ok "QUOTA_WARN_PERCENT=${QUOTA_WARN_PERCENT}"
+            else
+                fail "QUOTA_WARN_PERCENT must be an integer between 1 and 99 (got '${QUOTA_WARN_PERCENT}')"
+            fi
+            ;;
+    esac
+else
+    ok "QUOTA_WARN_PERCENT not set: the bot will apply 80"
+fi
+
 # --- 3. App DSN != owner DSN -----------------------------------------------
 # Same rule as config.Load(): identical DSNs => the bot would run with the
 # owner role and FORCE ROW LEVEL SECURITY would become decorative.

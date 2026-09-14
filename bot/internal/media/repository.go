@@ -224,6 +224,46 @@ func (r *Repository) Save(ctx context.Context, ownerUserID int64, m Record) (int
 	return id, nil
 }
 
+// CountByOwner returns how many media rows one tenant currently catalogues,
+// whatever their status. The quota tracker seeds and re-verifies from it: it
+// is the database truth behind QuotaMediaFiles. Served by
+// idx_media_files_owner_status (owner_user_id first).
+func (r *Repository) CountByOwner(ctx context.Context, ownerUserID int64) (int64, error) {
+	var count int64
+	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT COUNT(*)
+			FROM media_files
+			WHERE owner_user_id = $1
+		`, ownerUserID).Scan(&count)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("counting media files of tenant %d: %w", ownerUserID, err)
+	}
+	return count, nil
+}
+
+// SumStoredBytes returns the blob bytes one tenant currently holds on disk:
+// the sum of byte_size over 'stored' rows only. Pending rows have no file
+// yet (their byte_size is Telegram's declaration, not a disk fact) and purged
+// rows no longer have one. The quota tracker seeds and re-verifies from it:
+// it is the database truth behind QuotaMediaBytes.
+func (r *Repository) SumStoredBytes(ctx context.Context, ownerUserID int64) (int64, error) {
+	var total int64
+	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT COALESCE(SUM(byte_size), 0)
+			FROM media_files
+			WHERE owner_user_id = $1
+			  AND status = 'stored'
+		`, ownerUserID).Scan(&total)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("summing stored media bytes of tenant %d: %w", ownerUserID, err)
+	}
+	return total, nil
+}
+
 // GetByMessage returns the attachments of one message, ordered by file_index so
 // an album or a multi-file message is rebuilt in the order it was sent.
 func (r *Repository) GetByMessage(ctx context.Context, ownerUserID int64, businessConnectionID string, chatID, messageID int64) ([]File, error) {

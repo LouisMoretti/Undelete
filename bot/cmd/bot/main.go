@@ -23,6 +23,7 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/messages"
 	"github.com/LouisMoretti/Undelete/bot/internal/metrics"
 	"github.com/LouisMoretti/Undelete/bot/internal/outbox"
+	"github.com/LouisMoretti/Undelete/bot/internal/quotas"
 	"github.com/LouisMoretti/Undelete/bot/internal/storage"
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
 	"github.com/LouisMoretti/Undelete/bot/internal/tenantexcl"
@@ -158,7 +159,23 @@ func run(logger *slog.Logger) error {
 	// interleave with an erasure in flight. It is also what serialises two
 	// concurrent erasures of one tenant.
 	guard := tenantexcl.New()
-	fetcher := fetch.New(mediaRepo, client, downloader, cfg.TelegramBotToken, logger, guard)
+	// Per-tenant quotas (issue #19): one process-wide tracker, seeded from
+	// the repositories on first touch of each tenant. A saturated tenant has
+	// its further captures dropped explicitly; nothing else changes (no
+	// per-chat selection, no lifecycle gate). The limits are logged as
+	// numbers only -- no tenant data.
+	quotaTracker, err := quotas.NewTracker(cfg.QuotaLimits(), app.NewQuotaUsage(messagesRepo, mediaRepo), nil)
+	if err != nil {
+		return err
+	}
+	quotaLimits := cfg.QuotaLimits()
+	logger.Info("per-tenant quotas enforced",
+		slog.Int64("max_messages", quotaLimits.MaxMessages),
+		slog.Int64("max_media_files", quotaLimits.MaxMediaFiles),
+		slog.Int64("max_media_bytes", quotaLimits.MaxMediaBytes),
+		slog.Int64("captures_per_minute", quotaLimits.CapturesPerMinute),
+		slog.Int("warn_percent", quotaLimits.WarnPercent))
+	fetcher := fetch.New(mediaRepo, client, downloader, cfg.TelegramBotToken, logger, guard, fetch.WithQuota(quotaTracker))
 
 	// Same root as the downloader and the outbox worker: the three of them
 	// resolve the paths of media_files against it, and a purger pointed
@@ -213,7 +230,12 @@ func run(logger *slog.Logger) error {
 		// message resolved as enabled before the erasure disabled the tenant
 		// either commits before the erasure's delete step or is skipped
 		// after it, never resurrected behind it.
-		app.WithTenantGuard(guard))
+		app.WithTenantGuard(guard),
+		// Per-tenant quotas around the capture: a saturated tenant's
+		// messages and media attachments are dropped explicitly (logged
+		// with ids only, quota metrics), never a chat selection, never a
+		// lifecycle gate.
+		app.WithQuota(quotaTracker))
 
 	poller := telegram.NewPoller(client, logger)
 

@@ -21,6 +21,8 @@ import (
 
 	"github.com/LouisMoretti/Undelete/bot/internal/media"
 	"github.com/LouisMoretti/Undelete/bot/internal/media/store"
+	"github.com/LouisMoretti/Undelete/bot/internal/metrics"
+	"github.com/LouisMoretti/Undelete/bot/internal/quotas"
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
 	"github.com/LouisMoretti/Undelete/bot/internal/tenantexcl"
 )
@@ -68,10 +70,17 @@ type Fetcher struct {
 	guard  *tenantexcl.Guard
 	logger *slog.Logger
 	batch  int
+	// quota gates downloads against the per-tenant stored-bytes quota (issue
+	// #19). A refused download is catalogued without a file (MarkPurged),
+	// exactly like a file Telegram will never hand over: the deletion alert
+	// can still say a media existed, and the loop stops asking for it. Nil
+	// disables the gate (unit tests without quotas); production always wires
+	// the process tracker.
+	quota *quotas.Tracker
 }
 
-func New(repo catalogue, resolver Resolver, downloader Downloader, token string, logger *slog.Logger, guard *tenantexcl.Guard) *Fetcher {
-	return &Fetcher{
+func New(repo catalogue, resolver Resolver, downloader Downloader, token string, logger *slog.Logger, guard *tenantexcl.Guard, opts ...Option) *Fetcher {
+	f := &Fetcher{
 		repo:       repo,
 		resolver:   resolver,
 		downloader: downloader,
@@ -80,6 +89,21 @@ func New(repo catalogue, resolver Resolver, downloader Downloader, token string,
 		logger:     logger,
 		batch:      defaultBatch,
 	}
+	for _, opt := range opts {
+		opt(f)
+	}
+	return f
+}
+
+// Option configures a Fetcher. Optional by construction so the existing call
+// sites keep compiling unchanged.
+type Option func(*Fetcher)
+
+// WithQuota wires the per-tenant quota tracker: downloads are admitted
+// against the stored-bytes quota before starting, and accounted after
+// landing. Without it no byte quota is enforced.
+func WithQuota(tracker *quotas.Tracker) Option {
+	return func(f *Fetcher) { f.quota = tracker }
 }
 
 // ProcessTenant downloads at most one batch for a tenant and returns how many
@@ -112,9 +136,52 @@ func (f *Fetcher) ProcessTenant(ctx context.Context, ownerUserID int64) (int, er
 		if ctx.Err() != nil {
 			return stored, nil
 		}
-		switch err := f.fetchOne(ctx, ownerUserID, file); {
+		if f.quota != nil {
+			adm := f.quota.AdmitMediaBytes(ctx, ownerUserID)
+			if adm.Warn {
+				f.logger.Warn("tenant approaching or past media quota, downloads will be catalogued without a file",
+					slog.Int64("owner_user_id", ownerUserID),
+					slog.String("quota", string(adm.Quota)),
+					slog.Int64("usage", adm.Usage),
+					slog.Int64("limit", adm.Limit))
+				metrics.AddQuotaWarnings(1)
+			}
+			if !adm.Allowed {
+				metrics.AddQuotaDrops(1)
+				if markErr := f.repo.MarkPurged(ctx, ownerUserID, file.ID); markErr != nil {
+					return stored, markErr
+				}
+				// Warn on a fresh block (the tracker only asks once per
+				// recheck), Debug on a memoised repeat: ids only, never the
+				// path, the file_id or the URL.
+				if adm.Warn {
+					f.logger.Warn("media download dropped: tenant quota exceeded, catalogued without a file",
+						slog.Int64("owner_user_id", ownerUserID),
+						slog.Int64("media_file_id", file.ID),
+						slog.String("media_type", file.MediaType),
+						slog.Int64("usage", adm.Usage),
+						slog.Int64("limit", adm.Limit))
+				} else {
+					f.logger.Debug("media download dropped: tenant quota exceeded, catalogued without a file",
+						slog.Int64("owner_user_id", ownerUserID),
+						slog.Int64("media_file_id", file.ID))
+				}
+				continue
+			}
+		}
+		switch n, err := f.fetchOne(ctx, ownerUserID, file); {
 		case err == nil:
 			stored++
+			if f.quota != nil {
+				if adm := f.quota.AddMediaBytes(ctx, ownerUserID, n); adm.Warn {
+					f.logger.Warn("tenant approaching or past media quota, downloads will be catalogued without a file",
+						slog.Int64("owner_user_id", ownerUserID),
+						slog.String("quota", string(adm.Quota)),
+						slog.Int64("usage", adm.Usage),
+						slog.Int64("limit", adm.Limit))
+					metrics.AddQuotaWarnings(1)
+				}
+			}
 		case isDefinitive(err):
 			if markErr := f.repo.MarkPurged(ctx, ownerUserID, file.ID); markErr != nil {
 				return stored, markErr
@@ -134,15 +201,15 @@ func (f *Fetcher) ProcessTenant(ctx context.Context, ownerUserID int64) (int, er
 	return stored, nil
 }
 
-func (f *Fetcher) fetchOne(ctx context.Context, ownerUserID int64, file media.File) error {
+func (f *Fetcher) fetchOne(ctx context.Context, ownerUserID int64, file media.File) (int64, error) {
 	resolved, err := f.resolver.GetFile(ctx, file.TelegramFileID)
 	if err != nil {
-		return fmt.Errorf("resolving media %d: %w", file.ID, err)
+		return 0, fmt.Errorf("resolving media %d: %w", file.ID, err)
 	}
 	if resolved.FilePath == "" {
 		// Documented by the Bot API: no file_path means the file is not
 		// downloadable by a bot (over 20 MB). Definitive, hence the sentinel.
-		return fmt.Errorf("media %d: %w", file.ID, store.ErrTooLarge)
+		return 0, fmt.Errorf("media %d: %w", file.ID, store.ErrTooLarge)
 	}
 
 	saved, err := f.downloader.Download(ctx, f.token, store.Request{
@@ -152,14 +219,17 @@ func (f *Fetcher) fetchOne(ctx context.Context, ownerUserID int64, file media.Fi
 		UniqueID:    store.UniqueID(file.TelegramFileUniqueID),
 	})
 	if err != nil {
-		return fmt.Errorf("downloading media %d: %w", file.ID, err)
+		return 0, fmt.Errorf("downloading media %d: %w", file.ID, err)
 	}
 
-	return f.repo.MarkStored(ctx, ownerUserID, file.ID, media.StoredFile{
+	if err := f.repo.MarkStored(ctx, ownerUserID, file.ID, media.StoredFile{
 		RelativePath: saved.RelPath,
 		SHA256:       saved.SHA256,
 		ByteSize:     saved.Bytes,
-	})
+	}); err != nil {
+		return 0, err
+	}
+	return saved.Bytes, nil
 }
 
 // isDefinitive reports a failure that retrying could never clear. Everything

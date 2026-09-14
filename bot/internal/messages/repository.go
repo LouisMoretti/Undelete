@@ -248,6 +248,26 @@ func (r *Repository) MarkDeleted(ctx context.Context, ownerUserID, ownerTelegram
 	return found, nil
 }
 
+// CountByOwner returns how many message rows one tenant currently stores.
+// The quota tracker seeds and re-verifies from it: it is the database truth
+// behind QuotaMessages. Served by idx_messages_owner_saved_at
+// (owner_user_id first), so a saturated tenant's re-verification is an index
+// range scan, not a table scan.
+func (r *Repository) CountByOwner(ctx context.Context, ownerUserID int64) (int64, error) {
+	var count int64
+	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT COUNT(*)
+			FROM messages
+			WHERE owner_user_id = $1
+		`, ownerUserID).Scan(&count)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("counting messages of tenant %d: %w", ownerUserID, err)
+	}
+	return count, nil
+}
+
 // DeleteTenant deletes every message and every chat label of one tenant, and
 // returns the two counts. It is the messages half of /delete_my_data
 // (internal/erasure), never called by retention.

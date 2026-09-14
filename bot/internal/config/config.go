@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"github.com/LouisMoretti/Undelete/bot/internal/quotas"
 )
 
 // Config holds the bot's runtime configuration.
@@ -70,6 +72,22 @@ type Config struct {
 	// These endpoints expose no user content, but they remain intended for
 	// the internal network: do not publish them as-is.
 	HealthAddr string
+
+	// QuotaMaxMessages caps the stored message rows of one tenant
+	// (QUOTA_MAX_MESSAGES_PER_TENANT).
+	QuotaMaxMessages int64
+	// QuotaMaxMediaFiles caps the catalogued media rows of one tenant
+	// (QUOTA_MAX_MEDIA_FILES_PER_TENANT).
+	QuotaMaxMediaFiles int64
+	// QuotaMaxMediaBytes caps the stored blob bytes of one tenant
+	// (QUOTA_MAX_MEDIA_BYTES_PER_TENANT).
+	QuotaMaxMediaBytes int64
+	// QuotaCapturesPerMinute caps the captured messages per sliding minute
+	// of one tenant (QUOTA_CAPTURES_PER_MINUTE_PER_TENANT).
+	QuotaCapturesPerMinute int64
+	// QuotaWarnPercent is the usage percentage (1-99) at which the
+	// pre-saturation alert fires once per crossing (QUOTA_WARN_PERCENT).
+	QuotaWarnPercent int
 }
 
 // defaultHealthAddr: dedicated monitoring port, distinct from any
@@ -87,6 +105,19 @@ const defaultMediaDir = "media"
 // survive in a dump.
 const defaultBackupRetentionDays = 14
 
+// Default per-tenant quotas (issue #19), mirrored in .env.example and
+// scripts/preflight.sh. Generous for a personal instance, operator-tunable:
+// ~years of message capture, gigabytes of media, a rate far above what a
+// human group produces. quotas.DefaultLimits is the same set: the two must
+// stay equal, and QuotaLimits is what enforces it in one place.
+const (
+	defaultQuotaMaxMessages       = 100000
+	defaultQuotaMaxMediaFiles     = 10000
+	defaultQuotaMaxMediaBytes     = 5 << 30
+	defaultQuotaCapturesPerMinute = 300
+	defaultQuotaWarnPercent       = 80
+)
+
 // Load reads the configuration from the environment and validates it.
 //
 // Refuses to start if DatabaseURL == MigrationDatabaseURL: if the two DSNs
@@ -98,12 +129,53 @@ const defaultBackupRetentionDays = 14
 // just completely open.
 func Load() (*Config, error) {
 	cfg := &Config{
-		DatabaseURL:          os.Getenv("DATABASE_URL"),
-		MigrationDatabaseURL: os.Getenv("MIGRATION_DATABASE_URL"),
-		TelegramBotToken:     os.Getenv("TELEGRAM_BOT_TOKEN"),
-		HealthAddr:           defaultHealthAddr,
-		MediaDir:             defaultMediaDir,
-		BackupRetentionDays:  defaultBackupRetentionDays,
+		DatabaseURL:            os.Getenv("DATABASE_URL"),
+		MigrationDatabaseURL:   os.Getenv("MIGRATION_DATABASE_URL"),
+		TelegramBotToken:       os.Getenv("TELEGRAM_BOT_TOKEN"),
+		HealthAddr:             defaultHealthAddr,
+		MediaDir:               defaultMediaDir,
+		BackupRetentionDays:    defaultBackupRetentionDays,
+		QuotaMaxMessages:       defaultQuotaMaxMessages,
+		QuotaMaxMediaFiles:     defaultQuotaMaxMediaFiles,
+		QuotaMaxMediaBytes:     defaultQuotaMaxMediaBytes,
+		QuotaCapturesPerMinute: defaultQuotaCapturesPerMinute,
+		QuotaWarnPercent:       defaultQuotaWarnPercent,
+	}
+
+	// Per-tenant quotas (issue #19). Same strictness as BACKUP_RETENTION_DAYS
+	// above: an absent variable keeps the generous default, a malformed or
+	// non-positive one fails at startup rather than running an unbounded
+	// tenant silently.
+	quotaInts := []struct {
+		env   string
+		field *int64
+	}{
+		{"QUOTA_MAX_MESSAGES_PER_TENANT", &cfg.QuotaMaxMessages},
+		{"QUOTA_MAX_MEDIA_FILES_PER_TENANT", &cfg.QuotaMaxMediaFiles},
+		{"QUOTA_MAX_MEDIA_BYTES_PER_TENANT", &cfg.QuotaMaxMediaBytes},
+		{"QUOTA_CAPTURES_PER_MINUTE_PER_TENANT", &cfg.QuotaCapturesPerMinute},
+	}
+	for _, q := range quotaInts {
+		if raw := strings.TrimSpace(os.Getenv(q.env)); raw != "" {
+			value, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid %s (expected a positive integer): %w", q.env, err)
+			}
+			if value <= 0 {
+				return nil, fmt.Errorf("invalid %s: %d; expected a positive number", q.env, value)
+			}
+			*q.field = value
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("QUOTA_WARN_PERCENT")); raw != "" {
+		percent, err := strconv.Atoi(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid QUOTA_WARN_PERCENT (expected an integer between 1 and 99): %w", err)
+		}
+		if percent <= 0 || percent >= 100 {
+			return nil, fmt.Errorf("invalid QUOTA_WARN_PERCENT: %d; expected between 1 and 99", percent)
+		}
+		cfg.QuotaWarnPercent = percent
 	}
 
 	// Same parse rule as preflight.sh applies to the same variable: an integer,
@@ -198,6 +270,20 @@ func Load() (*Config, error) {
 	cfg.AllowedOwnerTelegramUserIDs = allowed
 
 	return cfg, nil
+}
+
+// QuotaLimits returns the configured per-tenant quotas as the tracker reads
+// them. The construction cannot fail: Load validated every field above, and
+// the defaults are quotas.DefaultLimits by construction -- pinned by
+// TestQuotaLimitsMatchDefaults.
+func (c *Config) QuotaLimits() quotas.Limits {
+	return quotas.Limits{
+		MaxMessages:       c.QuotaMaxMessages,
+		MaxMediaFiles:     c.QuotaMaxMediaFiles,
+		MaxMediaBytes:     c.QuotaMaxMediaBytes,
+		CapturesPerMinute: c.QuotaCapturesPerMinute,
+		WarnPercent:       c.QuotaWarnPercent,
+	}
 }
 
 // parseOwnerAllowlist reads OWNER_ALLOWLIST_TELEGRAM_USER_IDS into the list of

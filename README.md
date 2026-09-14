@@ -85,6 +85,37 @@ deactivation, so it is handled by that row. One holder may keep **several**
 connections at once; all of them resolve to the same tenant, which is what makes
 `/delete_my_data` cover the whole account rather than one connection.
 
+### Per-tenant quotas
+
+Open onboarding means strangers can store their conversations on this disk, so
+each tenant is bounded: stored messages (`QUOTA_MAX_MESSAGES_PER_TENANT`,
+default 100000), catalogued media files (`QUOTA_MAX_MEDIA_FILES_PER_TENANT`,
+default 10000), stored media bytes (`QUOTA_MAX_MEDIA_BYTES_PER_TENANT`,
+default 5 GiB) and captures per sliding minute
+(`QUOTA_CAPTURES_PER_MINUTE_PER_TENANT`, default 300). Every quota is keyed by
+the internal `owner_user_id` the connection resolved to -- never by anything
+read from the update, so no identifier can be spoofed into another tenant's
+budget -- and applies to the tenant as a whole, never to a selection of chats.
+
+Past a quota the capture is **dropped explicitly**: the update costs no write,
+the poller advances past it like past a refused connection, and the drop is
+logged with ids only plus counted in `undelete_quota_drops_total`. Deletions
+already stored are still alerted and `/delete_my_data` still works -- an
+erasure must work precisely when the tenant is over quota. At
+`QUOTA_WARN_PERCENT` (default 80) of a limit the pre-saturation alert fires
+once per crossing (log plus `undelete_quota_warnings_total`), and a fresh
+refusal alerts once more, so the operator hears "approaching" and then "now
+dropping" without one log line per update under sustained saturation.
+
+The enforcement is in-memory with the database as the source of truth: the
+first touch of a tenant seeds its counters (which is also what makes a restart
+safe), and a tenant the ledger calls over quota is re-verified before being
+refused, then memoised for a minute -- retention purges and erasures shrink
+the truth behind the tracker's back, and the next admission resyncs instead of
+refusing forever. A saturated tenant never blocks the others: admissions take
+no lock across database reads, and the outbox (100 jobs per tenant per tick)
+and media fetch (one batch per tenant per pass) loops visit tenants in order.
+
 ## Telegram setup (3 steps)
 
 1. **Create the bot** via [@BotFather](https://t.me/BotFather): `/newbot`,
@@ -484,8 +515,7 @@ receives and the text reviewed here cannot describe two different policies.
 - **Phase 3 (this task)**: real multi-tenancy — several simultaneous account
   holders, the `OWNER_TELEGRAM_USER_ID` guard replaced by
   `OWNER_ALLOWLIST_TELEGRAM_USER_IDS`, connection lifecycle (onboarding,
-  deactivation, reactivation, revocation), and an executable audit of the
-  RLS/`InTenant` surface. Per-chat sharding (#18) and per-tenant quotas (#19)
-  remain open.
+  deactivation, reactivation, revocation), an executable audit of the
+  RLS/`InTenant` surface, per-chat sharding (#18) and per-tenant quotas (#19).
 - **Phase 4**: content encryption (`text_encrypted BYTEA`, AES-256-GCM,
   per-tenant key) replacing plaintext `text_content`.

@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// TestPackageWrappersTouchTheDefaultInstance pins that the six package-level
+// TestPackageWrappersTouchTheDefaultInstance pins that the eight package-level
 // helpers write to std (the instance the binary serves): a wrapper silently
 // detached from Default() would make production dashboards freeze.
 func TestPackageWrappersTouchTheDefaultInstance(t *testing.T) {
@@ -17,6 +17,8 @@ func TestPackageWrappersTouchTheDefaultInstance(t *testing.T) {
 	AddOutboxFailed(5)
 	AddDeletions(6)
 	SetOutboxBacklog(7)
+	AddQuotaDrops(8)
+	AddQuotaWarnings(9)
 	after := Default().RenderPrometheus()
 	if before == after {
 		t.Fatal("package wrappers left the default instance unchanged")
@@ -28,6 +30,8 @@ func TestPackageWrappersTouchTheDefaultInstance(t *testing.T) {
 		"undelete_outbox_failed_total 5",
 		"undelete_deletions_total 6",
 		"undelete_outbox_backlog 7",
+		"undelete_quota_drops_total 8",
+		"undelete_quota_warnings_total 9",
 	} {
 		if !strings.Contains(after, want) {
 			t.Fatalf("after wrappers, exposition misses %q:\n%s", want, after)

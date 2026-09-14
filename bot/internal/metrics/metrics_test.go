@@ -15,6 +15,8 @@ var expectedSeries = []string{
 	"undelete_outbox_failed_total",
 	"undelete_deletions_total",
 	"undelete_outbox_backlog",
+	"undelete_quota_drops_total",
+	"undelete_quota_warnings_total",
 }
 
 func TestRenderPrometheusExposesExpectedSeries(t *testing.T) {
@@ -25,6 +27,8 @@ func TestRenderPrometheusExposesExpectedSeries(t *testing.T) {
 	c.AddOutboxFailed(6)
 	c.AddDeletions(7)
 	c.SetOutboxBacklog(4)
+	c.AddQuotaDrops(8)
+	c.AddQuotaWarnings(9)
 
 	out := c.RenderPrometheus()
 
@@ -35,6 +39,8 @@ func TestRenderPrometheusExposesExpectedSeries(t *testing.T) {
 		"undelete_outbox_failed_total 6",
 		"undelete_deletions_total 7",
 		"undelete_outbox_backlog 4",
+		"undelete_quota_drops_total 8",
+		"undelete_quota_warnings_total 9",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output without %q:\n%s", want, out)

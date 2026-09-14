@@ -138,8 +138,7 @@ func TestIsDefinitiveCoversEveryFailureClass(t *testing.T) {
 func TestFetchOneEmptyPathIsDefinitive(t *testing.T) {
 	cat := &fakeCatalogue{}
 	f := testFetcher(cat, &fakeResolver{files: map[string]*telegram.File{"x": {FilePath: ""}}}, nil)
-	err := f.fetchOne(context.Background(), 11, pendingFile(1))
-	if !errors.Is(err, store.ErrTooLarge) {
+	if _, err := f.fetchOne(context.Background(), 11, pendingFile(1)); !errors.Is(err, store.ErrTooLarge) {
 		t.Fatalf("fetchOne(empty path) = %v, want ErrTooLarge", err)
 	}
 }

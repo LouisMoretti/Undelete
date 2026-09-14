@@ -17,6 +17,7 @@ import (
 	"github.com/LouisMoretti/Undelete/bot/internal/messages"
 	"github.com/LouisMoretti/Undelete/bot/internal/metrics"
 	"github.com/LouisMoretti/Undelete/bot/internal/privacy"
+	"github.com/LouisMoretti/Undelete/bot/internal/quotas"
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
 	"github.com/LouisMoretti/Undelete/bot/internal/tenantexcl"
 	"github.com/LouisMoretti/Undelete/bot/internal/users"
@@ -111,7 +112,15 @@ type Handler struct {
 	// delete step or is skipped after it -- never resurrected behind it.
 	// Nil disables the exclusion (unit tests without an erasure to race);
 	// production always wires the process guard.
-	guard  *tenantexcl.Guard
+	guard *tenantexcl.Guard
+	// quota bounds what one tenant may capture (issue #19). It is consulted
+	// on the capture paths only -- saveMessage (message volume and rate) and
+	// saveMedia (media-file count). Deletion marks, commands and lifecycle
+	// paths never consult it: a deletion mark is not a capture, and an
+	// erasure must work precisely when the tenant is over quota. Nil disables
+	// every quota check (unit tests without quotas); production always wires
+	// the process tracker.
+	quota  *quotas.Tracker
 	logger *slog.Logger
 }
 
@@ -153,6 +162,13 @@ func WithRetention(store retentionStore, backupRetentionDays int) Option {
 // resurrect data the owner was told is gone.
 func WithTenantGuard(guard *tenantexcl.Guard) Option {
 	return func(h *Handler) { h.guard = guard }
+}
+
+// WithQuota wires the per-tenant quota tracker (issue #19): the capture
+// paths admit every message and every media attachment against it before
+// writing. Without it no quota is enforced.
+func WithQuota(tracker *quotas.Tracker) Option {
+	return func(h *Handler) { h.quota = tracker }
 }
 
 func NewHandler(businessSvc businessService, messagesRepo messageStore, mediaRepo mediaCatalogue, logger *slog.Logger, opts ...Option) *Handler {
@@ -396,6 +412,16 @@ func (h *Handler) saveMessage(ctx context.Context, msg *telegram.Message, edited
 			slog.String("business_connection_id", conn.ID))
 		return nil, nil
 	}
+	// Per-tenant quota (issue #19), before the tenant exclusion: a dropped
+	// update needs no Shared hold. The check is keyed by the resolved
+	// OwnerUserID -- never by a chat or sender id from the message -- and
+	// applies to the tenant as a whole, never to a selection of chats
+	// (constraint #8: no chat_id condition anywhere on the capture path).
+	if h.quota != nil {
+		if !h.admitQuota(conn.OwnerUserID, conn.ID, "message", h.quota.AdmitCapture(ctx, conn.OwnerUserID)) {
+			return nil, nil
+		}
+	}
 	// The connection above may have resolved before an erasure disabled it:
 	// re-resolve under the tenant exclusion before writing (cf. rechecked).
 	conn, release, err := h.rechecked(ctx, msg.BusinessConnectionID, conn)
@@ -524,6 +550,54 @@ func (h *Handler) enterSave(ctx context.Context, connectionID string, conn *busi
 		return nil, nil, fmt.Errorf("connection re-resolution under tenant exclusion: %w", err)
 	}
 	return fresh, release, nil
+}
+
+// admitQuota reports one quota admission: the pre-saturation alert (Warn log
+// with ids only, warning metric) when the tracker asks for it, the explicit
+// drop (drop metric, Warn on a fresh block, Debug on a memoised repeat or a
+// rate refusal) when the capture may not proceed.
+//
+// It returns whether the update may proceed. A refusal is never an error to
+// the poller -- the offset advances past the dropped update exactly like past
+// a refused connection -- and never a message to the owner: spending Telegram
+// quota answering an abuser is what the quota exists to prevent.
+//
+// Logs carry ids and counters only, never message content (the product rule
+// on saveMessage) and never the Telegram owner id as a metric label (the
+// metrics package exposes no labels at all).
+func (h *Handler) admitQuota(ownerUserID int64, connectionID string, what string, adm quotas.Admission) bool {
+	if adm.Warn {
+		h.logger.Warn("tenant approaching or past quota, captures will be dropped",
+			slog.Int64("owner_user_id", ownerUserID),
+			slog.String("business_connection_id", connectionID),
+			slog.String("quota", string(adm.Quota)),
+			slog.Int64("usage", adm.Usage),
+			slog.Int64("limit", adm.Limit))
+		metrics.AddQuotaWarnings(1)
+	}
+	if adm.Allowed {
+		return true
+	}
+	metrics.AddQuotaDrops(1)
+	if adm.Warn && adm.Quota != quotas.QuotaCaptureRate {
+		h.logger.Warn("capture dropped: tenant quota exceeded",
+			slog.Int64("owner_user_id", ownerUserID),
+			slog.String("business_connection_id", connectionID),
+			slog.String("quota", string(adm.Quota)),
+			slog.String("dropped", what),
+			slog.Int64("usage", adm.Usage),
+			slog.Int64("limit", adm.Limit))
+	} else {
+		// Memoised repeats and rate refusals are high-frequency by nature:
+		// Debug keeps them out of the operator's way while the counters
+		// still show the pressure.
+		h.logger.Debug("capture dropped: tenant quota exceeded",
+			slog.Int64("owner_user_id", ownerUserID),
+			slog.String("business_connection_id", connectionID),
+			slog.String("quota", string(adm.Quota)),
+			slog.String("dropped", what))
+	}
+	return false
 }
 
 // answerCommand answers the commands the account holder types in a chat
@@ -882,6 +956,9 @@ func (h *Handler) applyRetention(ctx context.Context, conn *business.Connection,
 // pending: the bytes are downloaded afterwards, by the media fetch loop, and
 // only a stored row can end up in a deletion alert.
 //
+// Each attachment is admitted against the media-file quota first (issue #19):
+// past it the attachment is skipped explicitly -- the text stays saved, only
+// the file row is missing, exactly like a download Telegram never hands over.
 // file_index is the position in the list returned by ExtractMedia, which is
 // deterministic for a given message: a Telegram redelivery therefore hits the
 // upsert on the same (message, file_index) instead of duplicating the file.
@@ -890,6 +967,12 @@ func (h *Handler) saveMedia(ctx context.Context, ownerUserID int64, msg *telegra
 		return nil
 	}
 	for index, attachment := range attachments {
+		if h.quota != nil {
+			if !h.admitQuota(ownerUserID, msg.BusinessConnectionID, "media attachment",
+				h.quota.AdmitMediaFile(ctx, ownerUserID)) {
+				return nil
+			}
+		}
 		record := media.Record{
 			BusinessConnectionID: msg.BusinessConnectionID,
 			ChatID:               msg.Chat.ID,

@@ -131,6 +131,50 @@ func TestRunOutboxLoopCapsJobsPerTenant(t *testing.T) {
 	}
 }
 
+// TestRunOutboxLoopServesQuietTenantPastSaturatedOne pins the issue #19
+// fairness half for notifications: a tenant whose queue never reports idle
+// (saturated, over quota, huge backlog) is capped per tick, so a quiet
+// tenant listed after it is still served in the same iteration -- a
+// saturated tenant never blocks the others.
+func TestRunOutboxLoopServesQuietTenantPastSaturatedOne(t *testing.T) {
+	tenants := &fakeTenantLister{tenants: testTenants(11, 22)}
+	served := map[int64]int{}
+	worker := &fakeOutboxDeliverer{process: func(_ context.Context, ownerUserID int64) (bool, error) {
+		served[ownerUserID]++
+		if ownerUserID == 11 {
+			return true, nil // saturated: never idle
+		}
+		return false, nil // quiet: idle at once
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	runOutboxLoop(ctx, tenants, worker, discardLogger())
+
+	if served[11] != maxJobsPerTenantPerTick {
+		t.Fatalf("saturated tenant served %d, want the %d cap", served[11], maxJobsPerTenantPerTick)
+	}
+	if served[22] != 1 {
+		t.Fatalf("quiet tenant served %d, want 1 in the same tick", served[22])
+	}
+}
+
+// TestRunMediaLoopServesQuietTenantPastBusyOne pins the issue #19 fairness
+// half for downloads: the fetch loop visits tenants in order whatever the
+// previous one stored, so one tenant's burst never starves another's.
+func TestRunMediaLoopServesQuietTenantPastBusyOne(t *testing.T) {
+	tenants := &fakeTenantLister{tenants: testTenants(11, 22)}
+	fetcher := &fakeMediaFetcher{stored: 20}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	runMediaLoop(ctx, tenants, fetcher, discardLogger())
+
+	if len(fetcher.calls) != 2 || fetcher.calls[0] != 11 || fetcher.calls[1] != 22 {
+		t.Fatalf("fetcher visited %v, want [11 22] in order despite tenant 11's burst", fetcher.calls)
+	}
+}
+
 // TestRunOutboxLoopSurvivesTenantListingFailure pins the failure mode: when
 // the tenant listing fails, the loop logs and waits for the next tick instead
 // of dying -- and the worker is never touched without a tenant.

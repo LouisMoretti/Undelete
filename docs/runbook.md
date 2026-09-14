@@ -649,8 +649,12 @@ Only when the instance is meant to hold other people's conversations.
    list of §0, it deletes nothing, and the holder can reconnect at will.
 2. **Weigh the exposure.** Open onboarding means strangers can have their
    conversations stored on this disk, under this operator's responsibility. The
-   per-tenant quotas and anti-abuse limits are issue #19 and are **not** in
-   place yet: today nothing bounds how much one tenant can store.
+   per-tenant quotas (issue #19) bound what one tenant can consume -- stored
+   messages, media files, media bytes and capture rate, see "Per-tenant
+   quotas" in the README -- but they bound the *volume*, not the *nature* of
+   what strangers store: review the QUOTA_* variables in `.env.example`
+   before opening, and watch `undelete_quota_drops_total` and
+   `undelete_quota_warnings_total` after.
 3. Empty the variable and deploy. At boot the logs carry the warning
    `onboarding is OPEN: any Telegram Business account holder can connect this
    bot and become a tenant`, and preflight reports `OPEN ONBOARDING`.
@@ -666,6 +670,11 @@ their rows stay, untouched, and become live again if they are re-listed.
 Rolling back to a **pre-Phase-3 image** also works and needs the old variable
 back: that binary does not read `OWNER_ALLOWLIST_TELEGRAM_USER_IDS`, and an
 unset `OWNER_TELEGRAM_USER_ID` would be no guard at all for it.
+
+Rolling back the **quotas** (issue #19) is configuration as well: no migration
+was added, so an older image runs fine on the schema and simply ignores the
+`QUOTA_*` variables. Captures dropped while the quotas were enforced stay
+dropped -- a quota drop writes nothing, so there is nothing to restore.
 
 ---
 

@@ -158,14 +158,23 @@ func (s *Service) Resolve(ctx context.Context, connectionID string) (*Connection
 		return nil, fmt.Errorf("empty business_connection_id")
 	}
 	if entry, ok := s.cache.lookup(connectionID); ok {
-		if entry.unknown {
+		switch entry.kind {
+		case entryUnknown:
 			return nil, fmt.Errorf("%w: %s", ErrConnectionUnknown, connectionID)
+		case entryRefused:
+			// A memoised refusal is re-checked, never served on trust: if the
+			// holder it names is admitted after all, the memo is ignored and
+			// the resolution falls through to the database.
+			if !s.ownerAllowed(entry.refusedOwnerTelegramUserID) {
+				return nil, ErrOwnerNotAllowed
+			}
+		case entryResolved:
+			if !s.ownerAllowed(entry.conn.OwnerTelegramUserID) {
+				return nil, ErrOwnerNotAllowed
+			}
+			conn := entry.conn
+			return &conn, nil
 		}
-		if !s.ownerAllowed(entry.conn.OwnerTelegramUserID) {
-			return nil, ErrOwnerNotAllowed
-		}
-		conn := entry.conn
-		return &conn, nil
 	}
 
 	conn, err := s.getFromDB(ctx, connectionID)
@@ -175,6 +184,12 @@ func (s *Service) Resolve(ctx context.Context, connectionID string) (*Connection
 		// the deployment restricts it again, through the cache or through the
 		// database after a restart.
 		if !s.ownerAllowed(conn.OwnerTelegramUserID) {
+			// Memoised like the revocation is: the holder is not admitted, and
+			// that verdict will not change before the entry expires, so the
+			// updates they keep sending cost one read in total rather than one
+			// each. Only the refusal is remembered -- no tenant key, nothing
+			// this connection could later be resolved with.
+			s.cache.storeRefused(connectionID, conn.OwnerTelegramUserID)
 			return nil, ErrOwnerNotAllowed
 		}
 		s.cache.store(*conn)
@@ -211,7 +226,14 @@ func (s *Service) Resolve(ctx context.Context, connectionID string) (*Connection
 		return nil, err
 	}
 	if resolved == nil {
-		// Rejected by the onboarding allowlist: no cache/DB entry.
+		// Rejected by the onboarding allowlist: neither a users row nor a
+		// business_connections row is written (upsertFromTelegram refuses
+		// before both). The refusal itself is memoised, so a stranger who
+		// connects the bot to their own Business account and then types costs
+		// one getBusinessConnection in total instead of one per message -- on
+		// the poller goroutine and on the rate budget the admitted tenants
+		// share.
+		s.cache.storeRefused(connectionID, apiConn.User.ID)
 		return nil, ErrOwnerNotAllowed
 	}
 	s.cache.store(*resolved)

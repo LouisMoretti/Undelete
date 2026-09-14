@@ -41,6 +41,15 @@ Telegram user id in canonical decimal form.
 | empty / unset | **open onboarding** | any Telegram Business account holder can connect the bot and becomes a tenant of their own |
 | `123,456` | **restricted** | only those holders are admitted; every other `business_connection` is refused, persisting nothing and answering nothing |
 
+A refusal is **memoised like a revocation**, for the cache's TTL: an unadmitted
+holder who connects the bot to their own Business account and then types costs
+one `business_connections` read (and, for an id no row matches, one
+`getBusinessConnection`) in total rather than one per message — those calls run
+on the sequential poller goroutine and on the Telegram rate budget the admitted
+tenants share. The memo carries the refusal and the holder it names, never a
+tenant key, and it is re-checked against the allowlist rather than served on
+trust.
+
 The allowlist is **admission control, never isolation**. Whatever it contains,
 each tenant's rows stay behind the same `FORCE ROW LEVEL SECURITY` policies,
 keyed on `owner_user_id` and reachable only through `storage.DB.InTenant`. Two

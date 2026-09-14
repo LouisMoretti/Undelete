@@ -160,7 +160,7 @@ bot/
     1. **In-memory cache** (for already-seen connections).
     2. **Database** (`business_connections`).
     3. **Telegram API** (`getBusinessConnection`) → **DB upsert** if new.
-  - **Onboarding allowlist**: if `OWNER_ALLOWLIST_TELEGRAM_USER_IDS` is non-empty, refuses connections from every other account holder (`ErrOwnerNotAllowed`). Empty = open onboarding (multi-tenant). Applied on all three resolution levels, historical rows included.
+  - **Onboarding allowlist**: if `OWNER_ALLOWLIST_TELEGRAM_USER_IDS` is non-empty, refuses connections from every other account holder (`ErrOwnerNotAllowed`). Empty = open onboarding (multi-tenant). Applied on all three resolution levels, historical rows included. The refusal is memoised for the cache's TTL, like a revocation, so an unadmitted holder costs one database read (and at most one `getBusinessConnection`) rather than one per update; the entry holds the refusal and the Telegram id it names, never an `owner_user_id`, and is re-checked against the allowlist on lookup.
   - **Connection lifecycle**: onboarding, deactivation, reactivation (all three carried by `business_connection`) and revocation (`getBusinessConnection` answering `400`, memoised as `ErrConnectionUnknown`). A connection never changes owner (`ErrConnectionOwnerConflict`).
   - **Resolution cache**: bounded (4096 entries, LRU) and expiring (1 min), so an out-of-band change to `business_connections` cannot be served indefinitely and the id space cannot grow without limit under open onboarding.
   - `HandleBusinessConnection`: Processes the `business_connection` update (upsert user + connection, sends a welcome message).
@@ -520,9 +520,9 @@ docker compose logs -f bot   # View the logs
 
 | Phase | Description |
 |-------|-------------|
-| **Phase 1** (current) | Mono-tenant, plaintext text, RLS in place. |
+| **Phase 1** (done) | Mono-tenant, plaintext text, RLS in place. |
 | **Phase 2** | Media (`media_files` table + local storage), GDPR commands (`/privacy` shipped, `/delete_my_data` still to come). |
-| **Phase 3** | Real multi-tenancy: `OWNER_TELEGRAM_USER_ID` replaced by `OWNER_ALLOWLIST_TELEGRAM_USER_IDS`, connection lifecycle, bounded/expiring resolution cache, RLS + `InTenant` audits. Sharding (#18) and per-tenant quotas (#19) still open. |
+| **Phase 3** (in progress) | Real multi-tenancy: `OWNER_TELEGRAM_USER_ID` replaced by `OWNER_ALLOWLIST_TELEGRAM_USER_IDS`, connection lifecycle, bounded/expiring resolution cache, RLS + `InTenant` audits — issue #17, on this branch. Per-chat sharding (#18) and per-tenant quotas (#19) are **not** done, so the phase is not complete. |
 | **Phase 4** | Content encryption (`text_encrypted BYTEA`, AES-256-GCM, per-tenant key). |
 
 ---

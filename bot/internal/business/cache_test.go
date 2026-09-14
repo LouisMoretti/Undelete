@@ -108,6 +108,7 @@ func TestCacheDisableOwnerPatchesOnlyThatOwner(t *testing.T) {
 	cache.store(cachedConn("bc-a2", 7))
 	cache.store(cachedConn("bc-b1", 8))
 	cache.storeUnknown("bc-gone")
+	cache.storeRefused("bc-stranger", 900)
 
 	cache.disableOwner(7)
 
@@ -125,8 +126,12 @@ func TestCacheDisableOwnerPatchesOnlyThatOwner(t *testing.T) {
 		t.Fatal("another tenant's connection was disturbed by disableOwner")
 	}
 	gone, ok := cache.lookup("bc-gone")
-	if !ok || !gone.unknown {
+	if !ok || gone.kind != entryUnknown {
 		t.Fatal("a negative entry must survive disableOwner unchanged")
+	}
+	refused, ok := cache.lookup("bc-stranger")
+	if !ok || refused.kind != entryRefused || refused.refusedOwnerTelegramUserID != 900 {
+		t.Fatalf("a refusal memo must survive disableOwner unchanged, got (%+v, %t)", refused, ok)
 	}
 }
 
@@ -140,7 +145,7 @@ func TestCacheNegativeEntriesAreServedAndExpire(t *testing.T) {
 	cache.storeUnknown("bc-gone")
 
 	entry, ok := cache.lookup("bc-gone")
-	if !ok || !entry.unknown {
+	if !ok || entry.kind != entryUnknown {
 		t.Fatalf("lookup of a negative entry = (%+v, %t), want an unknown entry", entry, ok)
 	}
 	clock.advance(time.Minute)

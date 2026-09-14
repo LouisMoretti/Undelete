@@ -605,7 +605,9 @@ The bot **refuses to start** while `OWNER_TELEGRAM_USER_ID` still holds a value.
 That refusal is the point: ignoring the leftover would switch the deployment to
 open onboarding without a single line of output, and the operator would keep
 believing one holder is admitted. `scripts/preflight.sh` reports it before the
-deploy rather than in a crash loop afterwards.
+deploy rather than in a crash loop afterwards — as it does for every allowlist
+entry `config.Load()` would refuse: malformed, zero, leading-zero, or past the
+signed 64-bit range a Telegram user id is parsed into.
 
 ### 7.1 Upgrade keeping exactly the guarantee you had (recommended first step)
 

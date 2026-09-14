@@ -33,18 +33,44 @@ const connectionCacheTTL = time.Minute
 // used, which costs at worst a database read to resolve them again.
 const connectionCacheMaxEntries = 4096
 
+// entryKind tells apart the three things a resolution can settle on. Both
+// negative kinds exist for the same reason -- a decision that will not change
+// within a TTL must not be re-taken for every update Telegram delivers -- but
+// they are distinct verdicts and the caller answers them with distinct errors.
+type entryKind uint8
+
+const (
+	// entryResolved is a connection: conn is the resolution.
+	entryResolved entryKind = iota
+	// entryUnknown is a NEGATIVE entry: Telegram answered
+	// getBusinessConnection for this id with "no such connection". Remembering
+	// the refusal is what keeps a revoked connection from costing one API call
+	// per queued update -- the updates Telegram had buffered for it keep
+	// arriving after the owner removed the bot, and each one would otherwise
+	// re-ask.
+	entryUnknown
+	// entryRefused is the other NEGATIVE entry: the id resolves to an account
+	// holder the onboarding allowlist does not admit. Without it, every update
+	// from an unadmitted holder re-runs the whole chain -- one
+	// business_connections read and, for an id no row matches, one
+	// getBusinessConnection -- on the sequential poller goroutine and on the
+	// bot's shared Telegram rate budget.
+	entryRefused
+)
+
 // cacheEntry is one memoised resolution.
 type cacheEntry struct {
-	id string
-	// conn is meaningful only when unknown is false.
+	id   string
+	kind entryKind
+	// conn is meaningful only for entryResolved.
 	conn Connection
-	// unknown marks a NEGATIVE entry: Telegram answered getBusinessConnection
-	// for this id with "no such connection". Remembering the refusal is what
-	// keeps a revoked connection from costing one API call per queued update --
-	// the updates Telegram had buffered for it keep arriving after the owner
-	// removed the bot, and each one would otherwise re-ask.
-	unknown   bool
-	expiresAt time.Time
+	// refusedOwnerTelegramUserID is meaningful only for entryRefused: the
+	// account holder the id resolved to, kept so the memo can be re-checked
+	// against the allowlist on lookup instead of being served on trust. The
+	// internal owner_user_id is deliberately NOT kept: a refused holder is not
+	// a tenant, and no entry that cannot be resolved may carry a tenant key.
+	refusedOwnerTelegramUserID int64
+	expiresAt                  time.Time
 }
 
 // connectionCache is a bounded, expiring, LRU cache of resolved connections.
@@ -101,7 +127,14 @@ func (c *connectionCache) store(conn Connection) {
 
 // storeUnknown memoises the fact that Telegram does not recognise id.
 func (c *connectionCache) storeUnknown(id string) {
-	c.put(cacheEntry{id: id, unknown: true})
+	c.put(cacheEntry{id: id, kind: entryUnknown})
+}
+
+// storeRefused memoises the fact that id belongs to an account holder the
+// onboarding allowlist does not admit. ownerTelegramUserID is the holder the id
+// resolved to, so the refusal is re-checked on lookup rather than trusted.
+func (c *connectionCache) storeRefused(id string, ownerTelegramUserID int64) {
+	c.put(cacheEntry{id: id, kind: entryRefused, refusedOwnerTelegramUserID: ownerTelegramUserID})
 }
 
 func (c *connectionCache) put(entry cacheEntry) {
@@ -137,7 +170,7 @@ func (c *connectionCache) disableOwner(ownerUserID int64) {
 
 	for _, element := range c.byID {
 		entry := element.Value.(*cacheEntry)
-		if !entry.unknown && entry.conn.OwnerUserID == ownerUserID {
+		if entry.kind == entryResolved && entry.conn.OwnerUserID == ownerUserID {
 			entry.conn.IsEnabled = false
 		}
 	}

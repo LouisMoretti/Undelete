@@ -98,7 +98,7 @@ func TestOnlyStorageAndUsersHoldADatabasePool(t *testing.T) {
 		if importsPgxPool(parsed) {
 			pools[file.pkg] = true
 		}
-		if mentionsRLSTable(string(source)) {
+		if mentionsRLSTable(parsed) {
 			tables[file.pkg] = true
 		}
 		if selectsDBPool(parsed) {
@@ -189,13 +189,62 @@ func selectsDBPool(parsed *ast.File) bool {
 	return found
 }
 
-// mentionsRLSTable looks for a table name preceded by the SQL keyword that
-// would introduce it. Matching the bare name would flag every comment that
-// merely says "messages".
-func mentionsRLSTable(source string) bool {
+// mentionsRLSTable reports an SQL statement naming an RLS-protected table. It
+// looks inside STRING LITERALS only -- which is where every query of this
+// module lives -- so the prose of a comment cannot trip it, and each literal is
+// judged on its own.
+//
+// Two things are required of a literal, and both are what keeps the rule from
+// being either blind or noisy:
+//
+//   - it reads as a statement (SELECT/INSERT/UPDATE/DELETE), so an error
+//     message that happens to say "on messages" is not a database access;
+//   - it names a table after the keyword that would introduce it, on a source
+//     NORMALISED to upper case with whitespace folded to single spaces.
+//
+// The normalisation is the point of this half. SQL here is written in wrapped
+// raw string literals, so the keyword and the table name it introduces are
+// routinely separated by a newline and two tabs, and nothing forces a new
+// package to write its statements in capitals. Matching the raw text missed
+// both -- and a rule that only catches the formatting the current code happens
+// to use is not a rule, it is a coincidence.
+func mentionsRLSTable(parsed *ast.File) bool {
+	found := false
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		if found {
+			return false
+		}
+		literal, ok := node.(*ast.BasicLit)
+		if !ok || literal.Kind != token.STRING {
+			return true
+		}
+		if isRLSStatement(literal.Value) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// isRLSStatement applies the two conditions of mentionsRLSTable to one literal.
+func isRLSStatement(literal string) bool {
+	normalised := normaliseSQL(literal)
+
+	statement := false
+	for _, verb := range []string{"SELECT ", "INSERT ", "UPDATE ", "DELETE "} {
+		if strings.Contains(normalised, verb) {
+			statement = true
+			break
+		}
+	}
+	if !statement {
+		return false
+	}
+
 	for _, table := range rlsTables {
 		for _, keyword := range []string{"FROM ", "INTO ", "UPDATE ", "TABLE ", "JOIN ", "ON "} {
-			if strings.Contains(source, keyword+table) {
+			if containsTableReference(normalised, keyword+normaliseSQL(table)) {
 				return true
 			}
 		}
@@ -203,21 +252,48 @@ func mentionsRLSTable(source string) bool {
 	return false
 }
 
-func assertExactly(t *testing.T, what string, got map[string]bool, want []string) {
-	t.Helper()
+// normaliseSQL folds a source file into the single form the keyword match is
+// written against: upper case, one space between tokens.
+func normaliseSQL(source string) string {
+	return strings.Join(strings.Fields(strings.ToUpper(source)), " ")
+}
 
+// containsTableReference reports "<keyword> <table>" occurring in normalised as
+// a whole name. The right-hand boundary is what keeps the widened match honest:
+// without it, a future `FROM messages_archive` would be read as a reference to
+// `messages`.
+func containsTableReference(normalised, reference string) bool {
+	for offset := 0; ; {
+		index := strings.Index(normalised[offset:], reference)
+		if index < 0 {
+			return false
+		}
+		end := offset + index + len(reference)
+		if end == len(normalised) || !isNameByte(normalised[end]) {
+			return true
+		}
+		offset = end
+	}
+}
+
+func isNameByte(b byte) bool {
+	return b == '_' || (b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z')
+}
+
+// compareAllowlist is the exactness rule itself, kept apart from the reporting
+// so it can be tested on its own: what appeared without being listed, and what
+// is listed but no longer appears.
+func compareAllowlist(got map[string]bool, want []string) (unexpected, stale []string) {
 	allowed := make(map[string]bool, len(want))
 	for _, pkg := range want {
 		allowed[pkg] = true
 	}
 
-	var unexpected []string
 	for pkg := range got {
 		if !allowed[pkg] {
 			unexpected = append(unexpected, pkg)
 		}
 	}
-	var stale []string
 	for _, pkg := range want {
 		if !got[pkg] {
 			stale = append(stale, pkg)
@@ -225,6 +301,13 @@ func assertExactly(t *testing.T, what string, got map[string]bool, want []string
 	}
 	sort.Strings(unexpected)
 	sort.Strings(stale)
+	return unexpected, stale
+}
+
+func assertExactly(t *testing.T, what string, got map[string]bool, want []string) {
+	t.Helper()
+
+	unexpected, stale := compareAllowlist(got, want)
 
 	if len(unexpected) > 0 {
 		t.Errorf("%s: %v are not on the allowlist. Tenant data is only reachable through storage.DB.InTenant; "+
@@ -234,5 +317,103 @@ func assertExactly(t *testing.T, what string, got map[string]bool, want []string
 	if len(stale) > 0 {
 		t.Errorf("%s: %v are on the allowlist but no longer match. Remove them: an allowlist entry that grants nothing "+
 			"is a permission waiting to be reused by accident.", what, stale)
+	}
+}
+
+// TestRLSTableDetectionSurvivesFormatting probes the audit itself. The rule it
+// enforces is only worth as much as its detection: a query is not written in one
+// canonical form, and a new package that names an RLS table must be caught
+// whatever the gofmt of its SQL. The shapes below are all ordinary Go -- a
+// wrapped raw string literal is what any query longer than a line looks like in
+// this repository, and lowercase SQL is a matter of taste, not of intent --
+// while the four negative cases keep the widened match from flagging prose.
+func TestRLSTableDetectionSurvivesFormatting(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "single line",
+			body: "const q = `SELECT * FROM messages WHERE chat_id = $1`",
+			want: true,
+		},
+		{
+			name: "wrapped over several lines",
+			body: "const q = `SELECT owner_user_id\n\tFROM\n\t\tmessages\n\tWHERE id = $1`",
+			want: true,
+		},
+		{
+			name: "lowercase",
+			body: "const q = `select * from messages`",
+			want: true,
+		},
+		{
+			name: "mixed case and wrapped INSERT",
+			body: "const q = `insert into\n  notification_outbox (owner_user_id)\n  values ($1)`",
+			want: true,
+		},
+		{
+			name: "wrapped JOIN",
+			body: "const q = `SELECT m.id\n\tFROM chats c\n\tJOIN\n\tmedia_files m ON m.chat_id = c.id`",
+			want: true,
+		},
+		{
+			name: "interpreted string literal, lowercase",
+			body: "func read() { _, _ = pool.Query(ctx, \"delete from data_erasure_requests where id = $1\") }",
+			want: true,
+		},
+		{
+			name: "comment naming a table",
+			body: "// The chunks are written INTO notification_outbox by the same transaction.\nconst q = 1",
+			want: false,
+		},
+		{
+			name: "error message naming a table without a statement",
+			body: "const q = \"FORCE ROW LEVEL SECURITY on messages would be decorative\"",
+			want: false,
+		},
+		{
+			name: "another table whose name merely starts like one of them",
+			body: "const q = `SELECT * FROM messages_archive`",
+			want: false,
+		},
+		{
+			name: "Go identifier that merely ends in a table name",
+			body: "func countFromMessages() int { return len(deletedMessages) }",
+			want: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := "package probe\n" + tc.body + "\n"
+			parsed, err := parser.ParseFile(token.NewFileSet(), "probe.go", source, 0)
+			if err != nil {
+				t.Fatalf("parse probe: %v", err)
+			}
+			if got := mentionsRLSTable(parsed); got != tc.want {
+				t.Fatalf("mentionsRLSTable(%q) = %t, want %t", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAllowlistComparisonReportsUnexpectedAndStale pins the exactness of the
+// allowlists themselves: a package that appears without being listed is a
+// violation, and a listed package that no longer matches is a permission
+// waiting to be reused by accident. Both halves are what makes the audit a
+// closed list rather than a minimum.
+func TestAllowlistComparisonReportsUnexpectedAndStale(t *testing.T) {
+	got := map[string]bool{"internal/outbox": true, "internal/privacy": true}
+	unexpected, stale := compareAllowlist(got, []string{"internal/outbox", "internal/media"})
+
+	if len(unexpected) != 1 || unexpected[0] != "internal/privacy" {
+		t.Fatalf("unexpected = %v, want [internal/privacy]", unexpected)
+	}
+	if len(stale) != 1 || stale[0] != "internal/media" {
+		t.Fatalf("stale = %v, want [internal/media]", stale)
+	}
+
+	if unexpected, stale := compareAllowlist(got, []string{"internal/outbox", "internal/privacy"}); len(unexpected) != 0 || len(stale) != 0 {
+		t.Fatalf("an exact match reported (%v, %v), want nothing", unexpected, stale)
 	}
 }

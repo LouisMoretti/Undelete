@@ -120,7 +120,7 @@ jobs:
         run: make test-coverage
 
   docker-build:
-    name: docker build
+    name: docker build (amd64 + arm64)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -128,11 +128,21 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # QEMU emulates the runtime-stage RUN steps (apk add, adduser) on the
+      # non-native arch. The Go build itself needs no emulation: the
+      # Dockerfile runs the toolchain on $BUILDPLATFORM and cross-compiles
+      # for $TARGETARCH.
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
       # The production image is otherwise never built before deploy: a
       # broken Dockerfile (or a base image that no longer resolves) must
-      # fail here, not on the deployment machine.
-      - name: docker build bot
-        run: docker build ./bot
+      # fail here, not on the deployment machine. Building both platforms
+      # also catches a Dockerfile that silently embeds a BUILDPLATFORM
+      # binary (missing GOARCH=$TARGETARCH) into the other arch image.
+      - name: docker build bot (amd64 + arm64)
+        run: docker buildx build --platform linux/amd64,linux/arm64 ./bot
 
   restore:
     name: backup restore recipes

@@ -6,18 +6,30 @@ package telegram
 
 import "encoding/json"
 
-// AllowedUpdates is the EXPLICIT list to pass to getUpdates.
+// allowedUpdates is the EXPLICIT list to pass to getUpdates.
 //
 // Non-negotiable constraint 1: without an explicit allowed_updates, Telegram
 // sends NONE of the business_* events by default (they are not part of the
 // update set sent by default to existing bots) -- and this silently, without
 // any error. A bot that omitted this parameter would seem to work (API
 // connection OK, getUpdates answers 200) while never receiving any message.
-var AllowedUpdates = []string{
+//
+// Kept unexported: the accessor below hands out a copy, so no caller -- and
+// no test helper -- can shrink or reorder the list and silently break capture.
+var allowedUpdates = []string{
 	"business_connection",
 	"business_message",
 	"edited_business_message",
 	"deleted_business_messages",
+}
+
+// AllowedUpdates returns the explicit update set for getUpdates. A fresh copy
+// on every call: constraint 1 must not depend on every consumer of this
+// package behaving.
+func AllowedUpdates() []string {
+	out := make([]string, len(allowedUpdates))
+	copy(out, allowedUpdates)
+	return out
 }
 
 // apiResponse is the standard envelope of any Bot API response.

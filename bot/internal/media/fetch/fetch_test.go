@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/LouisMoretti/Undelete/bot/internal/media"
@@ -174,6 +175,38 @@ func TestProcessTenantPurgesDefinitiveFailures(t *testing.T) {
 	}
 	if len(cat.purged) != 1 || cat.purged[0] != 1 {
 		t.Fatalf("definitive failure must mark purged, got %v", cat.purged)
+	}
+}
+
+// TestProcessTenantPurgesExpiredDownload pins the download-side definitive
+// path end to end, through a real store.Downloader: a file Telegram answers
+// 404 to is catalogued without a file (purged), not left pending to vanish
+// silently in the stale sweeper 48h later.
+func TestProcessTenantPurgesExpiredDownload(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+
+	downloader, err := store.New(store.Config{
+		BaseDir: t.TempDir(),
+		BaseURL: srv.URL + "/file/bot",
+		Logger:  slog.New(slog.NewJSONHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("new downloader: %v", err)
+	}
+	file := media.File{ID: 1, TelegramFileID: "file-id", TelegramFileUniqueID: "unique-1", MediaType: "photo"}
+	cat := &fakeCatalogue{pending: []media.File{file}}
+	res := &fakeResolver{files: map[string]*telegram.File{"file-id": {FilePath: "photos/expired.jpg"}}}
+	f := New(cat, res, downloader, "token", slog.New(slog.NewJSONHandler(io.Discard, nil)), nil)
+
+	stored, err := f.ProcessTenant(context.Background(), 11)
+	if err != nil || stored != 0 {
+		t.Fatalf("ProcessTenant = (%d, %v), want (0, nil)", stored, err)
+	}
+	if len(cat.purged) != 1 || cat.purged[0] != 1 {
+		t.Fatalf("expired download must mark purged, got stored=%v purged=%v", cat.stored, cat.purged)
 	}
 }
 

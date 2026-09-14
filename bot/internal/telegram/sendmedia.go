@@ -414,7 +414,11 @@ func writeMediaForm(mw *multipart.Writer, form mediaForm) error {
 		_, err = io.Copy(part, source)
 		source.Close()
 		if err != nil {
-			return fmt.Errorf("telegram: uploading %s: %w", file.name, err)
+			// The pre-check passed but the file became unreadable mid-upload
+			// (purged between Lstat and Open, truncated, I/O error): retrying
+			// would never clear it, so the outbox must degrade to text rather
+			// than burn its backoff. Same classification as the pre-check.
+			return fmt.Errorf("%w: uploading %s: %v", ErrMediaUnavailable, file.name, err)
 		}
 	}
 	return mw.Close()
@@ -427,11 +431,17 @@ func writeMediaForm(mw *multipart.Writer, form mediaForm) error {
 func (c *Client) sendForm(ctx context.Context, form mediaForm) error {
 	reader, writer := io.Pipe()
 	mw := multipart.NewWriter(writer)
+	// Captured for the classification below, not for synchronisation: the
+	// assignment is sequenced before CloseWithError in this goroutine, and the
+	// pipe's internal mutex hands that ordering to the reader, so reading it
+	// after do() returns is race-free.
+	var writeErr error
 	go func() {
+		writeErr = writeMediaForm(mw, form)
 		// CloseWithError(nil) is a plain Close: the reader then sees a clean
 		// EOF, and any write error is surfaced on the request side instead of
 		// being silently truncated into a malformed body.
-		writer.CloseWithError(writeMediaForm(mw, form))
+		writer.CloseWithError(writeErr)
 	}()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+c.token+"/"+form.method, reader)
@@ -440,5 +450,15 @@ func (c *Client) sendForm(ctx context.Context, form mediaForm) error {
 		return fmt.Errorf("building request %s: %w", form.method, err)
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
-	return c.do(req, form.method, nil)
+	if err := c.do(req, form.method, nil); err != nil {
+		// The transport error is only the messenger here: what the outbox
+		// decides on (retry vs degrade to text) is the writer's verdict, and
+		// net/http is not guaranteed to preserve errors.Is through the
+		// request-body path. Surface the classification explicitly.
+		if errors.Is(writeErr, ErrMediaUnavailable) {
+			return fmt.Errorf("%w: mid-upload file loss: %v", ErrMediaUnavailable, err)
+		}
+		return err
+	}
+	return nil
 }

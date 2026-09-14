@@ -198,6 +198,36 @@ func TestPostgreSQL16OutboxLifecycle(t *testing.T) {
 		}
 	})
 
+	t.Run("failed jobs resweep after the slow-lane delay", func(t *testing.T) {
+		// MarkFailed is a deferral, not a loss: once next_attempt_at has
+		// elapsed, the row is reclaimable with a fresh attempt budget.
+		insertChunk(ownerA.ID, 93201, "bc-hard-a", 88102, 3, 0, "slow lane me")
+		job, err := outboxRepo.Claim(context.Background(), ownerA.ID, 2*time.Minute)
+		if err != nil || job == nil {
+			t.Fatalf("Claim = (%v, %v), want job", job, err)
+		}
+		if err := outboxRepo.MarkFailed(context.Background(), ownerA.ID, job.ID, job.LeaseToken, "telegram_500"); err != nil {
+			t.Fatalf("MarkFailed: %v", err)
+		}
+		if early, err := outboxRepo.Claim(context.Background(), ownerA.ID, 2*time.Minute); err != nil || early != nil {
+			t.Fatalf("Claim during slow-lane delay = (%v, %v), want (nil, nil)", early, err)
+		}
+		// Simulate the 6h resweep delay elapsing, with the owner role.
+		if _, err := admin.Exec(context.Background(), `UPDATE notification_outbox SET next_attempt_at = now() - interval '1 minute' WHERE id = $1`, job.ID); err != nil {
+			t.Fatalf("age slow-lane deadline: %v", err)
+		}
+		reswept, err := outboxRepo.Claim(context.Background(), ownerA.ID, 2*time.Minute)
+		if err != nil || reswept == nil || reswept.ID != job.ID {
+			t.Fatalf("Claim after slow-lane delay = (%v, %v), want same id %d", reswept, err, job.ID)
+		}
+		if reswept.Attempts != 0 {
+			t.Fatalf("reswept attempts = %d, want 0 (fresh fast-lane budget per sweep)", reswept.Attempts)
+		}
+		if err := outboxRepo.MarkSent(context.Background(), ownerA.ID, reswept.ID, reswept.LeaseToken); err != nil {
+			t.Fatalf("MarkSent reswept: %v", err)
+		}
+	})
+
 	t.Run("chunk ordering and cross-tenant claim isolation", func(t *testing.T) {
 		insertChunk(ownerA.ID, 93201, "bc-hard-a", 88103, 3, 0, "part zero")
 		insertChunk(ownerA.ID, 93201, "bc-hard-a", 88103, 3, 1, "part one")

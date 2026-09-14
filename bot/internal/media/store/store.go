@@ -574,6 +574,19 @@ func (e *httpError) Error() string { return fmt.Sprintf("%s: %d", ErrHTTP.Error(
 
 func (e *httpError) Unwrap() error { return ErrHTTP }
 
+// HTTPStatus reports the status carried by an ErrHTTP, for callers that must
+// decide beyond retryable/not-retryable -- the fetch loop, which catalogues a
+// definitively-gone file (404) differently from a transiently-unavailable one
+// (503). The second return is false for a bare ErrHTTP and for any other
+// error: no status, no decision.
+func HTTPStatus(err error) (int, bool) {
+	var httpErr *httpError
+	if errors.As(err, &httpErr) {
+		return httpErr.status, true
+	}
+	return 0, false
+}
+
 // retryable: only network glitches and the statuses that can clear on their
 // own are worth another attempt. A 404 or a 401 (file expired, revoked token)
 // would return the same thing forever; a 429 or a 408, on the contrary, is

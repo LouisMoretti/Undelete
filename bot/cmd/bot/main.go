@@ -50,6 +50,45 @@ const mediaInterval = 5 * time.Second
 // and a COUNT(*) per tenant every second would cost more than the useful work.
 const backlogInterval = 15 * time.Second
 
+// maxJobsPerTenantPerTick bounds how many alerts one outbox tick delivers for
+// a single tenant. Leftovers wait for the next one-second tick: the bound is
+// about fairness across tenants (one huge backlog must not starve the
+// others), not about throughput.
+const maxJobsPerTenantPerTick = 100
+
+// The background loops below depend on narrow interfaces, not on the concrete
+// repositories (same pattern as the consumer interfaces in app, outbox, fetch
+// and business): the orchestration -- what runs in which order, what a phase
+// failure skips, when the loops stop -- is unit-testable with in-memory fakes
+// instead of a real PostgreSQL.
+type tenantLister interface {
+	ListTenantsForRetention(context.Context) ([]users.TenantRetention, error)
+}
+
+type outboxDeliverer interface {
+	ProcessOne(context.Context, int64) (bool, error)
+}
+
+type mediaFetcher interface {
+	ProcessTenant(context.Context, int64) (int, error)
+}
+
+type backlogCounter interface {
+	CountBacklog(context.Context, []users.TenantRetention) (int64, error)
+}
+
+type messageRetention interface {
+	PurgeExpired(context.Context, []users.TenantRetention) (int64, error)
+}
+
+type outboxRetention interface {
+	PurgeExpired(context.Context, []users.TenantRetention) (int64, error)
+}
+
+type mediaRetention interface {
+	Run(context.Context, []users.TenantRetention) (purge.Stats, error)
+}
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
@@ -101,10 +140,11 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	// One per-tenant exclusion for the whole process, shared by the erasure
-	// (exclusive side) and the two background writers (shared side): the
+	// (exclusive side) and the three background writers (shared side): the
 	// media fetcher must not land a blob after the erasure swept the disk,
-	// and the outbox worker must not deliver an alert the erasure drained.
-	// It is also what serialises two concurrent erasures of one tenant.
+	// the outbox worker must not deliver an alert the erasure drained, and
+	// the daily media retention must not interleave with an erasure in
+	// flight. It is also what serialises two concurrent erasures of one tenant.
 	guard := tenantexcl.New()
 	fetcher := fetch.New(mediaRepo, client, downloader, cfg.TelegramBotToken, logger, guard)
 
@@ -116,6 +156,11 @@ func run(logger *slog.Logger) error {
 		Catalogue: mediaRepo,
 		DryRun:    cfg.MediaPurgeDryRun,
 		Logger:    logger,
+		// Shared side of the erasure exclusion: the daily retention must not
+		// interleave with a /delete_my_data in flight. EraseTenant takes no
+		// guard itself -- erasure.Confirm holds the exclusive side while
+		// calling it.
+		Guard: guard,
 	})
 	if err != nil {
 		return err
@@ -159,7 +204,7 @@ func run(logger *slog.Logger) error {
 	wg.Add(5)
 	go func() {
 		defer wg.Done()
-		runRetentionLoop(ctx, usersRepo, messagesRepo, outboxRepo, mediaPurger, logger)
+		runRetentionLoop(ctx, usersRepo, messagesRepo, outboxRepo, mediaPurger, logger, retentionInterval)
 	}()
 	go func() {
 		defer wg.Done()
@@ -187,7 +232,7 @@ func run(logger *slog.Logger) error {
 		}
 	}()
 
-	logger.Info("poller starting", slog.Any("allowed_updates", telegram.AllowedUpdates))
+	logger.Info("poller starting", slog.Any("allowed_updates", telegram.AllowedUpdates()))
 
 	err = poller.Run(ctx, handler.HandleUpdate)
 	// Signal-driven shutdown cancels ctx: we wait for retention and the outbox
@@ -203,7 +248,7 @@ func run(logger *slog.Logger) error {
 	return err
 }
 
-func runOutboxLoop(ctx context.Context, usersRepo *users.Repository, worker *outbox.Worker, logger *slog.Logger) {
+func runOutboxLoop(ctx context.Context, usersRepo tenantLister, worker outboxDeliverer, logger *slog.Logger) {
 	ticker := time.NewTicker(outboxInterval)
 	defer ticker.Stop()
 
@@ -213,7 +258,7 @@ func runOutboxLoop(ctx context.Context, usersRepo *users.Repository, worker *out
 			logger.Error("outbox: failed to list tenants", slog.String("error", err.Error()))
 		} else {
 			for _, tenant := range tenants {
-				for processed := 0; processed < 100; processed++ {
+				for processed := 0; processed < maxJobsPerTenantPerTick; processed++ {
 					didProcess, err := worker.ProcessOne(ctx, tenant.OwnerUserID)
 					if err != nil {
 						logger.Error("outbox: processing failed", slog.Int64("owner_user_id", tenant.OwnerUserID), slog.String("error", err.Error()))
@@ -242,7 +287,7 @@ func runOutboxLoop(ctx context.Context, usersRepo *users.Repository, worker *out
 // fail, and neither the capture of new messages nor the delivery of alerts may
 // wait on it. A media that is not stored yet simply does not travel with its
 // alert -- the text goes out regardless.
-func runMediaLoop(ctx context.Context, usersRepo *users.Repository, fetcher *fetch.Fetcher, logger *slog.Logger) {
+func runMediaLoop(ctx context.Context, usersRepo tenantLister, fetcher mediaFetcher, logger *slog.Logger) {
 	ticker := time.NewTicker(mediaInterval)
 	defer ticker.Stop()
 
@@ -277,7 +322,7 @@ func runMediaLoop(ctx context.Context, usersRepo *users.Repository, fetcher *fet
 // runBacklogLoop refreshes the undelete_outbox_backlog gauge. A separate
 // loop from the outbox: a slow or failing COUNT(*) must not slow down alert
 // delivery, and a stale gauge is less serious than a late alert.
-func runBacklogLoop(ctx context.Context, usersRepo *users.Repository, outboxRepo *outbox.Repository, logger *slog.Logger) {
+func runBacklogLoop(ctx context.Context, usersRepo tenantLister, outboxRepo backlogCounter, logger *slog.Logger) {
 	ticker := time.NewTicker(backlogInterval)
 	defer ticker.Stop()
 
@@ -314,8 +359,12 @@ func runBacklogLoop(ctx context.Context, usersRepo *users.Repository, outboxRepo
 // behind, which is the slowest and the only I/O-bound phase. A failure there
 // must not cost the text retention, which is why it does not `continue` before
 // the summary log.
-func runRetentionLoop(ctx context.Context, usersRepo *users.Repository, messagesRepo *messages.Repository, outboxRepo *outbox.Repository, mediaPurger *purge.Purger, logger *slog.Logger) {
-	ticker := time.NewTicker(retentionInterval)
+// runRetentionLoop runs runRetentionOnce on every tick of interval
+// (retentionInterval in production). The interval is a parameter rather than
+// the constant so the loop mechanics -- tick, cycle, stop on shutdown -- are
+// unit-testable without waiting a day.
+func runRetentionLoop(ctx context.Context, usersRepo tenantLister, messagesRepo messageRetention, outboxRepo outboxRetention, mediaPurger mediaRetention, logger *slog.Logger, interval time.Duration) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -323,31 +372,46 @@ func runRetentionLoop(ctx context.Context, usersRepo *users.Repository, messages
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			tenants, err := usersRepo.ListTenantsForRetention(ctx)
-			if err != nil {
-				logger.Error("retention purge: failed to list tenants", slog.String("error", err.Error()))
-				continue
-			}
-			purged, err := messagesRepo.PurgeExpired(ctx, tenants)
-			if err != nil {
-				logger.Error("retention purge: failed", slog.String("error", err.Error()), slog.Int64("purged_before_error", purged))
-				continue
-			}
-			purgedOutbox, err := outboxRepo.PurgeExpired(ctx, tenants)
-			if err != nil {
-				logger.Error("outbox retention purge: failed", slog.String("error", err.Error()), slog.Int64("purged_before_error", purgedOutbox))
-				continue
-			}
-			mediaStats, err := mediaPurger.Run(ctx, tenants)
-			if err != nil && ctx.Err() == nil {
-				logger.Error("media retention purge: failed", slog.String("error", err.Error()))
-			}
-			logger.Info("retention purge complete",
-				append([]any{
-					slog.Int64("purged", purged),
-					slog.Int64("purged_outbox", purgedOutbox),
-					slog.Int("tenants", len(tenants)),
-				}, mediaStats.LogAttrs()...)...)
+			runRetentionOnce(ctx, usersRepo, messagesRepo, outboxRepo, mediaPurger, logger)
 		}
 	}
+}
+
+// runRetentionOnce performs a single retention cycle: text messages, then the
+// outbox payloads (which hold user content and would otherwise escape
+// retention_days), then the media tree -- last because it is the slowest and
+// the only I/O-bound phase. A failing phase skips the later ones, but once
+// the media phase is reached its failure no longer costs the cycle: the text
+// retention is what the summary reports.
+//
+// Split out of runRetentionLoop so the phase ordering is unit-testable: the
+// loop itself only owns the ticker, and a slow or failing purge must never
+// delay the processing of Telegram updates (long-polling responsiveness
+// constraint).
+func runRetentionOnce(ctx context.Context, usersRepo tenantLister, messagesRepo messageRetention, outboxRepo outboxRetention, mediaPurger mediaRetention, logger *slog.Logger) {
+	tenants, err := usersRepo.ListTenantsForRetention(ctx)
+	if err != nil {
+		logger.Error("retention purge: failed to list tenants", slog.String("error", err.Error()))
+		return
+	}
+	purged, err := messagesRepo.PurgeExpired(ctx, tenants)
+	if err != nil {
+		logger.Error("retention purge: failed", slog.String("error", err.Error()), slog.Int64("purged_before_error", purged))
+		return
+	}
+	purgedOutbox, err := outboxRepo.PurgeExpired(ctx, tenants)
+	if err != nil {
+		logger.Error("outbox retention purge: failed", slog.String("error", err.Error()), slog.Int64("purged_before_error", purgedOutbox))
+		return
+	}
+	mediaStats, err := mediaPurger.Run(ctx, tenants)
+	if err != nil && ctx.Err() == nil {
+		logger.Error("media retention purge: failed", slog.String("error", err.Error()))
+	}
+	logger.Info("retention purge complete",
+		append([]any{
+			slog.Int64("purged", purged),
+			slog.Int64("purged_outbox", purgedOutbox),
+			slog.Int("tenants", len(tenants)),
+		}, mediaStats.LogAttrs()...)...)
 }

@@ -16,7 +16,7 @@ import (
 	"sync"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/LouisMoretti/Undelete/bot/internal/telegram"
 	"github.com/LouisMoretti/Undelete/bot/internal/users"
@@ -41,6 +41,29 @@ type Connection struct {
 // guardrail (OWNER_TELEGRAM_USER_ID).
 var ErrOwnerMismatch = errors.New("business: telegram_user_id does not match OWNER_TELEGRAM_USER_ID")
 
+// pool is the minimal database surface the service needs. The resolution
+// table lives outside RLS and is queried directly, but an interface -- not
+// *pgxpool.Pool -- keeps the resolution chain unit-testable with an
+// in-memory fake instead of a real PostgreSQL (same pattern as the consumer
+// interfaces in app, outbox and fetch).
+type pool interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+// userStore upserts owners. Narrow interface for the same testability reason:
+// resolving a connection must not require the users table.
+type userStore interface {
+	UpsertByTelegramID(context.Context, int64) (*users.User, error)
+}
+
+// connectionAPI is the Telegram surface the service needs: resolving a
+// connection the database never saw, and welcoming a new one.
+type connectionAPI interface {
+	GetBusinessConnection(context.Context, string) (*telegram.BusinessConnection, error)
+	SendMessage(context.Context, telegram.SendMessageRequest) error
+}
+
 // Service resolves Business connections through a three-level chain:
 // in-memory cache -> database -> Telegram API (getBusinessConnection).
 //
@@ -53,9 +76,9 @@ var ErrOwnerMismatch = errors.New("business: telegram_user_id does not match OWN
 // call, the bot would silently ignore messages that are nonetheless covered
 // by a very real Business connection.
 type Service struct {
-	pool   *pgxpool.Pool
-	client *telegram.Client
-	users  *users.Repository
+	pool   pool
+	client connectionAPI
+	users  userStore
 	logger *slog.Logger
 
 	ownerFilter int64 // OWNER_TELEGRAM_USER_ID; 0 = no restriction
@@ -64,7 +87,7 @@ type Service struct {
 	cache map[string]Connection
 }
 
-func NewService(pool *pgxpool.Pool, client *telegram.Client, usersRepo *users.Repository, ownerFilter int64, logger *slog.Logger) *Service {
+func NewService(pool pool, client connectionAPI, usersRepo userStore, ownerFilter int64, logger *slog.Logger) *Service {
 	return &Service{
 		pool:        pool,
 		client:      client,

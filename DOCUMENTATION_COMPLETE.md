@@ -1,5 +1,12 @@
 # Undelete - Complete Documentation
 
+> **HISTORICAL SNAPSHOT -- DO NOT USE AS A REFERENCE.** This document
+> describes the project as of an early phase (single-table schema,
+> no media/erasure/privacy packages) and was never updated since. It is kept
+> for history only. Current references: `README.md` (product and operations),
+> `AGENTS.md` (agent instructions and architecture notes), `docs/runbook.md`
+> (deployment procedure) and `docs/backup-restore.md` (backup and restore).
+
 > **Undelete** is a Telegram anti-deletion bot using the **Telegram Business** API to automatically save messages from private conversations and notify the owner in case of deletion.
 
 ---

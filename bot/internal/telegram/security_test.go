@@ -18,8 +18,15 @@ func TestAllowedUpdatesIsTheExplicitBusinessSet(t *testing.T) {
 		"edited_business_message",
 		"deleted_business_messages",
 	}
-	if !reflect.DeepEqual(AllowedUpdates, want) {
-		t.Fatalf("AllowedUpdates = %q, want %q", AllowedUpdates, want)
+	if !reflect.DeepEqual(AllowedUpdates(), want) {
+		t.Fatalf("AllowedUpdates() = %q, want %q", AllowedUpdates(), want)
+	}
+	// The accessor must hand out a copy: mutating the returned slice must not
+	// move the list the poller actually sends.
+	first := AllowedUpdates()
+	first[0] = "messages"
+	if !reflect.DeepEqual(AllowedUpdates(), want) {
+		t.Fatalf("AllowedUpdates() is mutable from the outside: %q", AllowedUpdates())
 	}
 }
 

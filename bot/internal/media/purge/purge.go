@@ -68,6 +68,7 @@ import (
 
 	"github.com/LouisMoretti/Undelete/bot/internal/media"
 	"github.com/LouisMoretti/Undelete/bot/internal/media/store"
+	"github.com/LouisMoretti/Undelete/bot/internal/tenantexcl"
 	"github.com/LouisMoretti/Undelete/bot/internal/users"
 )
 
@@ -166,6 +167,14 @@ type Config struct {
 	Logger *slog.Logger
 	// Now is injectable so tests control ages deterministically.
 	Now func() time.Time
+	// Guard is the per-tenant exclusion shared with the erasure (same
+	// instance, wired in cmd/bot): the daily retention must not interleave
+	// with a /delete_my_data in flight. Optional, nil disables the
+	// coordination (unit tests); production always passes the shared guard.
+	// EraseTenant deliberately does NOT take it: erasure.Confirm holds the
+	// exclusive side while calling it, and re-acquiring the shared side from
+	// the same goroutine would self-deadlock. See Run and EraseTenant.
+	Guard *tenantexcl.Guard
 }
 
 // Stats counts what one run did, for the log line at the end of the retention
@@ -279,6 +288,12 @@ func New(cfg Config) (*Purger, error) {
 // rows -- the purge would look healthy forever while purging nothing
 // (constraint #4, same trap as messages.PurgeExpired).
 //
+// Each tenant's work runs under the shared side of the tenant exclusion when
+// a Guard is configured: the daily retention must not unlink or requeue while
+// a /delete_my_data holds the exclusive side. The exclusion serialises with
+// the erasure; every phase below is additionally idempotent, so the property
+// holds by coordination AND by construction.
+//
 // A tenant that fails does not stop the others: a filesystem error on one
 // storage subtree must not leave every other tenant's retention unapplied. The
 // errors are joined and returned once the loop is done.
@@ -304,7 +319,7 @@ func (p *Purger) Run(ctx context.Context, tenants []users.TenantRetention) (Stat
 		if ctx.Err() != nil {
 			break
 		}
-		stats, err := p.runTenant(ctx, tenant)
+		stats, err := p.runTenantGuarded(ctx, tenant)
 		total.add(stats)
 		if err != nil && ctx.Err() == nil {
 			p.cfg.Logger.Error("media purge: tenant failed",
@@ -314,6 +329,23 @@ func (p *Purger) Run(ctx context.Context, tenants []users.TenantRetention) (Stat
 		}
 	}
 	return total, errors.Join(failures...)
+}
+
+// runTenantGuarded serialises one tenant's retention with a concurrent
+// erasure: the shared side waits while /delete_my_data holds the exclusive
+// one. A cancelled context aborts the wait instead of running unguarded --
+// running unguarded "because shutdown was requested" would defeat the
+// exclusion exactly when an erasure might be racing it.
+func (p *Purger) runTenantGuarded(ctx context.Context, tenant users.TenantRetention) (Stats, error) {
+	if p.cfg.Guard == nil {
+		return p.runTenant(ctx, tenant)
+	}
+	release, err := p.cfg.Guard.Shared(ctx, tenant.OwnerUserID)
+	if err != nil {
+		return Stats{}, fmt.Errorf("media purge exclusion: %w", err)
+	}
+	defer release()
+	return p.runTenant(ctx, tenant)
 }
 
 // runTenant runs the four phases in the only order that is safe to interrupt:
@@ -342,6 +374,11 @@ func (p *Purger) runTenant(ctx context.Context, tenant users.TenantRetention) (S
 // EraseTenant deletes EVERY attachment of one tenant -- blobs and rows -- and
 // returns the two counts. It serves /delete_my_data (internal/erasure) and
 // nothing else; retention never calls it.
+//
+// Exclusion contract: the caller MUST hold the tenant's exclusive exclusion
+// (erasure.Confirm does). This function takes no guard itself: re-acquiring
+// the shared side while holding the exclusive one would self-deadlock. Run,
+// the retention path, takes the shared side per tenant instead.
 //
 // Same ordering as the retention path, for the same reason: the files go first,
 // located from the rows that name them, and only then the rows. A crash in

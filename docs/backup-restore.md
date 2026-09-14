@@ -322,7 +322,8 @@ In a single call, `scripts/restore-test.sh`:
 4. runs **the real `scripts/backup.sh`** — it is indeed the production
    script's output that is put to the test — with `BACKUP_DIR` in a
    temporary directory, never in the repository's `./backups`;
-5. verifies the archive's integrity with `gzip -t`;
+5. verifies the archive's integrity with `gzip -t` and checks the `.sha256`
+   sidecar `backup.sh` writes next to every dump;
 6. starts a second, distinct **target** container with a blank database, and
    verifies it is actually empty before restoration — if it is not,
    the script stops there, without overwriting anything;
@@ -332,11 +333,11 @@ In a single call, `scripts/restore-test.sh`:
    `schema_migrations`), `schema_migrations` versions identical to those
    applied, per-table row counts equal to the source, content of the canary
    rows (message, chat label, outbox payload), and persistence of
-   `FORCE ROW LEVEL SECURITY` on the three protected tables;
+   `FORCE ROW LEVEL SECURITY` on the five protected tables;
 9. removes, via a `trap`, **only its two containers** and its
    temporary directory.
 
-Output: a `[OK]` / `[ECHEC]` verdict per check, the measured RTO, and a
+Output: a `[OK]` / `[FAIL]` verdict per check, the measured RTO, and a
 non-zero exit code if any single check fails.
 
 The script refuses to start if `MIGRATION_DATABASE_URL` or `DATABASE_URL` is
@@ -393,9 +394,8 @@ In one call it:
 Output: an `[OK]` / `[FAIL]` verdict per check, the measured media RTO, and a
 non-zero exit code if any single check fails.
 
-Both recipes need Docker. Neither runs in CI today (`.github/workflows/ci.yml`
-covers lint, unit tests and the Postgres integration suite): they are run
-locally, on the cadence below.
+Both recipes need Docker. They run in CI on the weekly schedule and on manual
+dispatch (`.github/workflows/ci.yml`); locally, run them on the cadence below.
 
 ## Recipe cadence
 
@@ -403,13 +403,9 @@ locally, on the cadence below.
 silent regression (added migration, PostgreSQL image change, truncated
 archive) to take hold unseen.
 
-Suggested `crontab -e` entry — Sunday 04:00, journal kept so the measured RTO
-can be re-read:
-
-```cron
-0 4 * * 0 cd /path/to/Undelete && env -u MIGRATION_DATABASE_URL -u DATABASE_URL make test-restore >> /var/log/undelete-restore-test.log 2>&1
-30 4 * * 0 cd /path/to/Undelete && env -u MIGRATION_DATABASE_URL -u DATABASE_URL make test-restore-media >> /var/log/undelete-restore-test.log 2>&1
-```
+The canonical schedule lives in `docs/runbook.md` §5.2 (it also covers the
+integration suite and the media recipe): follow it rather than inventing a
+second cadence here.
 
 The two recipes are scheduled half an hour apart rather than chained: each is
 self-contained, and a failure of the first must not cancel the second — losing

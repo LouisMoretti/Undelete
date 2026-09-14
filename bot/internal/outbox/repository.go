@@ -16,6 +16,15 @@ import (
 
 var ErrLeaseLost = errors.New("outbox lease lost")
 
+// failedResweepDelay parks a failed job in the slow lane: after the fast-lane
+// budget is exhausted (or a definitive 4xx is recorded), the alert is NOT
+// abandoned -- Claim reclaims it once this delay has elapsed, with a fresh
+// attempt budget. A multi-hour Telegram outage therefore delays the alert
+// instead of losing it, and a poison row (owner blocked the bot) costs one
+// send attempt per sweep while staying observable via outbox_failed_total.
+// Rows still die by retention (PurgeExpired on created_at), never by despair.
+const failedResweepDelay = 6 * time.Hour
+
 // Repository accesses notification_outbox exclusively via InTenant/RLS.
 type Repository struct {
 	db *storage.DB
@@ -66,6 +75,19 @@ func insertTx(ctx context.Context, tx pgx.Tx, ownerUserID, ownerTelegramUserID i
 // deadline, lease expiry) are evaluated on the PostgreSQL server clock: no Go
 // `now` enters the decision, so a drift between the bot clock and the
 // database clock can neither hide a job nor make it claimable too early.
+//
+// 'failed' rows are eligible too, once their slow-lane deadline has elapsed:
+// this is the resweep that makes MarkFailed a deferral rather than a loss.
+// A reclaimed failure re-enters with attempts reset to zero (a fresh fast-lane
+// budget per sweep), so a job that fails every sweep still only costs one
+// fast lane per failedResweepDelay instead of spinning.
+//
+// A prior chunk in 'failed' does NOT block the later chunks of the same
+// message (only pending/processing priors do): no head-of-line blocking --
+// one poison chunk must not retain the whole message. The accepted
+// counterpart is disorder: a reswept chunk can land after the chunks that
+// followed it. Each chunk is self-contained, so redelivery order is a
+// presentation detail, not a correctness one.
 func (r *Repository) Claim(ctx context.Context, ownerUserID int64, lease time.Duration) (*Job, error) {
 	leaseToken, err := newLeaseToken()
 	if err != nil {
@@ -77,7 +99,7 @@ func (r *Repository) Claim(ctx context.Context, ownerUserID int64, lease time.Du
 			WITH candidate AS (
 				SELECT current_job.id
 				FROM notification_outbox current_job
-				WHERE current_job.status IN ('pending', 'processing')
+				WHERE current_job.status IN ('pending', 'processing', 'failed')
 				  AND current_job.next_attempt_at <= clock_timestamp()
 				  AND (current_job.locked_until IS NULL OR current_job.locked_until <= clock_timestamp())
 				  AND NOT EXISTS (
@@ -96,6 +118,7 @@ func (r *Repository) Claim(ctx context.Context, ownerUserID int64, lease time.Du
 			)
 			UPDATE notification_outbox o
 			SET status = 'processing',
+			    attempts = CASE WHEN o.status = 'failed' THEN 0 ELSE o.attempts END,
 			    locked_until = clock_timestamp() + make_interval(secs => $1),
 			    lease_token = $2, updated_at = clock_timestamp()
 			FROM candidate
@@ -159,24 +182,35 @@ func (r *Repository) MarkRetry(ctx context.Context, ownerUserID, id int64, lease
 	})
 }
 
+// MarkFailed moves the job to the slow lane instead of abandoning it:
+// next_attempt_at is pushed failedResweepDelay into the future, after which
+// Claim reclaims the row with a fresh attempt budget. A job that fails every
+// sweep therefore costs one fast lane per delay, forever observable and
+// forever recoverable, until retention (PurgeExpired) takes it.
 func (r *Repository) MarkFailed(ctx context.Context, ownerUserID, id int64, leaseToken, errorClass string) error {
 	return r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			UPDATE notification_outbox
 			SET status = 'failed', attempts = attempts + 1,
+			    next_attempt_at = clock_timestamp() + make_interval(secs => $4),
 			    locked_until = NULL, lease_token = NULL,
 			    last_error_class = $3, updated_at = clock_timestamp()
 			WHERE id = $1 AND status = 'processing' AND lease_token = $2
-		`, id, leaseToken, errorClass)
+		`, id, leaseToken, errorClass, failedResweepDelay.Seconds())
 		return verifyLeaseUpdate(tag.RowsAffected(), id, err)
 	})
 }
 
 // CountBacklog sums, tenant by tenant, the alerts still waiting to be
-// delivered (status pending or processing). It is the source of the
+// delivered (status pending, processing or failed). It is the source of the
 // undelete_outbox_backlog gauge: an aggregated counter with no breakdown by
 // tenant, chat or message -- exposing the backlog PER tenant would publish
 // each owner's activity on /metrics.
+//
+// `failed` is included on purpose: a slow-lane row is undelivered work, even
+// while parked until its resweep deadline. Excluding it would drop the gauge
+// to zero precisely when every alert is stuck -- the falsely reassuring
+// metric this gauge exists to avoid.
 //
 // The InTenant loop is not a stylistic detail: notification_outbox has FORCE
 // ROW LEVEL SECURITY and the application role does not have BYPASSRLS. A
@@ -192,7 +226,7 @@ func (r *Repository) CountBacklog(ctx context.Context, tenants []users.TenantRet
 			var count int64
 			if err := tx.QueryRow(ctx, `
 				SELECT count(*) FROM notification_outbox
-				WHERE owner_user_id = $1 AND status IN ('pending', 'processing')
+				WHERE owner_user_id = $1 AND status IN ('pending', 'processing', 'failed')
 			`, tenant.OwnerUserID).Scan(&count); err != nil {
 				return fmt.Errorf("outbox backlog count for tenant %d: %w", tenant.OwnerUserID, err)
 			}

@@ -4,6 +4,7 @@ package telegram_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -37,7 +38,7 @@ func TestLastSuccessfulPollAdvancesAfterSuccessfulGetUpdates(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := telegram.NewClient("test-token", time.Second, telegram.WithBaseURL(server.URL+"/bot"))
+	client := telegram.NewClient("test-token", 61*time.Second, telegram.WithBaseURL(server.URL+"/bot"))
 	poller := telegram.NewPoller(client, newDiscardLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -58,5 +59,22 @@ func TestLastSuccessfulPollAdvancesAfterSuccessfulGetUpdates(t *testing.T) {
 	last := poller.LastSuccessfulPoll()
 	if last.Before(before) || last.After(time.Now()) {
 		t.Fatalf("LastSuccessfulPoll() = %v, want a time in [%v, now]", last, before)
+	}
+}
+
+// TestRunRefusesShortHTTPTimeout pins the long-poll invariant in code, not in
+// a comment: a client whose timeout cannot outlive the 50s server wait would
+// cut every poll and spin the bot on errors. Run fails loudly instead --
+// including with the nil logger NewPoller accepts (no panic on the error
+// path, which would defeat the purpose of failing loudly).
+func TestRunRefusesShortHTTPTimeout(t *testing.T) {
+	client := telegram.NewClient("test-token", time.Second)
+	poller := telegram.NewPoller(client, nil)
+
+	err := poller.Run(context.Background(), func(context.Context, telegram.Update) error {
+		return nil
+	})
+	if !errors.Is(err, telegram.ErrPollTimeoutTooShort) {
+		t.Fatalf("Run() with a 1s-timeout client = %v, want ErrPollTimeoutTooShort", err)
 	}
 }

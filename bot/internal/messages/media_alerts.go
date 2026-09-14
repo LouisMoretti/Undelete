@@ -29,7 +29,11 @@ type mediaAlertScope struct {
 //
 // A message whose media is not on disk -- never downloaded, or already purged
 // by retention -- simply produces no entry: its text alert already states the
-// message type, and inventing an entry would only guarantee a fallback.
+// message type, and inventing an entry would only guarantee a fallback. The
+// consequence is a known delivery window, not a bug in this function: a
+// message deleted before its download completes (the fetch loop runs every
+// few seconds) is notified as text only, and nothing re-enqueues the media
+// once it lands -- by design, a media that fails must never block the alert.
 func enqueueMediaAlerts(ctx context.Context, tx pgx.Tx, scope mediaAlertScope, found []DeletedRecord, chunkCount map[int64]int) error {
 	if len(found) == 0 {
 		return nil

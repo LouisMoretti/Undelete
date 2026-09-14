@@ -4,6 +4,12 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Weekly drift check: dependency-only breakage (postgres image, actions,
+  # Go toolchain) must not wait for the next PR to surface. The restore
+  # recipes run here too -- they are too slow for every PR.
+  schedule:
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
 
 # Read-only token: CI publishes nothing, comments on nothing.
 permissions:
@@ -45,12 +51,21 @@ jobs:
         working-directory: bot
         run: go vet ./...
 
+      # go.mod/go.sum must be committed tidy: a dirty diff means the module
+      # files were changed without committing the result.
+      - name: go mod tidy check
+        working-directory: bot
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
       # The suites gated by env (integration, outbox) skip themselves here for
       # lack of DSNs: they run in the integration job.
       # Coverage gate: the unit run must keep the total statement coverage
-      # above the floor. DB-bound packages (business, messages, storage,
-      # users) score low here by design; they are covered by the integration
-      # job instead, so the floor only guards the total against regressions
+      # above the floor. DB-bound packages (business is unit-tested via
+      # fakes, messages/storage/users/media-repository stay DB-bound by
+      # design) score low here; they are covered by the integration job
+      # instead, so the floor only guards the total against regressions
       # that delete tests.
       - name: go test with coverage
         working-directory: bot
@@ -58,9 +73,9 @@ jobs:
           go test -coverprofile=coverage.out -covermode=atomic ./...
           go tool cover -func=coverage.out | tee coverage.txt
           total=$(awk '/^total:/ {gsub(/%/, "", $3); print $3}' coverage.txt)
-          echo "total coverage: ${total}% (floor 60%)"
-          echo "### Coverage: ${total}% (floor 60%)" >> "$GITHUB_STEP_SUMMARY"
-          awk '/^total:/ {gsub(/%/, "", $3); if ($3 + 0 < 60) {print "coverage " $3 "% below floor 60%"; exit 1}}' coverage.txt
+          echo "total coverage: ${total}% (floor 70%)"
+          echo "### Coverage: ${total}% (floor 70%)" >> "$GITHUB_STEP_SUMMARY"
+          awk '/^total:/ {gsub(/%/, "", $3); if ($3 + 0 < 70) {print "coverage " $3 "% below floor 70%"; exit 1}}' coverage.txt
 
   integration:
     name: PostgreSQL 16 integration
@@ -103,3 +118,38 @@ jobs:
       # this one can. Disposable container like the integration job.
       - name: make test-coverage
         run: make test-coverage
+
+  docker-build:
+    name: docker build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # The production image is otherwise never built before deploy: a
+      # broken Dockerfile (or a base image that no longer resolves) must
+      # fail here, not on the deployment machine.
+      - name: docker build bot
+        run: docker build ./bot
+
+  restore:
+    name: backup restore recipes
+    # Too slow for every PR (two disposable databases plus two media
+    # restores); the weekly schedule and manual runs cover them. The scripts
+    # refuse foreign DSNs and never touch existing volumes, so they are safe
+    # to run unattended.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: make test-restore
+        run: make test-restore
+
+      - name: make test-restore-media
+        run: make test-restore-media

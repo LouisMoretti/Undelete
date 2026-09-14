@@ -81,6 +81,13 @@ func insertTx(ctx context.Context, tx pgx.Tx, ownerUserID, ownerTelegramUserID i
 // A reclaimed failure re-enters with attempts reset to zero (a fresh fast-lane
 // budget per sweep), so a job that fails every sweep still only costs one
 // fast lane per failedResweepDelay instead of spinning.
+//
+// A prior chunk in 'failed' does NOT block the later chunks of the same
+// message (only pending/processing priors do): no head-of-line blocking --
+// one poison chunk must not retain the whole message. The accepted
+// counterpart is disorder: a reswept chunk can land after the chunks that
+// followed it. Each chunk is self-contained, so redelivery order is a
+// presentation detail, not a correctness one.
 func (r *Repository) Claim(ctx context.Context, ownerUserID int64, lease time.Duration) (*Job, error) {
 	leaseToken, err := newLeaseToken()
 	if err != nil {
@@ -195,10 +202,15 @@ func (r *Repository) MarkFailed(ctx context.Context, ownerUserID, id int64, leas
 }
 
 // CountBacklog sums, tenant by tenant, the alerts still waiting to be
-// delivered (status pending or processing). It is the source of the
+// delivered (status pending, processing or failed). It is the source of the
 // undelete_outbox_backlog gauge: an aggregated counter with no breakdown by
 // tenant, chat or message -- exposing the backlog PER tenant would publish
 // each owner's activity on /metrics.
+//
+// `failed` is included on purpose: a slow-lane row is undelivered work, even
+// while parked until its resweep deadline. Excluding it would drop the gauge
+// to zero precisely when every alert is stuck -- the falsely reassuring
+// metric this gauge exists to avoid.
 //
 // The InTenant loop is not a stylistic detail: notification_outbox has FORCE
 // ROW LEVEL SECURITY and the application role does not have BYPASSRLS. A
@@ -214,7 +226,7 @@ func (r *Repository) CountBacklog(ctx context.Context, tenants []users.TenantRet
 			var count int64
 			if err := tx.QueryRow(ctx, `
 				SELECT count(*) FROM notification_outbox
-				WHERE owner_user_id = $1 AND status IN ('pending', 'processing')
+				WHERE owner_user_id = $1 AND status IN ('pending', 'processing', 'failed')
 			`, tenant.OwnerUserID).Scan(&count); err != nil {
 				return fmt.Errorf("outbox backlog count for tenant %d: %w", tenant.OwnerUserID, err)
 			}

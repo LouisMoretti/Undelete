@@ -24,10 +24,10 @@ const (
 	maxBackoff   = 15 * time.Minute
 	// maxDeliveryAttempts bounds the FAST lane: how many reschedules one job
 	// gets before it moves to the slow lane (MarkFailed + a long-dated
-	// next_attempt_at, reclaimed later by Claim). Attempts 0..9 wait
-	// 1s..512s (2^9 = 512s < maxBackoff): roughly two hours of sustained
-	// Telegram outage. Beyond that the 6h resweep takes over instead of
-	// giving up -- a short outage must not cost an alert, and a long one
+	// next_attempt_at, reclaimed later by Claim). Attempts 0..8 wait
+	// 1s..256s (≈8.5 min of backoff cumulated): the fast lane absorbs a
+	// brief Telegram outage. Beyond that the 6h resweep takes over instead
+	// of giving up -- a short outage must not cost an alert, and a long one
 	// must not spin the worker either.
 	maxDeliveryAttempts = 10
 	// 2^10 s = 1024s already exceeds maxBackoff: beyond that, the exponentiation

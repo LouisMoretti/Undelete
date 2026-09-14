@@ -197,7 +197,11 @@ func (c *Client) SendMessage(ctx context.Context, req SendMessageRequest) error 
 		wait := backoff
 		var apiErr *APIError
 		if errors.As(lastErr, &apiErr) {
-			if apiErr.Code < http.StatusInternalServerError && !apiErr.IsRateLimited() {
+			// A 429 without retry_after is still a throttle signal, not a
+			// definitive refusal: it retries with the client-side backoff,
+			// exactly like the outbox worker treats it. Any other 4xx
+			// surfaces immediately.
+			if apiErr.Code < http.StatusInternalServerError && !apiErr.IsRateLimited() && apiErr.Code != http.StatusTooManyRequests {
 				return lastErr
 			}
 			wait = sendMessageWait(apiErr, backoff)

@@ -208,14 +208,14 @@ done
 
 # --- 5b. Freshness of the last database dump ---------------------------------
 # A backup that has silently stopped running is exactly what this check must
-# catch: the daily loop takes one dump per 24h, so no archive younger than 49
+# catch: the daily loop takes one dump per 24h, so no archive younger than 48
 # hours means the backups are dead (or never ran -- a fresh install with no
 # dump yet is a SKIP, not a FAIL).
 latest_dump="$(find "${repo_root}/backups" -maxdepth 1 -name 'undelete-*.sql.gz' -type f -mtime -2 2>/dev/null | head -n 1)"
 if [ -n "$latest_dump" ]; then
     ok "recent database dump present: $(basename "$latest_dump")"
 elif find "${repo_root}/backups" -maxdepth 1 -name 'undelete-*.sql.gz' -type f 2>/dev/null | grep -q .; then
-    fail "no database dump younger than 49h in ./backups: the daily backup loop is not producing -- check \`docker compose logs backup\` for 'backup: FATAL'"
+    fail "no database dump younger than 48h in ./backups: the daily backup loop is not producing -- check \`docker compose logs backup\` for 'backup: FATAL'"
 else
     skip "no database dump in ./backups yet (first deploy?)"
 fi

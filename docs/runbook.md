@@ -56,7 +56,7 @@ reported:
 | distinct DSNs | `DATABASE_URL ≠ MIGRATION_DATABASE_URL`, same rule as `config.Load()` |
 | disk space | threshold `PREFLIGHT_MIN_DISK_GB` (default 2 GB) on the repository FS |
 | `./backups` and `./media` | present; `./media` writable by uid 10001 (the bot's user -- first setup needs `chown 10001:10001 media`) |
-| dump freshness | an `undelete-*.sql.gz` younger than 49h in `./backups` (the daily loop is dead otherwise; no dump at all is a `[SKIP]`, i.e. first deploy) |
+| dump freshness | an `undelete-*.sql.gz` younger than 48h in `./backups` (the daily loop is dead otherwise; no dump at all is a `[SKIP]`, i.e. first deploy) |
 | PostgreSQL roles | owner role reachable; `undelete_app` exists, `NOSUPERUSER` and `NOBYPASSRLS` |
 | Telegram token | `getMe` on api.telegram.org; **the token is never displayed**, any API output is masked |
 
@@ -190,7 +190,7 @@ A dead loop prints nothing at all -- which is why the optional dead man's
 switch exists: set `BACKUP_PING_URL` in `.env` (e.g. a healthchecks.io check)
 and it is pinged after every fully successful pass. A missed ping means the
 backups are NOT happening, even if nobody reads the logs. Preflight's dump
-freshness check (`undelete-*.sql.gz` younger than 49h) is the second net for
+freshness check (`undelete-*.sql.gz` younger than 48h) is the second net for
 the same failure: run it daily (see the cron in §5.2).
 
 Note the dump name: it is the rollback point of §3.3.

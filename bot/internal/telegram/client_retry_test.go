@@ -125,6 +125,31 @@ func TestSendMessageWaitCapsAbusiveRetryAfter(t *testing.T) {
 	}
 }
 
+// TestSendMessageBare429RetriesWithBackoff pins the throttle-not-refusal
+// rule: a 429 WITHOUT retry_after is still a throttle signal, so it consumes
+// the attempt budget with the client-side backoff (1s + 2s) instead of
+// surfacing after one call -- the same treatment the outbox worker applies.
+func TestSendMessageBare429RetriesWithBackoff(t *testing.T) {
+	client, calls := testServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		errEnvelope(w, 429, "too many requests", 0)
+	})
+	start := time.Now()
+	err := client.SendMessage(context.Background(), SendMessageRequest{ChatID: 42, Text: "hi"})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected an error after 3 attempts")
+	}
+	if !strings.Contains(err.Error(), "after 3 attempts") {
+		t.Fatalf("error must name the attempt budget, got %v", err)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("calls = %d, want 3 (bare 429 must retry)", calls.Load())
+	}
+	if elapsed < 2*time.Second {
+		t.Fatalf("expected ~3s of backoff, finished in %v", elapsed)
+	}
+}
+
 // TestSendMessageCancelledDuringBackoff pins shutdown responsiveness: a
 // cancelled context during the retry wait aborts immediately with ctx.Err.
 func TestSendMessageCancelledDuringBackoff(t *testing.T) {

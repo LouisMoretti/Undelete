@@ -354,7 +354,7 @@ func TestPostgresCountBacklogAggregatesAllTenantsDespiteRLS(t *testing.T) {
 	insert(ownerA, 900015, "pending", 1)
 	insert(ownerA, 900015, "processing", 2)
 	insert(ownerA, 900015, "sent", 3)   // delivered: outside backlog
-	insert(ownerA, 900015, "failed", 4) // abandoned: outside backlog
+	insert(ownerA, 900015, "failed", 4) // slow lane: inside backlog (undelivered, parked until resweep)
 	insert(ownerB, 900016, "pending", 5)
 
 	repo := outbox.NewRepository(db)
@@ -363,8 +363,8 @@ func TestPostgresCountBacklogAggregatesAllTenantsDespiteRLS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if backlog != 3 {
-		t.Fatalf("CountBacklog = %d, expected 3 (2 for A, 1 for B)", backlog)
+	if backlog != 4 {
+		t.Fatalf("CountBacklog = %d, expected 4 (3 for A incl. failed, 1 for B)", backlog)
 	}
 
 	// Only one tenant requested: the gauge only aggregates what it is given.
@@ -374,7 +374,7 @@ func TestPostgresCountBacklogAggregatesAllTenantsDespiteRLS(t *testing.T) {
 
 	var naive int64
 	if err := db.Pool.QueryRow(ctx, `
-		SELECT count(*) FROM notification_outbox WHERE status IN ('pending', 'processing')
+		SELECT count(*) FROM notification_outbox WHERE status IN ('pending', 'processing', 'failed')
 	`).Scan(&naive); err != nil {
 		t.Fatal(err)
 	}

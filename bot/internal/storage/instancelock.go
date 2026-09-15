@@ -24,6 +24,8 @@ const InstanceLockKey int64 = 74617309141002
 // took the lock before this one could take it back: the caller must stop.
 var ErrInstanceLockLost = errors.New("storage: the instance lock was taken over by another process")
 
+var errInstanceLockReleased = errors.New("storage: instance lock released")
+
 const (
 	defaultInstanceLockRetry = 5 * time.Second
 	defaultInstanceLockCheck = 15 * time.Second
@@ -112,7 +114,9 @@ func (l *InstanceLock) Hold(ctx context.Context) error {
 			return ctx.Err()
 		}
 		l.logger.Warn("instance lock session lost, taking the lock back")
-		if err := l.retake(ctx); err != nil {
+		if err := l.retake(ctx); errors.Is(err, errInstanceLockReleased) {
+			return nil
+		} else if err != nil {
 			return err
 		}
 	}
@@ -127,6 +131,9 @@ func (l *InstanceLock) retake(ctx context.Context) error {
 		}
 		if err == nil {
 			return ErrInstanceLockLost
+		}
+		if errors.Is(err, errInstanceLockReleased) {
+			return err
 		}
 		if err := sleepCtx(ctx, l.retry); err != nil {
 			return err
@@ -163,7 +170,7 @@ func (l *InstanceLock) tryLock(ctx context.Context) (bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.released {
-		return false, errors.New("storage: instance lock released")
+		return false, errInstanceLockReleased
 	}
 	if l.conn == nil {
 		conn, err := pgx.Connect(ctx, l.dsn)

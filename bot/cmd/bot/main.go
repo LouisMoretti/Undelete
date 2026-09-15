@@ -115,18 +115,28 @@ func run(logger *slog.Logger) error {
 	// serving. A second process waits here until the first one stops.
 	lock, err := storage.AcquireInstanceLock(signalCtx, cfg.DatabaseURL, logger)
 	if err != nil {
+		if signalCtx.Err() != nil {
+			logger.Info("shutdown requested while waiting for the instance lock")
+			return nil
+		}
 		return err
 	}
 	ctx, stop := context.WithCancelCause(signalCtx)
+	// The lock outlives ctx: it is released by the last deferred call, once
+	// the loops have finished their iteration and the pool is closed -- not
+	// at the signal, which would let the next instance start while this one
+	// is still delivering.
+	holdCtx, releaseLock := context.WithCancel(context.Background())
 	lockDone := make(chan struct{})
 	go func() {
 		defer close(lockDone)
-		if err := lock.Hold(ctx); errors.Is(err, storage.ErrInstanceLockLost) {
+		if err := lock.Hold(holdCtx); errors.Is(err, storage.ErrInstanceLockLost) {
 			stop(err)
 		}
 	}()
 	defer func() {
 		stop(nil)
+		releaseLock()
 		<-lockDone
 	}()
 

@@ -42,11 +42,10 @@ const (
 )
 
 // The normalised prefixes the repository's statements are recognised by. The
-// two DELETEs and the two UPDATEs are distinguished by their WHERE and SET
-// clauses respectively. In simple protocol every argument arrives quoted and
-// space-padded (pgx's comment-injection mitigation), which normSQL folds away.
+// two UPDATEs are distinguished by their SET clauses. In simple protocol every
+// argument arrives quoted and space-padded (pgx's comment-injection
+// mitigation), which normSQL folds away.
 const (
-	clearPendingSQL  = "DELETE FROM DATA_ERASURE_REQUESTS WHERE OWNER_USER_ID = '11' AND STATUS = 'PENDING'"
 	insertRequestSQL = "INSERT INTO DATA_ERASURE_REQUESTS"
 	spendSQL         = "UPDATE DATA_ERASURE_REQUESTS SET STATUS = 'CONSUMED'"
 	classifySQL      = "SELECT STATUS FROM DATA_ERASURE_REQUESTS"
@@ -406,16 +405,16 @@ func assertEveryQueryRanInsideInTenant(t *testing.T, queries []string, ownerUser
 	}
 }
 
-// TestRepositoryIssueClearsPendingAndInsertsInOneTenantTransaction pins the
-// Issue contract on the wire: the pending codes of the tenant are cleared and
-// the new row inserted inside ONE transaction (no instant with two live codes,
-// nor one with none while the bot is about to hand one out), only 'pending'
-// rows are cleared (a consumed row may still need resuming, a completed one is
-// the replay receipt), and the expiry is computed by the SERVER's clock
-// (now() + make_interval), never by the bot's.
-func TestRepositoryIssueClearsPendingAndInsertsInOneTenantTransaction(t *testing.T) {
+// TestRepositoryIssueReplacesThePendingCodeInOneStatement pins the Issue
+// contract on the wire: ONE upsert inside the tenant transaction, arbitrated
+// by the one-pending-per-owner index (migration 0008), so two racing Requests
+// can never leave two live codes. Only the 'pending' row is matched (a
+// consumed row may still need resuming, a completed one is the replay
+// receipt), every identifying column is overwritten with the new request's,
+// and the expiry is computed by the SERVER's clock (now() + make_interval),
+// never by the bot's.
+func TestRepositoryIssueReplacesThePendingCodeInOneStatement(t *testing.T) {
 	repo, srv := newScriptedRepository(t)
-	srv.on(clearPendingSQL, pgReply{tag: "DELETE 1"})
 	srv.on(insertRequestSQL, pgReply{
 		columns: []pgColumn{{name: "expires_at", oid: oidTimestamptz}},
 		rows:    [][]string{{"2026-09-15 12:34:56.789567+00"}},
@@ -432,25 +431,26 @@ func TestRepositoryIssueClearsPendingAndInsertsInOneTenantTransaction(t *testing
 	}
 
 	queries := srv.normalizedQueries()
-	if len(queries) != 5 || queries[0] != "BEGIN" || queries[4] != "COMMIT" {
-		t.Fatalf("queries = %v, want begin, context, clear, insert, commit", queries)
+	if len(queries) != 4 || queries[0] != "BEGIN" || queries[3] != "COMMIT" {
+		t.Fatalf("queries = %v, want begin, context, upsert, commit", queries)
 	}
 	assertEveryQueryRanInsideInTenant(t, queries, testTenant.OwnerUserID)
 
-	clear := firstQueryWithPrefix(t, queries, clearPendingSQL)
-	if !strings.Contains(clear, "STATUS = 'PENDING'") {
-		t.Fatalf("the clear is %q: only pending rows may go", clear)
-	}
-	insert := firstQueryWithPrefix(t, queries, insertRequestSQL)
+	upsert := firstQueryWithPrefix(t, queries, insertRequestSQL)
 	for _, want := range []string{
 		"'CAFEBABE'",                   // the hash, never the code
 		"'700001'",                     // the owner's Telegram id
 		"'BC-1'",                       // the traceability connection id
 		"RETURNING EXPIRES_AT",         // the deadline is read back, not assumed
 		"MAKE_INTERVAL(SECS => '600')", // the TTL travels to the server clock, ChallengeTTL
+		"ON CONFLICT (OWNER_USER_ID) WHERE STATUS = 'PENDING'",
+		"CODE_SHA256 = EXCLUDED.CODE_SHA256",
+		"EXPIRES_AT = EXCLUDED.EXPIRES_AT",
+		"OWNER_TELEGRAM_USER_ID = EXCLUDED.OWNER_TELEGRAM_USER_ID",
+		"BUSINESS_CONNECTION_ID = EXCLUDED.BUSINESS_CONNECTION_ID",
 	} {
-		if !strings.Contains(insert, want) {
-			t.Fatalf("the insert %q does not carry %q", insert, want)
+		if !strings.Contains(upsert, want) {
+			t.Fatalf("the upsert %q does not carry %q", upsert, want)
 		}
 	}
 }
@@ -538,28 +538,21 @@ func TestRepositoryClaimClassifiesEveryServerAnswer(t *testing.T) {
 // an owner handed a code the store never wrote would hold an unspendable
 // authorisation.
 func TestRepositoryIssueFailuresSurface(t *testing.T) {
-	t.Run("clearing the pending codes fails", func(t *testing.T) {
+	t.Run("the upsert fails", func(t *testing.T) {
 		repo, srv := newScriptedRepository(t)
-		srv.on(clearPendingSQL, pgReply{err: "disk full"})
+		srv.on(insertRequestSQL, pgReply{err: "disk full"})
 
 		_, err := repo.Issue(context.Background(), testTenant, "cafebabe", ChallengeTTL)
 		if err == nil {
-			t.Fatal("Issue returned no error although the clear failed")
+			t.Fatal("Issue returned no error although the upsert failed")
 		}
-		for _, stage := range []string{"clearing pending erasure requests", "issuing erasure request"} {
-			if !strings.Contains(err.Error(), stage) {
-				t.Fatalf("error %q does not name %q", err, stage)
-			}
-		}
-		// The insert must not have run after the failed clear.
-		if got := countQueriesWithPrefix(srv.normalizedQueries(), insertRequestSQL); got != 0 {
-			t.Fatalf("the insert ran %d times after a failed clear", got)
+		if !strings.Contains(err.Error(), "issuing erasure request") {
+			t.Fatalf("error %q does not name its stage", err)
 		}
 	})
 
 	t.Run("the insert returns no row", func(t *testing.T) {
 		repo, srv := newScriptedRepository(t)
-		srv.on(clearPendingSQL, pgReply{tag: "DELETE 0"})
 		srv.on(insertRequestSQL, pgReply{tag: "INSERT 0 1"})
 
 		_, err := repo.Issue(context.Background(), testTenant, "cafebabe", ChallengeTTL)
@@ -703,7 +696,6 @@ func TestServiceRunsTheRealRepositoryThroughItsStates(t *testing.T) {
 	steps := &fakeSteps{}
 	service := newService(t, repo, steps)
 
-	srv.on(clearPendingSQL, pgReply{tag: "DELETE 1"})
 	srv.on(insertRequestSQL, pgReply{
 		columns: []pgColumn{{name: "expires_at", oid: oidTimestamptz}},
 		rows:    [][]string{{"2026-09-15 12:34:56.789567+00"}},

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -285,6 +286,66 @@ func TestPostgreSQL16Erasure(t *testing.T) {
 		}
 		if got := counts(t, erased.ID); got["messages"] != 2 {
 			t.Fatalf("an expired code deleted data: %+v", got)
+		}
+	})
+
+	t.Run("concurrent requests leave exactly one live code", func(t *testing.T) {
+		ctx := phaseContext(t)
+		// Separate Guards per goroutine would model two processes; one shared
+		// Service models two chats of the same owner on two poller shards,
+		// which the shared exclusion does NOT serialise -- only the schema can.
+		const racers = 8
+		codes := make(chan string, racers)
+		errs := make(chan error, racers)
+		var wg sync.WaitGroup
+		for i := 0; i < racers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				challenge, err := service.Request(ctx, tenantOf(erased, "erase-conn"))
+				if err != nil {
+					errs <- err
+					return
+				}
+				codes <- challenge.Code
+			}()
+		}
+		wg.Wait()
+		close(codes)
+		close(errs)
+		for err := range errs {
+			t.Fatalf("a racing Request failed: %v", err)
+		}
+
+		var pending []string
+		rows, err := admin.Query(ctx, `
+			SELECT code_sha256 FROM data_erasure_requests
+			WHERE owner_user_id = $1 AND status = 'pending'
+		`, erased.ID)
+		if err != nil {
+			t.Fatalf("read pending rows: %v", err)
+		}
+		for rows.Next() {
+			var hash string
+			if err := rows.Scan(&hash); err != nil {
+				t.Fatalf("scan pending row: %v", err)
+			}
+			pending = append(pending, hash)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("pending rows: %v", err)
+		}
+		if len(pending) != 1 {
+			t.Fatalf("%d pending codes after %d racing Requests, want exactly 1", len(pending), racers)
+		}
+		handedOut := false
+		for code := range codes {
+			if erasure.HashCode(code) == pending[0] {
+				handedOut = true
+			}
+		}
+		if !handedOut {
+			t.Fatal("the surviving pending code is none of the codes handed out")
 		}
 	})
 

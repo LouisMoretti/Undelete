@@ -17,6 +17,8 @@ var expectedSeries = []string{
 	"undelete_outbox_backlog",
 	"undelete_quota_drops_total",
 	"undelete_quota_warnings_total",
+	"undelete_update_retries_total",
+	"undelete_updates_dropped_transient_total",
 }
 
 func TestRenderPrometheusExposesExpectedSeries(t *testing.T) {

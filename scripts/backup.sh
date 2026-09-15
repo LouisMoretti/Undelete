@@ -19,10 +19,30 @@ set -eu
 # failing pg_dump would be masked by gzip's success and produce an empty
 # archive presented as valid.
 set -o pipefail
+# A dump holds every captured message in the clear, like the media archives
+# of scripts/backup-media.sh: 0600/0700 for everything written here, never
+# the container's default 022. Host-side reads of ./backups therefore run
+# under sudo (docs/backup-restore.md, "Permissions").
+umask 077
 
 : "${MIGRATION_DATABASE_URL:?MIGRATION_DATABASE_URL must be set}"
 BACKUP_DIR="${BACKUP_DIR:-./backups}"
 BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
+
+# Same rule as the bot's config.Load (which quotes this number in the
+# /delete_my_data confirmation): a positive integer of days. Anything else
+# would reach the shell arithmetic below, where a word is read as a variable
+# name and the purge age becomes meaningless.
+case "$BACKUP_RETENTION_DAYS" in
+    '' | *[!0-9]*)
+        echo "backup: invalid BACKUP_RETENTION_DAYS '${BACKUP_RETENTION_DAYS}' (expected a positive number of days)" >&2
+        exit 1
+        ;;
+esac
+if [ "$BACKUP_RETENTION_DAYS" -lt 1 ]; then
+    echo "backup: invalid BACKUP_RETENTION_DAYS '${BACKUP_RETENTION_DAYS}' (expected a positive number of days)" >&2
+    exit 1
+fi
 
 mkdir -p "$BACKUP_DIR"
 
@@ -31,9 +51,6 @@ mkdir -p "$BACKUP_DIR"
 # than the number the /delete_my_data confirmation states.
 echo "backup: purging archives that reached ${BACKUP_RETENTION_DAYS} days of age"
 PURGE_AFTER_MTIME="+$((BACKUP_RETENTION_DAYS - 1))"
-if [ "${BACKUP_RETENTION_DAYS}" -le 1 ] 2>/dev/null; then
-    PURGE_AFTER_MTIME="+0"
-fi
 # -mtime compares whole days: -mtime +K matches files strictly older than K+1
 # days. Purging with K = RETENTION-1 therefore deletes an archive on the first
 # daily run where it is at least RETENTION days old. "About RETENTION days"

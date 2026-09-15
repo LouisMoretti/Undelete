@@ -93,6 +93,17 @@ func TestPostgreSQL16SecurityAndRetention(t *testing.T) {
 		if superuser || createDB || createRole || bypassRLS {
 			t.Fatalf("dangerous runtime attributes: super=%t createdb=%t createrole=%t bypassrls=%t", superuser, createDB, createRole, bypassRLS)
 		}
+		// The migration ledger belongs to the runner alone (migration 0009):
+		// a runtime role able to delete a row would replay its DDL at boot.
+		var ledgerAccess bool
+		if err := admin.QueryRow(ctx, `
+			SELECT has_table_privilege('undelete_app', 'schema_migrations', 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE')
+		`).Scan(&ledgerAccess); err != nil {
+			t.Fatalf("read ledger privileges: %v", err)
+		}
+		if ledgerAccess {
+			t.Fatal("the runtime role still has a privilege on schema_migrations")
+		}
 	})
 
 	db, err := storage.NewPool(ctx, runtimeDSN)

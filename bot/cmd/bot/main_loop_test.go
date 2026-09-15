@@ -86,10 +86,15 @@ func (p *phaseRecorder) PurgeExpired(context.Context, []users.TenantRetention) (
 type fakeMediaRetention struct {
 	calls []string
 	err   error
+	// afterRun, when set, runs at the end of every Run (e.g. a shutdown).
+	afterRun func()
 }
 
 func (f *fakeMediaRetention) Run(context.Context, []users.TenantRetention) (purge.Stats, error) {
 	f.calls = append(f.calls, "run")
+	if f.afterRun != nil {
+		f.afterRun()
+	}
 	return purge.Stats{FilesDeleted: 2}, f.err
 }
 
@@ -254,6 +259,26 @@ func TestRunRetentionLoopTicksCyclesAndStops(t *testing.T) {
 	}
 }
 
+// TestRunRetentionLoopRunsACycleAtStart pins the boot pass: the first cycle
+// runs before the first tick, so a process restarted more often than the
+// interval still purges.
+func TestRunRetentionLoopRunsACycleAtStart(t *testing.T) {
+	tenants := &fakeTenantLister{tenants: testTenants(11)}
+	msgs := &phaseRecorder{}
+	ob := &phaseRecorder{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Shut down as soon as the first cycle ends: with an hour-long interval,
+	// only a boot pass can have run by then.
+	media := &fakeMediaRetention{afterRun: cancel}
+
+	runRetentionLoop(ctx, tenants, msgs, ob, media, discardLogger(), time.Hour)
+
+	if len(msgs.calls) != 1 || len(ob.calls) != 1 || len(media.calls) != 1 {
+		t.Fatalf("cycles at start: messages %v, outbox %v, media %v; want exactly one each", msgs.calls, ob.calls, media.calls)
+	}
+}
+
 // TestRunFailsFastWithoutConfiguration pins the startup contract: without
 // any environment, run returns the configuration error instead of booting
 // half-wired (no migrations, no pool, no Telegram client).
@@ -290,12 +315,12 @@ func TestRunRetentionOnceRunsPhasesInOrder(t *testing.T) {
 	}
 }
 
-// TestRunRetentionOnceSkipsLaterPhasesOnFailure pins the short-circuit: a
-// failing text purge skips the outbox and media phases (its own error is
-// already logged), and a failing outbox purge skips the media phase. The
-// media phase failure itself still closes the cycle.
-func TestRunRetentionOnceSkipsLaterPhasesOnFailure(t *testing.T) {
-	t.Run("messages failure skips outbox and media", func(t *testing.T) {
+// TestRunRetentionOnceRunsEveryPhaseDespiteFailures pins the phase
+// independence: a failing text purge must not starve the outbox and media
+// phases of their daily pass, and a failing outbox purge must not starve the
+// media phase. The media phase failure itself still closes the cycle.
+func TestRunRetentionOnceRunsEveryPhaseDespiteFailures(t *testing.T) {
+	t.Run("messages failure still runs outbox and media", func(t *testing.T) {
 		tenants := &fakeTenantLister{tenants: testTenants(11)}
 		msgs := &phaseRecorder{errOn: "purgeExpired"}
 		ob := &phaseRecorder{}
@@ -303,20 +328,34 @@ func TestRunRetentionOnceSkipsLaterPhasesOnFailure(t *testing.T) {
 
 		runRetentionOnce(context.Background(), tenants, msgs, ob, media, discardLogger())
 
-		if len(ob.calls) != 0 || len(media.calls) != 0 {
-			t.Fatalf("outbox calls = %v, media calls = %v; want none after a messages failure", ob.calls, media.calls)
+		if len(ob.calls) != 1 || len(media.calls) != 1 {
+			t.Fatalf("outbox calls = %v, media calls = %v; want one each after a messages failure", ob.calls, media.calls)
 		}
 	})
 
-	t.Run("outbox failure skips media", func(t *testing.T) {
+	t.Run("outbox failure still runs media", func(t *testing.T) {
 		tenants := &fakeTenantLister{tenants: testTenants(11)}
 		ob := &failingOutbox{}
 		media := &fakeMediaRetention{}
 
 		runRetentionOnce(context.Background(), tenants, &phaseRecorder{}, ob, media, discardLogger())
 
-		if len(media.calls) != 0 {
-			t.Fatalf("media calls = %v; want none after an outbox failure", media.calls)
+		if len(media.calls) != 1 {
+			t.Fatalf("media calls = %v; want one after an outbox failure", media.calls)
+		}
+	})
+
+	t.Run("shutdown between phases stops the cycle", func(t *testing.T) {
+		tenants := &fakeTenantLister{tenants: testTenants(11)}
+		ctx, cancel := context.WithCancel(context.Background())
+		msgs := &cancellingPurge{cancel: cancel}
+		ob := &phaseRecorder{}
+		media := &fakeMediaRetention{}
+
+		runRetentionOnce(ctx, tenants, msgs, ob, media, discardLogger())
+
+		if len(ob.calls) != 0 || len(media.calls) != 0 {
+			t.Fatalf("outbox calls = %v, media calls = %v; want none once shutdown began", ob.calls, media.calls)
 		}
 	})
 
@@ -333,6 +372,14 @@ func TestRunRetentionOnceSkipsLaterPhasesOnFailure(t *testing.T) {
 			t.Fatal("every phase must have run despite the media failure")
 		}
 	})
+}
+
+// cancellingPurge simulates a shutdown arriving during the text purge.
+type cancellingPurge struct{ cancel context.CancelFunc }
+
+func (c *cancellingPurge) PurgeExpired(context.Context, []users.TenantRetention) (int64, error) {
+	c.cancel()
+	return 0, context.Canceled
 }
 
 type failingOutbox struct{ calls []string }
@@ -533,22 +580,22 @@ func TestRunBacklogLoopPublishesCountToGauge(t *testing.T) {
 	}
 }
 
-// TestRunStopsOnMigrationFailure pins the boot order at the unit level: with
-// a loadable configuration, run() attempts the migrations with the owner DSN
-// BEFORE anything else -- the failure it surfaces is the migration
-// connection's, not the application pool's and not a configuration one. The
-// migration DSN points at a unix socket directory that cannot exist, so the
-// connection fails instantly and without any network.
-func TestRunStopsOnMigrationFailure(t *testing.T) {
+// TestRunTakesTheInstanceLockFirst pins the boot order at the unit level:
+// with a loadable configuration, run() takes the instance lock BEFORE
+// anything else, migrations included (a new version must not migrate under
+// an old one still serving) -- and an unreachable database fails the boot at
+// once instead of waiting. Both DSNs point at unix socket directories that
+// cannot exist, so the connections fail instantly and without any network.
+func TestRunTakesTheInstanceLockFirst(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://app:app@/app?host=/tmp/opencode/no-such-app-socket&sslmode=disable")
 	t.Setenv("MIGRATION_DATABASE_URL", "postgres://mig:mig@/mig?host=/tmp/opencode/no-such-socket&sslmode=disable")
 	t.Setenv("TELEGRAM_BOT_TOKEN", "0:test-token")
 
 	err := run(discardLogger())
 	if err == nil {
-		t.Fatal("run() with an unreachable migration DSN = nil, want the migration failure")
+		t.Fatal("run() with an unreachable database = nil, want the instance lock failure")
 	}
-	if !strings.Contains(err.Error(), "connecting for migrations") {
-		t.Fatalf("run() error = %q, want the migration failure: migrations must run before the pool opens", err)
+	if !strings.Contains(err.Error(), "connecting for the instance lock") {
+		t.Fatalf("run() error = %q, want the instance lock failure: it must precede the migrations", err)
 	}
 }

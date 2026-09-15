@@ -130,8 +130,12 @@ itself right after writing. Verify the pair after a forced dump (and any
 time a dump is copied anywhere):
 
 ```bash
-cd backups && sha256sum -c undelete-<timestamp>.sql.gz.sha256
+cd backups && sudo sha256sum -c undelete-<timestamp>.sql.gz.sha256
 ```
+
+Dumps are written `0600` (root, `umask 077` in `scripts/backup.sh`): they hold
+every captured message in the clear, so reading them from the host takes
+`sudo`, exactly like the media archives.
 
 The script purges archives that reached `BACKUP_RETENTION_DAYS` days of age
 (files only) BEFORE dumping, then writes `backups/undelete-<UTC timestamp>.sql.gz`.
@@ -242,6 +246,19 @@ volume is preserved in all cases.
 
 `docker compose ps` must show `postgres` *healthy* and `bot` *running*. The
 bot waits for `service_healthy` on Postgres: a slightly slow start is normal.
+
+**One bot per database.** At boot, before its migrations, the bot takes a
+PostgreSQL session advisory lock (`storage.InstanceLockKey`) and holds it for
+its whole life: the tenant exclusion that keeps `/delete_my_data` honest lives
+in the process memory, so a second process would bring back every race it
+excludes. A second bot on the same database logs
+`another bot instance holds the instance lock: waiting for it to stop` and
+starts only once the first one exits -- during a rollout that is a few seconds
+at most. A bot stuck on that line otherwise means another container (a stray
+`docker compose run`, a second checkout) is connected to this database: find
+it with `docker ps`. If the lock's session drops and another process takes
+the lock first, the bot exits with `instance lock was taken over` rather than
+run alongside it.
 
 ### Step 4 — Verification
 
@@ -567,9 +584,9 @@ Hence the rollout, once, on the first deployment that carries the media purge:
    Only a real boolean is accepted; a typo fails at startup rather than silently
    disabling retention. At boot the logs carry
    `media retention purge running in DRY RUN: no file will be deleted`.
-2. **Wait for one pass.** The retention loop is on a 24h ticker and does *not*
-   fire at boot: the first summary line appears one day after the rollout. Read
-   it in `docker compose logs bot`, on the `retention purge complete` line:
+2. **Wait for one pass.** The retention loop runs one pass at boot, then every
+   24h: the first summary line appears within minutes of the rollout. Read it
+   in `docker compose logs bot`, on the `retention purge complete` line:
 
    | Counter | Read it as |
    |---|---|
@@ -583,7 +600,8 @@ Hence the rollout, once, on the first deployment that carries the media purge:
    has more expiring media than one pass can absorb: the purge resumes the next
    day, and only sustained repetition is a problem.
 3. **Switch it off** (`MEDIA_PURGE_DRY_RUN=false`, or remove the line) and
-   `docker compose up -d`. Leaving the dry run on is not a safe default: a
+   `docker compose up -d`. The real deletion starts with the boot pass of that
+   restart, not a day later. Leaving the dry run on is not a safe default: a
    retention that never runs is a silent breach of the promise made to the
    owner, and nothing else in the logs says so.
 

@@ -254,6 +254,7 @@ echo "backup-media: mode=${mode} media=${MEDIA_DIR} -> $(basename "$archive")"
 if [ "$mode" = full ]; then
     : > "$started_marker"
     base_full='-'
+    incremental_reference='-'
     # find into a file, then post-process: written as `find | sed` the exit
     # status kept would be sed's, and a find that failed halfway (unreadable
     # subdirectory) would produce a short listing presented as a complete
@@ -272,6 +273,7 @@ else
         echo "backup-media: WARNING: marker $(basename "$reference") missing, falling back to the archive's mtime" >&2
         reference="$newest_full"
     fi
+    incremental_reference=$(basename "$reference")
     ( cd "$MEDIA_DIR" && find . -type f -newer "$reference" ) > "$workdir/raw"
     sed 's|^\./||' "$workdir/raw" | LC_ALL=C sort > "$workdir/files"
 fi
@@ -370,6 +372,7 @@ schema=1
 archive=$(basename "$archive")
 mode=${mode}
 base_full=${base_full}
+incremental_reference=${incremental_reference}
 db_dump=${dump_name}
 media_dir=${MEDIA_DIR}
 started_at=${started_at}

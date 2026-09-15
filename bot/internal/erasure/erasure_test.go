@@ -3,6 +3,7 @@ package erasure
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -25,7 +26,10 @@ type fakeChallenges struct {
 	// issueErr, claimErr and completeErr inject a database failure at each of
 	// the three points where one changes the outcome.
 	issueErr, claimErr, completeErr error
-	deleted                         []string
+	// deleteOthersErr injects a failure at the last deletion step: removing
+	// every request of the tenant except the receipt.
+	deleteOthersErr error
+	deleted         []string
 }
 
 type fakeRequest struct {
@@ -107,6 +111,9 @@ func (f *fakeChallenges) Complete(_ context.Context, ownerUserID int64, codeHash
 func (f *fakeChallenges) DeleteOthers(_ context.Context, ownerUserID int64, keepHash string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.deleteOthersErr != nil {
+		return 0, f.deleteOthersErr
+	}
 	var deleted int64
 	for hash, row := range f.rows {
 		if row.owner == ownerUserID && hash != keepHash {
@@ -838,5 +845,330 @@ func TestCompletedReceiptKeepsOnlyWhatTheReplayNeeds(t *testing.T) {
 	}
 	if row.owner != testTenant.OwnerUserID {
 		t.Fatalf("the receipt lost its tenant key: %+v", row)
+	}
+}
+
+// TestConfirmAcceptsFoldedCode proves end to end what NormaliseCode promises:
+// the owner retypes the code by hand, and the Confirm path folds exactly like
+// the hash path. If Confirm hashed the raw submission, a lower-case code with
+// a dash would read as unknown although the pure function folds it.
+func TestConfirmAcceptsFoldedCode(t *testing.T) {
+	challenges := newChallenges()
+	steps := &fakeSteps{}
+	service := newService(t, challenges, steps)
+
+	challenge, err := service.Request(context.Background(), testTenant)
+	if err != nil {
+		t.Fatalf("Request: %v", err)
+	}
+	folded := strings.ToLower(challenge.Code[:4] + "-" + challenge.Code[4:])
+	if NormaliseCode(folded) != challenge.Code {
+		t.Fatalf("the test folding %q does not fold back to %q", folded, challenge.Code)
+	}
+
+	outcome, err := service.Confirm(context.Background(), testTenant, folded)
+	if err != nil {
+		t.Fatalf("Confirm with folded code: %v", err)
+	}
+	if outcome != OutcomeErased {
+		t.Fatalf("outcome = %v, want OutcomeErased: the folded code must spend the same row", outcome)
+	}
+	if got := strings.Join(steps.calls, ","); got != "connections,outbox,media,messages" {
+		t.Fatalf("steps ran as %q, want the full erasure", got)
+	}
+}
+
+// TestEraseStopsAtLateFailingStep covers the two erase branches the earlier
+// tests leave out: a failing outbox step and a failing messages step. Both
+// must stop the list, surface as OutcomeErased with an error (started but not
+// finished: the same code resumes), and leave the request consumable.
+func TestEraseStopsAtLateFailingStep(t *testing.T) {
+	tests := []struct {
+		name      string
+		failAt    string
+		wantCalls string
+		wantErr   string
+	}{
+		{name: "outbox", failAt: "outbox", wantCalls: "connections,outbox", wantErr: "deleting queued alerts"},
+		{name: "messages", failAt: "messages", wantCalls: "connections,outbox,media,messages", wantErr: "deleting messages"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			challenges := newChallenges()
+			steps := &fakeSteps{failAt: tt.failAt}
+			service := newService(t, challenges, steps)
+
+			challenge, err := service.Request(context.Background(), testTenant)
+			if err != nil {
+				t.Fatalf("Request: %v", err)
+			}
+			outcome, err := service.Confirm(context.Background(), testTenant, challenge.Code)
+			if err == nil {
+				t.Fatal("a failing step must surface as an error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error %q does not name its step %q", err, tt.wantErr)
+			}
+			if outcome != OutcomeErased {
+				t.Fatalf("outcome = %v, want OutcomeErased: the erasure started but did not finish", outcome)
+			}
+			if got := strings.Join(steps.calls, ","); got != tt.wantCalls {
+				t.Fatalf("steps ran as %q, want %q: the failure must stop the list", got, tt.wantCalls)
+			}
+			hash := HashCode(challenge.Code)
+			if status := challenges.rows[hash].status; status != "consumed" {
+				t.Fatalf("request status = %q, want consumed so the same code resumes", status)
+			}
+
+			steps.failAt = ""
+			steps.calls = nil
+			outcome, err = service.Confirm(context.Background(), testTenant, challenge.Code)
+			if err != nil {
+				t.Fatalf("resumed Confirm: %v", err)
+			}
+			if outcome != OutcomeErased {
+				t.Fatalf("outcome = %v, want OutcomeErased after resume", outcome)
+			}
+			if got := strings.Join(steps.calls, ","); got != "connections,outbox,media,messages" {
+				t.Fatalf("the resumed run did %q, want every step from the beginning", got)
+			}
+		})
+	}
+}
+
+// TestDeleteOthersFailureKeepsErasureResumable covers the last deletion step:
+// removing every request but the receipt. A failure there is still a started
+// but unfinished erasure -- same outcome contract as a failing deletion step,
+// and the same code resumes it.
+func TestDeleteOthersFailureKeepsErasureResumable(t *testing.T) {
+	challenges := newChallenges()
+	challenges.deleteOthersErr = errors.New("database down")
+	steps := &fakeSteps{}
+	service := newService(t, challenges, steps)
+
+	challenge, err := service.Request(context.Background(), testTenant)
+	if err != nil {
+		t.Fatalf("Request: %v", err)
+	}
+	hash := HashCode(challenge.Code)
+
+	outcome, err := service.Confirm(context.Background(), testTenant, challenge.Code)
+	if err == nil {
+		t.Fatal("a failing DeleteOthers must surface as an error")
+	}
+	if !strings.Contains(err.Error(), "deleting other erasure requests") {
+		t.Fatalf("error %q does not name its step", err)
+	}
+	if outcome != OutcomeErased {
+		t.Fatalf("outcome = %v, want OutcomeErased: the erasure started but did not finish", outcome)
+	}
+	if got := strings.Join(steps.calls, ","); got != "connections,outbox,media,messages" {
+		t.Fatalf("steps ran as %q: DeleteOthers runs after every deletion step", got)
+	}
+	if status := challenges.rows[hash].status; status != "consumed" {
+		t.Fatalf("request status = %q, want consumed so the same code resumes", status)
+	}
+
+	// A superseded request present at resume time must go on the second run.
+	challenges.rows["stale-hash"] = &fakeRequest{owner: testTenant.OwnerUserID, status: "pending", expiresAt: time.Now().Add(time.Minute)}
+	challenges.deleteOthersErr = nil
+	steps.calls = nil
+	outcome, err = service.Confirm(context.Background(), testTenant, challenge.Code)
+	if err != nil {
+		t.Fatalf("resumed Confirm: %v", err)
+	}
+	if outcome != OutcomeErased {
+		t.Fatalf("outcome = %v, want OutcomeErased after resume", outcome)
+	}
+	if _, ok := challenges.rows["stale-hash"]; ok {
+		t.Fatal("the resumed erasure left a superseded request behind")
+	}
+	if status := challenges.rows[hash].status; status != "completed" {
+		t.Fatalf("request status = %q after resume, want completed", status)
+	}
+}
+
+// TestConfirmWithCancelledContextFailsClosed covers the guard-acquisition
+// branch: when the tenant exclusion cannot be entered, nothing is claimed and
+// nothing is deleted. The empty-code subtest pins the order the other way: a
+// blank submission returns before the guard, so even a cancelled context must
+// not turn it into an error.
+func TestConfirmWithCancelledContextFailsClosed(t *testing.T) {
+	challenges := newChallenges()
+	steps := &fakeSteps{}
+	service := newService(t, challenges, steps)
+
+	challenge, err := service.Request(context.Background(), testTenant)
+	if err != nil {
+		t.Fatalf("Request: %v", err)
+	}
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	outcome, err := service.Confirm(cancelled, testTenant, challenge.Code)
+	if err == nil {
+		t.Fatal("Confirm on a cancelled context must fail")
+	}
+	if outcome != OutcomeUnknown {
+		t.Fatalf("outcome = %v, want OutcomeUnknown: nothing was decided", outcome)
+	}
+	if len(steps.calls) != 0 {
+		t.Fatalf("a Confirm that never entered the exclusion ran %v", steps.calls)
+	}
+	if status := challenges.rows[HashCode(challenge.Code)].status; status != "pending" {
+		t.Fatalf("request status = %q, want pending: the claim must not have run", status)
+	}
+
+	outcome, err = service.Confirm(cancelled, testTenant, "   ")
+	if err != nil {
+		t.Fatalf("a blank code must stay a plain refusal even on a cancelled context: %v", err)
+	}
+	if outcome != OutcomeUnknown {
+		t.Fatalf("outcome = %v, want OutcomeUnknown", outcome)
+	}
+}
+
+// TestFailedCompletionIsResumable strengthens the complete-fails branch: the
+// deletions already ran, but without the completed receipt the same code must
+// rerun them idempotently and finish. An alert is deferred, never abandoned.
+func TestFailedCompletionIsResumable(t *testing.T) {
+	challenges := newChallenges()
+	steps := &fakeSteps{}
+	service := newService(t, challenges, steps)
+
+	challenge, err := service.Request(context.Background(), testTenant)
+	if err != nil {
+		t.Fatalf("Request: %v", err)
+	}
+	hash := HashCode(challenge.Code)
+	challenges.completeErr = errors.New("database down")
+
+	outcome, err := service.Confirm(context.Background(), testTenant, challenge.Code)
+	if err == nil {
+		t.Fatal("Confirm returned no error although the request could not be completed")
+	}
+	if outcome != OutcomeErased {
+		t.Fatalf("outcome = %v, want OutcomeErased: the deletions ran, only the receipt is missing", outcome)
+	}
+	if got := strings.Join(steps.calls, ","); got != "connections,outbox,media,messages" {
+		t.Fatalf("steps ran as %q, want the full list before the completion", got)
+	}
+	if status := challenges.rows[hash].status; status != "consumed" {
+		t.Fatalf("request status = %q, want consumed so the same code resumes", status)
+	}
+
+	challenges.completeErr = nil
+	steps.calls = nil
+	outcome, err = service.Confirm(context.Background(), testTenant, challenge.Code)
+	if err != nil {
+		t.Fatalf("resumed Confirm: %v", err)
+	}
+	if outcome != OutcomeErased {
+		t.Fatalf("outcome = %v, want OutcomeErased after resume", outcome)
+	}
+	if status := challenges.rows[hash].status; status != "completed" {
+		t.Fatalf("request status = %q after resume, want completed", status)
+	}
+}
+
+// logCapture is a slog.Handler that keeps every message and attribute as text,
+// so the test can prove the code and its hash never reach the application log:
+// either would turn the log into a live erasure token.
+type logCapture struct {
+	mu    sync.Mutex
+	texts []string
+}
+
+func (c *logCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c *logCapture) Handle(_ context.Context, r slog.Record) error {
+	var sb strings.Builder
+	sb.WriteString(r.Message)
+	r.Attrs(func(a slog.Attr) bool {
+		sb.WriteString(" ")
+		sb.WriteString(a.String())
+		return true
+	})
+	c.mu.Lock()
+	c.texts = append(c.texts, sb.String())
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *logCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
+func (c *logCapture) WithGroup(string) slog.Handler      { return c }
+
+func (c *logCapture) joined() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.texts...)
+}
+
+// TestDiscardHandlerMethods exercises the no-op logger methods that are used
+// when Config.Logger is nil. The Service never calls With/WithGroup, and
+// Enabled returns false so Handle is never invoked, but the methods exist and
+// must not panic.
+func TestDiscardHandlerMethods(t *testing.T) {
+	h := discardHandler{}
+
+	if h.Enabled(context.Background(), slog.LevelInfo) {
+		t.Fatal("Enabled must return false")
+	}
+	if err := h.Handle(context.Background(), slog.Record{}); err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if h.WithAttrs(nil) != h {
+		t.Fatal("WithAttrs must return the same handler")
+	}
+	if h.WithGroup("") != h {
+		t.Fatal("WithGroup must return the same handler")
+	}
+}
+
+// TestLogsNeverCarryCodeOrHash: the code is returned in clear once, hashed for
+// storage, and never logged -- not on issue, not on the deletion counters, not
+// on a replay. The hash is equally secret: it IS the lookup key of a live
+// code.
+func TestLogsNeverCarryCodeOrHash(t *testing.T) {
+	challenges := newChallenges()
+	steps := &fakeSteps{}
+	capture := &logCapture{}
+	s, err := New(Config{
+		Challenges:  challenges,
+		Connections: steps,
+		Outbox:      steps,
+		Media:       steps,
+		Messages:    messageSteps{steps: steps},
+		Guard:       tenantexcl.New(),
+		Logger:      slog.New(capture),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	challenge, err := s.Request(context.Background(), testTenant)
+	if err != nil {
+		t.Fatalf("Request: %v", err)
+	}
+	hash := HashCode(challenge.Code)
+	if _, err := s.Confirm(context.Background(), testTenant, challenge.Code); err != nil {
+		t.Fatalf("Confirm: %v", err)
+	}
+	if _, err := s.Confirm(context.Background(), testTenant, challenge.Code); err != nil {
+		t.Fatalf("replayed Confirm: %v", err)
+	}
+
+	lines := capture.joined()
+	if len(lines) == 0 {
+		t.Fatal("no log line captured: the test is not observing anything")
+	}
+	for _, line := range lines {
+		if strings.Contains(line, challenge.Code) {
+			t.Fatalf("a log line carries the erasure code: %q", line)
+		}
+		if strings.Contains(line, hash) {
+			t.Fatalf("a log line carries the code hash: %q", line)
+		}
 	}
 }

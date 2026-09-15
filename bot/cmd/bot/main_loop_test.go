@@ -5,10 +5,12 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/LouisMoretti/Undelete/bot/internal/media/purge"
+	"github.com/LouisMoretti/Undelete/bot/internal/metrics"
 	"github.com/LouisMoretti/Undelete/bot/internal/users"
 )
 
@@ -352,5 +354,201 @@ func TestRunRetentionOnceSurvivesTenantListingFailure(t *testing.T) {
 
 	if len(msgs.calls) != 0 || len(ob.calls) != 0 || len(media.calls) != 0 {
 		t.Fatal("no phase may run without a tenant list")
+	}
+}
+
+// logCancellingHandler is a slog handler that records every logged message
+// and cancels the context under test as soon as the watched message is
+// logged. It turns "the loop logs the error, then stops at the next tick
+// without hanging on it" into a deterministic sequence: the log call is
+// synchronous in the loop's goroutine, so once Handle has cancelled, the
+// following select can only see ctx.Done (the tickers are seconds away).
+type logCancellingHandler struct {
+	cancel context.CancelFunc
+	watch  string
+	msgs   []string
+}
+
+func (h *logCancellingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *logCancellingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.msgs = append(h.msgs, r.Message)
+	if r.Message == h.watch {
+		h.cancel()
+	}
+	return nil
+}
+
+func (h *logCancellingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *logCancellingHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *logCancellingHandler) seen(msg string) bool {
+	for _, m := range h.msgs {
+		if m == msg {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRunOutboxLoopBreaksTenantDrainOnErrorButServesNext pins the outbox
+// failure mode: a ProcessOne error breaks THAT tenant's drain for the tick
+// (its queue is retried on the next one), but the loop still moves on to the
+// tenants listed after it -- one broken tenant never stops the whole delivery
+// tick.
+func TestRunOutboxLoopBreaksTenantDrainOnErrorButServesNext(t *testing.T) {
+	tenants := &fakeTenantLister{tenants: testTenants(11, 22)}
+	served := map[int64]int{}
+	worker := &fakeOutboxDeliverer{process: func(_ context.Context, ownerUserID int64) (bool, error) {
+		served[ownerUserID]++
+		if ownerUserID == 11 {
+			return true, errors.New("send away") // error mid-drain
+		}
+		return false, nil
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	runOutboxLoop(ctx, tenants, worker, discardLogger())
+
+	if served[11] != 1 {
+		t.Fatalf("failing tenant drained %d times, want the drain broken after 1 error", served[11])
+	}
+	if served[22] != 1 {
+		t.Fatalf("next tenant served %d times, want 1 after the failing tenant", served[22])
+	}
+}
+
+// TestRunMediaLoopLogsFetchErrorAndStillServesNextTenant pins the media
+// failure mode: a tenant whose download fails is logged (the context is still
+// live) and skipped for this iteration, and the tenants listed after it are
+// still fetched in the same pass. The second tenant's call cancels the
+// context, which stops the loop deterministically before the 5s tick.
+func TestRunMediaLoopLogsFetchErrorAndStillServesNextTenant(t *testing.T) {
+	tenants := &fakeTenantLister{tenants: testTenants(11, 22)}
+	ctx, cancel := context.WithCancel(context.Background())
+	fetcher := &scriptedMediaFetcher{cancel: cancel}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runMediaLoop(ctx, tenants, fetcher, discardLogger())
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runMediaLoop did not stop after its iteration")
+	}
+
+	if len(fetcher.calls) != 2 || fetcher.calls[0] != 11 || fetcher.calls[1] != 22 {
+		t.Fatalf("fetcher visited %v, want [11 22]: the failing tenant must not stop the pass", fetcher.calls)
+	}
+}
+
+// scriptedMediaFetcher fails tenant 11's download and, once tenant 22 has been
+// served (proving the pass continued), cancels the context to stop the loop.
+type scriptedMediaFetcher struct {
+	calls  []int64
+	cancel context.CancelFunc
+}
+
+func (f *scriptedMediaFetcher) ProcessTenant(_ context.Context, ownerUserID int64) (int, error) {
+	f.calls = append(f.calls, ownerUserID)
+	if ownerUserID == 11 {
+		return 0, errors.New("getFile away")
+	}
+	f.cancel()
+	return 2, nil
+}
+
+// TestRunMediaLoopLogsListingFailureAndStops pins the media listing failure:
+// the error is logged while the context is live (unlike the shutdown path,
+// which stays silent), no tenant is fetched, and the loop stops on the
+// shutdown instead of waiting out the media tick.
+func TestRunMediaLoopLogsListingFailureAndStops(t *testing.T) {
+	tenants := &fakeTenantLister{err: errors.New("database away")}
+	fetcher := &fakeMediaFetcher{}
+	ctx, cancel := context.WithCancel(context.Background())
+	handler := &logCancellingHandler{cancel: cancel, watch: "media fetch: failed to list tenants"}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runMediaLoop(ctx, tenants, fetcher, slog.New(handler))
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runMediaLoop did not stop after the listing failure")
+	}
+
+	if !handler.seen(handler.watch) {
+		t.Fatalf("listing failure not logged; messages = %v", handler.msgs)
+	}
+	if len(fetcher.calls) != 0 {
+		t.Fatal("fetcher must not run without a tenant list")
+	}
+}
+
+// TestRunBacklogLoopLogsCountFailureAndStops pins the backlog failure mode:
+// a failing COUNT(*) is logged while the context is live, leaves the gauge
+// untouched, and the loop stops on the shutdown instead of waiting out the
+// backlog tick.
+func TestRunBacklogLoopLogsCountFailureAndStops(t *testing.T) {
+	tenants := &fakeTenantLister{tenants: testTenants(11)}
+	counter := &fakeBacklogCounter{err: errors.New("count away")}
+	ctx, cancel := context.WithCancel(context.Background())
+	handler := &logCancellingHandler{cancel: cancel, watch: "outbox backlog: count failed"}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runBacklogLoop(ctx, tenants, counter, slog.New(handler))
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runBacklogLoop did not stop after the count failure")
+	}
+
+	if !handler.seen(handler.watch) {
+		t.Fatalf("count failure not logged; messages = %v", handler.msgs)
+	}
+}
+
+// TestRunBacklogLoopPublishesCountToGauge pins the observable end of the
+// backlog loop: the value CountBacklog returns in an iteration is what the
+// undelete_outbox_backlog gauge exposes -- the loop is not just calling the
+// counter, its result reaches /metrics.
+func TestRunBacklogLoopPublishesCountToGauge(t *testing.T) {
+	tenants := &fakeTenantLister{tenants: testTenants(11)}
+	counter := &fakeBacklogCounter{value: 37}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	runBacklogLoop(ctx, tenants, counter, discardLogger())
+
+	if !strings.Contains(metrics.Default().RenderPrometheus(), "undelete_outbox_backlog 37\n") {
+		t.Fatal("undelete_outbox_backlog does not expose the counted backlog")
+	}
+}
+
+// TestRunStopsOnMigrationFailure pins the boot order at the unit level: with
+// a loadable configuration, run() attempts the migrations with the owner DSN
+// BEFORE anything else -- the failure it surfaces is the migration
+// connection's, not the application pool's and not a configuration one. The
+// migration DSN points at a unix socket directory that cannot exist, so the
+// connection fails instantly and without any network.
+func TestRunStopsOnMigrationFailure(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://app:app@/app?host=/tmp/opencode/no-such-app-socket&sslmode=disable")
+	t.Setenv("MIGRATION_DATABASE_URL", "postgres://mig:mig@/mig?host=/tmp/opencode/no-such-socket&sslmode=disable")
+	t.Setenv("TELEGRAM_BOT_TOKEN", "0:test-token")
+
+	err := run(discardLogger())
+	if err == nil {
+		t.Fatal("run() with an unreachable migration DSN = nil, want the migration failure")
+	}
+	if !strings.Contains(err.Error(), "connecting for migrations") {
+		t.Fatalf("run() error = %q, want the migration failure: migrations must run before the pool opens", err)
 	}
 }

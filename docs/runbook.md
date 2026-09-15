@@ -130,8 +130,12 @@ itself right after writing. Verify the pair after a forced dump (and any
 time a dump is copied anywhere):
 
 ```bash
-cd backups && sha256sum -c undelete-<timestamp>.sql.gz.sha256
+cd backups && sudo sha256sum -c undelete-<timestamp>.sql.gz.sha256
 ```
+
+Dumps are written `0600` (root, `umask 077` in `scripts/backup.sh`): they hold
+every captured message in the clear, so reading them from the host takes
+`sudo`, exactly like the media archives.
 
 The script purges archives that reached `BACKUP_RETENTION_DAYS` days of age
 (files only) BEFORE dumping, then writes `backups/undelete-<UTC timestamp>.sql.gz`.

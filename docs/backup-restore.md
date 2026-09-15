@@ -169,6 +169,7 @@ schema=1
 archive=undelete-media-20260904T041200Z-full.tar.gz
 mode=full
 base_full=-
+incremental_reference=-
 db_dump=undelete-20260904T041000Z.sql.gz
 media_dir=/media
 started_at=2026-09-04T04:12:00Z
@@ -179,6 +180,12 @@ archive_sha256=<hex>
 manifest=undelete-media-20260904T041200Z-full.manifest
 skipped_paths=0
 ```
+
+`incremental_reference` names the file an incremental's `find -newer` ran
+against: normally the full's `.started` marker, or the full archive itself
+when that marker was missing (a WARNING on stderr at the time, and a less safe
+window: files written while the full was being archived may be missed). `-`
+for a full.
 
 `.meta` is written **last**, once everything else is on disk and coherent: an
 archive without its `.meta` is the signature of an interrupted run and must
@@ -205,6 +212,8 @@ Exit codes, since the difference decides whether there is anything to keep:
 
 The script runs with `umask 077`: archives, manifests and sidecars come out
 `0600`, owned by the identity that ran it (`root`, in the backup container).
+`scripts/backup.sh` does the same for the database dumps and their `.sha256`
+sidecars, which hold every captured message in the clear.
 An archive holds attachments in the clear — whoever reads the file reads the
 content — so this is not left to the default `022`.
 
@@ -422,7 +431,8 @@ Step-by-step procedure, to be done **towards a new target**:
 
 1. **Choose the archive.** `ls -lt backups/undelete-*.sql.gz` — the timestamp
    is in UTC. Verify its integrity before anything else:
-   `gzip -t backups/undelete-<timestamp>.sql.gz`.
+   `sudo gzip -t backups/undelete-<timestamp>.sql.gz` (dumps are `0600`
+   root, like the media archives: see "Permissions").
 2. **Prepare a blank, distinct target.** A new cluster, or at minimum
    a newly created database (`CREATE DATABASE undelete_restore;`) on a
    cluster where `db/init/01-app-role.sh` created the `undelete_app` role.
@@ -431,7 +441,7 @@ Step-by-step procedure, to be done **towards a new target**:
    only copy of the data.
 3. **Restore.** In two commands, and with `-v ON_ERROR_STOP=1`:
    ```sh
-   gunzip -c backups/undelete-<timestamp>.sql.gz > /tmp/undelete-restore.sql
+   (umask 077; sudo gunzip -c backups/undelete-<timestamp>.sql.gz > /tmp/undelete-restore.sql)
    psql -v ON_ERROR_STOP=1 \
      -f /tmp/undelete-restore.sql \
      "postgres://postgres:<password>@127.0.0.1:5432/undelete_restore"

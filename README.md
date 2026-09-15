@@ -212,7 +212,10 @@ Exposed metrics (counters, except `undelete_outbox_backlog` which is a gauge):
 
 `undelete_outbox_failed_total` counts alerts that exhausted the fast lane
 (10 attempts) and entered the slow lane: they are deferred with a fresh
-budget after 6h, never abandoned. `undelete_outbox_backlog` counts
+budget after 6h, never abandoned for failing -- only retention removes them,
+like any other outbox row (`retention_days`, counted from creation): an alert
+still undeliverable after that many days is purged with the content it
+carries. `undelete_outbox_backlog` counts
 `pending`/`processing`/`failed`: `failed` rows are undelivered work, even
 while parked until their resweep deadline — excluding them would drop the
 gauge to zero precisely when every alert is stuck.

@@ -364,7 +364,9 @@ else
 fi
 
 echo "restore-media-test: restoring the database"
-gunzip -c "$dump" > "$workdir/restore.sql"
+# The dump is root:0600 (umask 077 in backup.sh, same as in production):
+# decompressed as root inside the container that mounts the work directory.
+docker exec "$dst_container" gunzip -c "/work/backups/$(basename "$dump")" > "$workdir/restore.sql"
 psql_in "$dst_container" "$dst_db" -q < "$workdir/restore.sql"
 
 # 3, not 4: AgACincrone is registered AFTER scripts/backup.sh ran above, so the

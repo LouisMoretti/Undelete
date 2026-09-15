@@ -466,3 +466,267 @@ func TestInvalidOwnerIsRefused(t *testing.T) {
 		}
 	}
 }
+
+func TestAddMediaBytesInvalidOwnerIsAccountedNotRefused(t *testing.T) {
+	limits := testLimits()
+	tr := mustTracker(t, limits, nil, nil)
+	ctx := context.Background()
+	// The bytes land AFTER the download already happened: unlike the gates,
+	// accounting cannot refuse -- and an invalid owner must leave no ledger
+	// behind it.
+	for _, owner := range []int64{0, -3} {
+		adm := tr.AddMediaBytes(ctx, owner, 100)
+		if !adm.Allowed {
+			t.Fatalf("AddMediaBytes(%d) = %+v, want allowed: the download already happened", owner, adm)
+		}
+		if adm.Quota != QuotaMediaBytes || adm.Limit != limits.MaxMediaBytes {
+			t.Fatalf("AddMediaBytes(%d) = %+v, want the media_bytes quota with the configured limit", owner, adm)
+		}
+		if _, _, _, seeded := tr.Usage(owner); seeded {
+			t.Fatalf("AddMediaBytes(%d) seeded the ledger, want no state for an invalid owner", owner)
+		}
+	}
+}
+
+func TestAddMediaBytesNegativeClampsToZero(t *testing.T) {
+	tr := mustTracker(t, testLimits(), nil, nil)
+	ctx := context.Background()
+
+	adm := tr.AddMediaBytes(ctx, 11, -50)
+	if !adm.Allowed || adm.Warn {
+		t.Fatalf("add -50 = %+v, want allowed without warn", adm)
+	}
+	if _, _, bytes, seeded := tr.Usage(11); !seeded || bytes != 0 {
+		t.Fatalf("usage bytes = (%d,%v), want (0,true): a negative add must not move the ledger", bytes, seeded)
+	}
+}
+
+func TestAddMediaBytesSeedsFromSourceOnFirstTouch(t *testing.T) {
+	src := &fakeSource{messages: 4, files: 1, bytes: 900}
+	tr := mustTracker(t, testLimits(), src, nil)
+	ctx := context.Background()
+
+	// Seeded bytes (900) already sit above the 500 warn threshold with no
+	// alert emitted yet: the first accounting warns, like a crossing.
+	adm := tr.AddMediaBytes(ctx, 11, 50)
+	if !adm.Allowed || !adm.Warn {
+		t.Fatalf("add 50 = %+v, want allowed WITH the warn for seeded-into-saturation", adm)
+	}
+	msgs, files, bytes, seeded := tr.Usage(11)
+	if !seeded || msgs != 4 || files != 1 || bytes != 950 {
+		t.Fatalf("usage = (%d,%d,%d,%v), want (4,1,950,true)", msgs, files, bytes, seeded)
+	}
+	if got := src.totalCalls(); got < 3 {
+		t.Fatalf("first-touch accounting cost %d source queries, want at least the 3 seeding reads", got)
+	}
+}
+
+func TestAddMediaBytesSourceFailureFailsOpen(t *testing.T) {
+	src := &fakeSource{err: fmt.Errorf("database away")}
+	tr := mustTracker(t, testLimits(), src, nil)
+
+	adm := tr.AddMediaBytes(context.Background(), 11, 100)
+	if !adm.Allowed {
+		t.Fatalf("add on source failure = %+v, want fail-open allowed", adm)
+	}
+	if _, _, bytes, seeded := tr.Usage(11); seeded || bytes != 100 {
+		t.Fatalf("usage bytes = (%d,%v), want (100,false): in-memory growth until the resync heals it", bytes, seeded)
+	}
+}
+
+func TestResyncClampsNegativeSourceValues(t *testing.T) {
+	src := &fakeSource{messages: -5, files: -2, bytes: -100}
+	tr := mustTracker(t, testLimits(), src, nil)
+
+	if adm := tr.AdmitCapture(context.Background(), 11); !adm.Allowed {
+		t.Fatalf("admit = %+v, want allowed: negative source counts clamp to zero", adm)
+	}
+	msgs, files, bytes, seeded := tr.Usage(11)
+	if !seeded || msgs != 1 || files != 0 || bytes != 0 {
+		t.Fatalf("usage = (%d,%d,%d,%v), want (1,0,0,true)", msgs, files, bytes, seeded)
+	}
+}
+
+// failMessagesSource fails a single UsageSource method: the resync is
+// all-or-nothing, so one failing query must fail the whole resync open.
+type failMessagesSource struct {
+	*fakeSource
+}
+
+func (s failMessagesSource) CountMessages(context.Context, int64) (int64, error) {
+	return 0, fmt.Errorf("messages count away")
+}
+
+func TestPartialSourceFailureFailsOpen(t *testing.T) {
+	src := failMessagesSource{&fakeSource{messages: 0, files: 0, bytes: 0}}
+	tr := mustTracker(t, testLimits(), src, nil)
+
+	if adm := tr.AdmitCapture(context.Background(), 11); !adm.Allowed {
+		t.Fatalf("admit on partial source failure = %+v, want fail-open allowed", adm)
+	}
+	if _, _, _, seeded := tr.Usage(11); seeded {
+		t.Fatalf("partial failure seeded the ledger: the resync must be all-or-nothing")
+	}
+}
+
+func TestResyncUnknownTenantCreatesNoState(t *testing.T) {
+	// Direct resync for a never-touched tenant exercises the same branch as
+	// a tenant evicted while its queries ran: the source is read, then the
+	// missing ledger is left alone instead of materialising ghost state.
+	src := &fakeSource{messages: 7, files: 2, bytes: 100}
+	tr := mustTracker(t, testLimits(), src, nil)
+	ctx := context.Background()
+
+	tr.resync(ctx, 777)
+	if got := src.totalCalls(); got != 3 {
+		t.Fatalf("resync cost %d source queries, want exactly 3", got)
+	}
+	if _, _, _, seeded := tr.Usage(777); seeded {
+		t.Fatal("resync for an unknown tenant seeded state: eviction would leak back in")
+	}
+	// The tenant still seeds normally on its next admission.
+	if adm := tr.AdmitCapture(ctx, 777); !adm.Allowed {
+		t.Fatalf("admit after ghost resync = %+v, want allowed", adm)
+	}
+	if msgs, _, _, seeded := tr.Usage(777); !seeded || msgs != 8 {
+		t.Fatalf("usage messages = (%d,%v), want (8,true)", msgs, seeded)
+	}
+}
+
+func TestCaptureRateRefusalNeverWarns(t *testing.T) {
+	limits := testLimits()
+	limits.CapturesPerMinute = 2
+	tr := mustTracker(t, limits, nil, nil)
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if adm := tr.AdmitCapture(ctx, 11); !adm.Allowed {
+			t.Fatalf("admit %d refused: %+v", i, adm)
+		}
+	}
+	adm := tr.AdmitCapture(ctx, 11)
+	if adm.Allowed || adm.Quota != QuotaCaptureRate {
+		t.Fatalf("3rd admit = %+v, want a capture_rate refusal", adm)
+	}
+	if adm.Warn {
+		t.Fatalf("rate refusal = %+v, want Warn=false: under a flood a warning per refusal would be the flood", adm)
+	}
+	if adm.Usage != 2 || adm.Limit != 2 {
+		t.Fatalf("rate refusal quotes usage=%d limit=%d, want 2/2", adm.Usage, adm.Limit)
+	}
+}
+
+func TestRefusedVolumeStillSpendsRateBudget(t *testing.T) {
+	limits := testLimits()
+	limits.MaxMessages = 1
+	limits.CapturesPerMinute = 3
+	tr := mustTracker(t, limits, nil, nil)
+	ctx := context.Background()
+
+	if adm := tr.AdmitCapture(ctx, 11); !adm.Allowed {
+		t.Fatalf("first admit = %+v, want allowed", adm)
+	}
+	// The message quota is now exhausted, but each refused update was load
+	// either way: the rate budget keeps draining until the refusal flips to
+	// the rate quota.
+	for i := 0; i < 2; i++ {
+		adm := tr.AdmitCapture(ctx, 11)
+		if adm.Allowed || adm.Quota != QuotaMessages {
+			t.Fatalf("refused admit %d = %+v, want a messages refusal", i, adm)
+		}
+	}
+	adm := tr.AdmitCapture(ctx, 11)
+	if adm.Allowed || adm.Quota != QuotaCaptureRate {
+		t.Fatalf("4th admit = %+v, want a capture_rate refusal: refused volume spends rate", adm)
+	}
+}
+
+func TestMediaFilesWarnOnceThenRefuse(t *testing.T) {
+	tr := mustTracker(t, testLimits(), nil, nil)
+	ctx := context.Background()
+
+	// Threshold is 5/100*50 = 2: file 1 silent, file 2 warns once.
+	if adm := tr.AdmitMediaFile(ctx, 11); !adm.Allowed || adm.Warn {
+		t.Fatalf("file 1 = %+v, want allowed without warn", adm)
+	}
+	if adm := tr.AdmitMediaFile(ctx, 11); !adm.Allowed || !adm.Warn {
+		t.Fatalf("file 2 = %+v, want allowed WITH the pre-saturation warn", adm)
+	}
+	for i := 3; i <= 5; i++ {
+		adm := tr.AdmitMediaFile(ctx, 11)
+		if !adm.Allowed || adm.Warn {
+			t.Fatalf("file %d = %+v, want allowed without a second warn", i, adm)
+		}
+	}
+	adm := tr.AdmitMediaFile(ctx, 11)
+	if adm.Allowed || !adm.Warn || adm.Quota != QuotaMediaFiles {
+		t.Fatalf("file 6 = %+v, want a fresh media_files refusal with warn", adm)
+	}
+	if adm.Usage != 5 || adm.Limit != 5 {
+		t.Fatalf("refusal quotes usage=%d limit=%d, want 5/5", adm.Usage, adm.Limit)
+	}
+	if adm := tr.AdmitMediaFile(ctx, 11); adm.Allowed || adm.Warn {
+		t.Fatalf("repeat = %+v, want a silent memoised refusal", adm)
+	}
+}
+
+func TestTinyLimitWarnsOnFirstAdmit(t *testing.T) {
+	// limit 1 at 50% floors the threshold to zero: the very first admission
+	// warns. Safe direction -- an absurd limit alerts early, never silently.
+	limits := testLimits()
+	limits.MaxMessages = 1
+	tr := mustTracker(t, limits, nil, nil)
+
+	adm := tr.AdmitCapture(context.Background(), 11)
+	if !adm.Allowed || !adm.Warn {
+		t.Fatalf("first admit at limit 1 = %+v, want allowed WITH the warn", adm)
+	}
+}
+
+func TestWarnThresholdMath(t *testing.T) {
+	for _, tc := range []struct {
+		limit int64
+		pct   int
+		want  int64
+	}{
+		{limit: 10, pct: 50, want: 5},
+		{limit: 5, pct: 50, want: 2},
+		{limit: 1, pct: 50, want: 0},
+		{limit: 100000, pct: 80, want: 80000},
+	} {
+		got := Limits{WarnPercent: tc.pct}.warnThreshold(tc.limit)
+		if got != tc.want {
+			t.Fatalf("warnThreshold(%d at %d%%) = %d, want %d", tc.limit, tc.pct, got, tc.want)
+		}
+	}
+	// Absurd limit: exact integer math must not overflow the product -- the
+	// threshold stays inside [0, limit].
+	huge := int64(9000000000000000000)
+	got := Limits{WarnPercent: 99}.warnThreshold(huge)
+	if got != 8910000000000000000 {
+		t.Fatalf("warnThreshold(huge at 99%%) = %d, want 8910000000000000000", got)
+	}
+	if got < 0 || got > huge {
+		t.Fatalf("warnThreshold(huge) = %d, want inside [0, %d]", got, huge)
+	}
+}
+
+func TestConcurrentAddMediaBytesIsExact(t *testing.T) {
+	tr := mustTracker(t, testLimits(), nil, nil)
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				tr.AddMediaBytes(ctx, 11, 7)
+			}
+		}()
+	}
+	wg.Wait()
+	if _, _, bytes, _ := tr.Usage(11); bytes != 8*50*7 {
+		t.Fatalf("ledger bytes = %d, want exactly %d", bytes, 8*50*7)
+	}
+}

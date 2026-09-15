@@ -395,23 +395,24 @@ func runBacklogLoop(ctx context.Context, usersRepo tenantLister, outboxRepo back
 //
 // The media purge closes the same cycle on disk, and runs LAST: it deletes
 // blobs and repairs the database/filesystem discrepancies a crash leaves
-// behind, which is the slowest and the only I/O-bound phase. A failure there
-// must not cost the text retention, which is why it does not `continue` before
-// the summary log.
-// runRetentionLoop runs runRetentionOnce on every tick of interval
-// (retentionInterval in production). The interval is a parameter rather than
-// the constant so the loop mechanics -- tick, cycle, stop on shutdown -- are
-// unit-testable without waiting a day.
+// behind, which is the slowest and the only I/O-bound phase.
+//
+// runRetentionLoop runs runRetentionOnce at start, then on every tick of
+// interval (retentionInterval in production). The first cycle is not deferred
+// to the first tick: a process restarted more often than once per interval
+// (deploys, crashes) would otherwise never purge, and data would outlive the
+// retention_days /privacy announces. The interval is a parameter rather than
+// the constant so the loop mechanics are unit-testable without waiting a day.
 func runRetentionLoop(ctx context.Context, usersRepo tenantLister, messagesRepo messageRetention, outboxRepo outboxRetention, mediaPurger mediaRetention, logger *slog.Logger, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
+		runRetentionOnce(ctx, usersRepo, messagesRepo, outboxRepo, mediaPurger, logger)
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			runRetentionOnce(ctx, usersRepo, messagesRepo, outboxRepo, mediaPurger, logger)
 		}
 	}
 }
@@ -419,9 +420,10 @@ func runRetentionLoop(ctx context.Context, usersRepo tenantLister, messagesRepo 
 // runRetentionOnce performs a single retention cycle: text messages, then the
 // outbox payloads (which hold user content and would otherwise escape
 // retention_days), then the media tree -- last because it is the slowest and
-// the only I/O-bound phase. A failing phase skips the later ones, but once
-// the media phase is reached its failure no longer costs the cycle: the text
-// retention is what the summary reports.
+// the only I/O-bound phase. The phases are independent: each one logs its own
+// failure and the next still runs, so an outage of one (a failing text purge)
+// never starves the others (the media tree) of their daily pass. Only a failed
+// tenant listing skips the cycle, since no phase can run without it.
 //
 // Split out of runRetentionLoop so the phase ordering is unit-testable: the
 // loop itself only owns the ticker, and a slow or failing purge must never
@@ -436,11 +438,15 @@ func runRetentionOnce(ctx context.Context, usersRepo tenantLister, messagesRepo 
 	purged, err := messagesRepo.PurgeExpired(ctx, tenants)
 	if err != nil {
 		logger.Error("retention purge: failed", slog.String("error", err.Error()), slog.Int64("purged_before_error", purged))
+	}
+	if ctx.Err() != nil {
 		return
 	}
 	purgedOutbox, err := outboxRepo.PurgeExpired(ctx, tenants)
 	if err != nil {
 		logger.Error("outbox retention purge: failed", slog.String("error", err.Error()), slog.Int64("purged_before_error", purgedOutbox))
+	}
+	if ctx.Err() != nil {
 		return
 	}
 	mediaStats, err := mediaPurger.Run(ctx, tenants)

@@ -580,22 +580,22 @@ func TestRunBacklogLoopPublishesCountToGauge(t *testing.T) {
 	}
 }
 
-// TestRunStopsOnMigrationFailure pins the boot order at the unit level: with
-// a loadable configuration, run() attempts the migrations with the owner DSN
-// BEFORE anything else -- the failure it surfaces is the migration
-// connection's, not the application pool's and not a configuration one. The
-// migration DSN points at a unix socket directory that cannot exist, so the
-// connection fails instantly and without any network.
-func TestRunStopsOnMigrationFailure(t *testing.T) {
+// TestRunTakesTheInstanceLockFirst pins the boot order at the unit level:
+// with a loadable configuration, run() takes the instance lock BEFORE
+// anything else, migrations included (a new version must not migrate under
+// an old one still serving) -- and an unreachable database fails the boot at
+// once instead of waiting. Both DSNs point at unix socket directories that
+// cannot exist, so the connections fail instantly and without any network.
+func TestRunTakesTheInstanceLockFirst(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://app:app@/app?host=/tmp/opencode/no-such-app-socket&sslmode=disable")
 	t.Setenv("MIGRATION_DATABASE_URL", "postgres://mig:mig@/mig?host=/tmp/opencode/no-such-socket&sslmode=disable")
 	t.Setenv("TELEGRAM_BOT_TOKEN", "0:test-token")
 
 	err := run(discardLogger())
 	if err == nil {
-		t.Fatal("run() with an unreachable migration DSN = nil, want the migration failure")
+		t.Fatal("run() with an unreachable database = nil, want the instance lock failure")
 	}
-	if !strings.Contains(err.Error(), "connecting for migrations") {
-		t.Fatalf("run() error = %q, want the migration failure: migrations must run before the pool opens", err)
+	if !strings.Contains(err.Error(), "connecting for the instance lock") {
+		t.Fatalf("run() error = %q, want the instance lock failure: it must precede the migrations", err)
 	}
 }

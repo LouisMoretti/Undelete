@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -106,8 +107,28 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
+
+	// One bot per database, enforced before anything runs -- migrations
+	// included, so a new version never migrates under an old one still
+	// serving. A second process waits here until the first one stops.
+	lock, err := storage.AcquireInstanceLock(signalCtx, cfg.DatabaseURL, logger)
+	if err != nil {
+		return err
+	}
+	ctx, stop := context.WithCancelCause(signalCtx)
+	lockDone := make(chan struct{})
+	go func() {
+		defer close(lockDone)
+		if err := lock.Hold(ctx); errors.Is(err, storage.ErrInstanceLockLost) {
+			stop(err)
+		}
+	}()
+	defer func() {
+		stop(nil)
+		<-lockDone
+	}()
 
 	// Migrations applied with the owner DSN, BEFORE the application pool
 	// opens: the undelete_app role has no DDL rights.
@@ -274,13 +295,20 @@ func run(logger *slog.Logger) error {
 	logger.Info("poller starting", slog.Any("allowed_updates", telegram.AllowedUpdates()))
 
 	err = poller.Run(ctx, handler.HandleUpdate)
-	// Signal-driven shutdown cancels ctx: we wait for retention and the outbox
-	// to finish their current iteration before closing the pool, otherwise a
-	// leased alert would stay 'processing' until the lease expires and could
-	// be redelivered on restart.
-	stop()
+	// Read before stop() below cancels ctx for everyone: whether the poller
+	// returned because of a signal, a lost instance lock, or on its own.
+	signalled := signalCtx.Err() != nil
+	cause := context.Cause(ctx)
+	// Shutdown cancels ctx: we wait for retention and the outbox to finish
+	// their current iteration before closing the pool, otherwise a leased
+	// alert would stay 'processing' until the lease expires and could be
+	// redelivered on restart.
+	stop(nil)
 	wg.Wait()
-	if ctx.Err() != nil {
+	switch {
+	case errors.Is(cause, storage.ErrInstanceLockLost):
+		return cause
+	case signalled:
 		logger.Info("shutdown requested, clean stop")
 		return nil
 	}

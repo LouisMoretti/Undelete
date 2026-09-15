@@ -247,6 +247,19 @@ volume is preserved in all cases.
 `docker compose ps` must show `postgres` *healthy* and `bot` *running*. The
 bot waits for `service_healthy` on Postgres: a slightly slow start is normal.
 
+**One bot per database.** At boot, before its migrations, the bot takes a
+PostgreSQL session advisory lock (`storage.InstanceLockKey`) and holds it for
+its whole life: the tenant exclusion that keeps `/delete_my_data` honest lives
+in the process memory, so a second process would bring back every race it
+excludes. A second bot on the same database logs
+`another bot instance holds the instance lock: waiting for it to stop` and
+starts only once the first one exits -- during a rollout that is a few seconds
+at most. A bot stuck on that line otherwise means another container (a stray
+`docker compose run`, a second checkout) is connected to this database: find
+it with `docker ps`. If the lock's session drops and another process takes
+the lock first, the bot exits with `instance lock was taken over` rather than
+run alongside it.
+
 ### Step 4 — Verification
 
 **a. HTTP probes** — on `:9090`, internal to the Docker network (the port is

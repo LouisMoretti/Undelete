@@ -13,7 +13,16 @@
 -- default privileges were never configured would otherwise leave the bot
 -- without access. The grants below are the ones the defaults already give:
 -- on a configured database this changes nothing.
-REVOKE ALL ON schema_migrations FROM undelete_app;
+--
+-- The ledger is created by the Go runner, not by a migration: a replay of the
+-- SQL files without it (scripts/restore-media-test.sh) has nothing to revoke.
+DO $$
+BEGIN
+    IF to_regclass('public.schema_migrations') IS NOT NULL THEN
+        REVOKE ALL ON schema_migrations FROM undelete_app;
+    END IF;
+END
+$$;
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON users, business_connections, messages TO undelete_app;
 GRANT USAGE, SELECT ON SEQUENCE users_id_seq, messages_id_seq TO undelete_app;

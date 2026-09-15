@@ -121,6 +121,7 @@ type Handler struct {
 	// every quota check (unit tests without quotas); production always wires
 	// the process tracker.
 	quota  *quotas.Tracker
+	retry  *transientRetry
 	logger *slog.Logger
 }
 
@@ -176,6 +177,7 @@ func NewHandler(businessSvc businessService, messagesRepo messageStore, mediaRep
 		business: businessSvc,
 		messages: messagesRepo,
 		media:    mediaRepo,
+		retry:    newTransientRetry(),
 		logger:   logger,
 	}
 	for _, opt := range opts {
@@ -200,8 +202,13 @@ func connectionRefused(err error) bool {
 		errors.Is(err, business.ErrConnectionOwnerConflict)
 }
 
-// HandleUpdate implements telegram.Handler.
+// HandleUpdate implements telegram.Handler. A transient failure is retried in
+// place (cf. transientRetry) before the poller gets to advance past it.
 func (h *Handler) HandleUpdate(ctx context.Context, u telegram.Update) error {
+	return h.retry.run(ctx, func() error { return h.handleUpdate(ctx, u) })
+}
+
+func (h *Handler) handleUpdate(ctx context.Context, u telegram.Update) error {
 	switch {
 	case u.BusinessConnection != nil:
 		return h.business.HandleBusinessConnection(ctx, *u.BusinessConnection)

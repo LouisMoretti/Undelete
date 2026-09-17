@@ -13,6 +13,7 @@
 | View bot logs | `docker compose logs -f bot` |
 | Stop stack | `docker compose down` (never `-v` — deletes the DB volume) |
 | Preflight before deploy | `sh scripts/preflight.sh` |
+| Go toolchain | not on system PATH — wrap Go/make commands in `nix-shell --run '...'` (non-pure shell, rtk filtering applies automatically; don't `\| tail` just to save tokens) |
 
 ## Project Structure
 - `bot/` — Go 1.25 module (`github.com/LouisMoretti/Undelete/bot`)

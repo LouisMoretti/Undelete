@@ -38,6 +38,15 @@ case "$BACKUP_RETENTION_DAYS" in
         echo "backup: invalid BACKUP_RETENTION_DAYS '${BACKUP_RETENTION_DAYS}' (expected a positive number of days)" >&2
         exit 1
         ;;
+    # A leading zero makes the shell arithmetic below read the value as octal:
+    # '010' would silently mean 8 days, and '08'/'09' are not octal at all and
+    # abort the script with "value too great for base" -- no purge, no dump.
+    # Rejected here so both land on this message instead. '0' alone is left to
+    # the positivity check below, which words it the same way.
+    0?*)
+        echo "backup: invalid BACKUP_RETENTION_DAYS '${BACKUP_RETENTION_DAYS}' (expected a positive number of days, written without a leading zero)" >&2
+        exit 1
+        ;;
 esac
 if [ "$BACKUP_RETENTION_DAYS" -lt 1 ]; then
     echo "backup: invalid BACKUP_RETENTION_DAYS '${BACKUP_RETENTION_DAYS}' (expected a positive number of days)" >&2

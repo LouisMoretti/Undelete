@@ -396,6 +396,23 @@ func TestRunRetentionOnceRunsEveryPhaseDespiteFailures(t *testing.T) {
 			t.Fatal("every phase must have run despite the media failure")
 		}
 	})
+
+	t.Run("shutdown during media skips the summary", func(t *testing.T) {
+		tenants := &fakeTenantLister{tenants: testTenants(11)}
+		ctx, cancel := context.WithCancel(context.Background())
+		// The shutdown lands inside the last phase, where the two earlier
+		// early returns can no longer catch it.
+		media := &fakeMediaRetention{afterRun: cancel}
+		// watch is left empty: this handler only records, the cancel above
+		// drives the test.
+		handler := &logCancellingHandler{cancel: func() {}}
+
+		runRetentionOnce(ctx, tenants, &phaseRecorder{}, &phaseRecorder{}, media, slog.New(handler))
+
+		if handler.seen("retention purge complete") {
+			t.Fatalf("cycle cut short by a shutdown still logged the summary; messages = %v", handler.msgs)
+		}
+	})
 }
 
 // cancellingPurge simulates a shutdown arriving during the text purge.

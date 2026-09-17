@@ -500,6 +500,13 @@ func runRetentionOnce(ctx context.Context, usersRepo tenantLister, messagesRepo 
 	if err != nil && ctx.Err() == nil {
 		logger.Error("media retention purge: failed", slog.String("error", err.Error()))
 	}
+	// Same early return as the two phases above: a cycle cut short by a
+	// shutdown must not close on a "complete" line carrying the counts of the
+	// part that did run -- the media tree still holds blobs past their
+	// retention, and the summary would claim otherwise.
+	if ctx.Err() != nil {
+		return
+	}
 	logger.Info("retention purge complete",
 		append([]any{
 			slog.Int64("purged", purged),

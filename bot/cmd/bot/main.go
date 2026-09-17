@@ -446,6 +446,15 @@ func runRetentionLoop(ctx context.Context, usersRepo tenantLister, messagesRepo 
 	defer ticker.Stop()
 
 	for {
+		// Checked before the cycle, not only after it: a shutdown that arrives
+		// while the migrations or the pool are still opening would otherwise
+		// spend a boot pass against a dying context and log its failures as if
+		// the purge had broken, on what is a clean stop.
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		runRetentionOnce(ctx, usersRepo, messagesRepo, outboxRepo, mediaPurger, logger)
 		select {
 		case <-ctx.Done():

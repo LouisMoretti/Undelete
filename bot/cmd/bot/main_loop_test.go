@@ -279,6 +279,30 @@ func TestRunRetentionLoopRunsACycleAtStart(t *testing.T) {
 	}
 }
 
+// TestRunRetentionLoopSkipsTheBootPassOnShutdown pins the other half of the
+// boot pass: a shutdown that arrived before the loop started (a SIGTERM during
+// the migrations or the pool open) cancels it entirely. Spending it on a dying
+// context would log every phase's context error as a broken purge, on what is
+// a clean stop.
+//
+// Unlike the outbox, media and backlog loops -- where a pre-cancelled context
+// is the way their single iteration is made deterministic -- this loop owes
+// its first cycle to a live context only.
+func TestRunRetentionLoopSkipsTheBootPassOnShutdown(t *testing.T) {
+	tenants := &fakeTenantLister{tenants: testTenants(11)}
+	msgs := &phaseRecorder{}
+	ob := &phaseRecorder{}
+	media := &fakeMediaRetention{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	runRetentionLoop(ctx, tenants, msgs, ob, media, discardLogger(), time.Hour)
+
+	if tenants.calls != 0 || len(msgs.calls) != 0 || len(ob.calls) != 0 || len(media.calls) != 0 {
+		t.Fatalf("listings = %d, phases = %v/%v/%v; want no cycle at all", tenants.calls, msgs.calls, ob.calls, media.calls)
+	}
+}
+
 // TestRunFailsFastWithoutConfiguration pins the startup contract: without
 // any environment, run returns the configuration error instead of booting
 // half-wired (no migrations, no pool, no Telegram client).

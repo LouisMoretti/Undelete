@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -627,11 +628,18 @@ func TestRunBacklogLoopPublishesCountToGauge(t *testing.T) {
 // takes the lock, a new version cannot migrate under an old one still serving
 // (the lock is advisory: upgrading FROM a pre-lock binary still requires
 // stopping it first) -- and an unreachable database fails the boot at once
-// instead of waiting. Both DSNs point at unix socket directories that
-// cannot exist, so the connections fail instantly and without any network.
+// instead of waiting.
+//
+// Both DSNs point at a unix socket directory the test never creates, inside
+// its own t.TempDir(): the connections fail instantly, without any network,
+// and without depending on a path outside the test that something else could
+// create. They stay distinct DSNs because config.Load() rejects equal ones.
 func TestRunTakesTheInstanceLockFirst(t *testing.T) {
-	t.Setenv("DATABASE_URL", "postgres://app:app@/app?host=/tmp/opencode/no-such-app-socket&sslmode=disable")
-	t.Setenv("MIGRATION_DATABASE_URL", "postgres://mig:mig@/mig?host=/tmp/opencode/no-such-socket&sslmode=disable")
+	missing := t.TempDir()
+	appSocket := filepath.Join(missing, "no-such-app-socket")
+	migrationSocket := filepath.Join(missing, "no-such-migration-socket")
+	t.Setenv("DATABASE_URL", "postgres://app:app@/app?host="+appSocket+"&sslmode=disable")
+	t.Setenv("MIGRATION_DATABASE_URL", "postgres://mig:mig@/mig?host="+migrationSocket+"&sslmode=disable")
 	t.Setenv("TELEGRAM_BOT_TOKEN", "0:test-token")
 
 	err := run(discardLogger())

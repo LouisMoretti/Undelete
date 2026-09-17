@@ -187,6 +187,11 @@ func TestTransientRetryDegradesAfterAnExhaustedBudget(t *testing.T) {
 	}
 }
 
+// TestTransientRetryHonoursRetryAfterWithinItsCap pins both halves of the 429
+// wait: the server's retry_after is a floor the retry never undercuts (coming
+// back early only re-hits the limit), and an abusive one is capped so the
+// poller shard is not frozen. The jitter on top is upward only, a quarter of
+// the wait at most, so shards throttled together do not wake together.
 func TestTransientRetryHonoursRetryAfterWithinItsCap(t *testing.T) {
 	clock := &fakeClock{now: time.Unix(1_800_000_000, 0)}
 	r := newTestRetry(clock)
@@ -196,9 +201,35 @@ func TestTransientRetryHonoursRetryAfterWithinItsCap(t *testing.T) {
 	calls = 0
 	_ = r.run(context.Background(), failing(1, &telegram.APIError{Code: 429, RetryAfter: 3600}, &calls))
 
-	want := []time.Duration{2 * time.Second, transientMaxWait}
-	if len(clock.waits) != 2 || clock.waits[0] != want[0] || clock.waits[1] != want[1] {
-		t.Fatalf("waits = %v, want %v (retry_after, then capped)", clock.waits, want)
+	if len(clock.waits) != 2 {
+		t.Fatalf("waits = %v, want two (retry_after, then capped)", clock.waits)
+	}
+	for i, base := range []time.Duration{2 * time.Second, transientMaxWait} {
+		if clock.waits[i] < base || clock.waits[i] > base+base/4 {
+			t.Fatalf("wait %d = %v, want within [%v, %v]", i, clock.waits[i], base, base+base/4)
+		}
+	}
+}
+
+// TestTransientRetryJittersRetryAfterAcrossShards pins the desynchronisation
+// itself: N callers throttled by the same 429 must not all come back at the
+// same instant. Repeated waits on one retry_after spread over more than one
+// value -- the jitter is real, not a constant offset.
+func TestTransientRetryJittersRetryAfterAcrossShards(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1_800_000_000, 0)}
+	r := newTestRetry(clock)
+
+	for range 20 {
+		calls := 0
+		_ = r.run(context.Background(), failing(1, &telegram.APIError{Code: 429, RetryAfter: 4}, &calls))
+	}
+
+	distinct := map[time.Duration]struct{}{}
+	for _, w := range clock.waits {
+		distinct[w] = struct{}{}
+	}
+	if len(distinct) < 2 {
+		t.Fatalf("waits = %v, want more than one value: shards would wake together", clock.waits)
 	}
 }
 

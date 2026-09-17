@@ -32,6 +32,8 @@ const (
 	transientBaseDelay = 500 * time.Millisecond
 	// transientMaxWait caps one wait, a server-provided retry_after included:
 	// the retry runs on a poller shard, and the next getUpdates waits for it.
+	// The jitter in wait() is added on top of the capped value, so a single
+	// wait reaches at most transientMaxWait * 1.25.
 	transientMaxWait = 5 * time.Second
 	// transientCooldown is how long an exhausted budget keeps the handler in
 	// degraded mode: every update then gets a single attempt, so a real
@@ -105,12 +107,20 @@ func (r *transientRetry) healthy() {
 }
 
 // wait honours a 429's retry_after (the service's own recovery timeline),
-// otherwise backs off exponentially with jitter so the shards that failed on
-// the same blip do not all come back at the same instant.
+// otherwise backs off exponentially. Both paths jitter, so the shards that
+// failed on the same blip do not all come back at the same instant and
+// re-create it.
+//
+// The 429 path jitters UPWARD only: retry_after is a floor, and coming back
+// before it re-hits the same limit and spends an attempt for nothing. The
+// spread is a quarter of the wait, which is enough to separate the shards
+// without pushing the delay to a different order of magnitude.
 func (r *transientRetry) wait(err error, retry int) time.Duration {
 	var apiErr *telegram.APIError
 	if errors.As(err, &apiErr) && apiErr.IsRateLimited() {
-		return min(time.Duration(apiErr.RetryAfter)*time.Second, r.maxWait)
+		// IsRateLimited guarantees retry_after >= 1s, so d is never 0 here.
+		d := min(time.Duration(apiErr.RetryAfter)*time.Second, r.maxWait)
+		return d + rand.N(d/4+1)
 	}
 	d := min(r.baseDelay<<(retry-1), r.maxWait)
 	if d <= 0 {

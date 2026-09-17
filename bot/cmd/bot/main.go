@@ -111,8 +111,15 @@ func run(logger *slog.Logger) error {
 	defer stopSignals()
 
 	// One bot per database, enforced before anything runs -- migrations
-	// included, so a new version never migrates under an old one still
-	// serving. A second process waits here until the first one stops.
+	// included, so that once every binary in rotation takes this lock, a new
+	// version never migrates under an old one still serving. A second process
+	// waits here until the first one stops.
+	//
+	// The guarantee is only as good as the rotation: a Postgres advisory lock
+	// binds the sessions that ask for it, and a binary from before this lock
+	// existed never does. Upgrading FROM such a version therefore requires
+	// stopping the old process first -- otherwise this one acquires the lock
+	// unopposed and migrates while the old one still serves.
 	lock, err := storage.AcquireInstanceLock(signalCtx, cfg.DatabaseURL, logger)
 	if err != nil {
 		if signalCtx.Err() != nil {

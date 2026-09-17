@@ -623,9 +623,11 @@ func TestRunBacklogLoopPublishesCountToGauge(t *testing.T) {
 
 // TestRunTakesTheInstanceLockFirst pins the boot order at the unit level:
 // with a loadable configuration, run() takes the instance lock BEFORE
-// anything else, migrations included (a new version must not migrate under
-// an old one still serving) -- and an unreachable database fails the boot at
-// once instead of waiting. Both DSNs point at unix socket directories that
+// anything else, migrations included, so that once every binary in rotation
+// takes the lock, a new version cannot migrate under an old one still serving
+// (the lock is advisory: upgrading FROM a pre-lock binary still requires
+// stopping it first) -- and an unreachable database fails the boot at once
+// instead of waiting. Both DSNs point at unix socket directories that
 // cannot exist, so the connections fail instantly and without any network.
 func TestRunTakesTheInstanceLockFirst(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://app:app@/app?host=/tmp/opencode/no-such-app-socket&sslmode=disable")

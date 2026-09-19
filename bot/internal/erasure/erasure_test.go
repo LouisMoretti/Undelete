@@ -988,6 +988,37 @@ func TestDeleteOthersFailureKeepsErasureResumable(t *testing.T) {
 	}
 }
 
+// TestRequestWaitsForAnErasureInFlight pins that Request enters the tenant's
+// shared exclusion: while an erasure holds the exclusive side, no code can be
+// issued (a pending row landing between DeleteOthers and Complete would
+// survive the "everything is gone" answer). Once the erasure releases, the
+// same Request goes through.
+func TestRequestWaitsForAnErasureInFlight(t *testing.T) {
+	challenges := newChallenges()
+	service := newService(t, challenges, &fakeSteps{})
+
+	release, err := service.guard.Exclusive(context.Background(), testTenant.OwnerUserID)
+	if err != nil {
+		t.Fatalf("Exclusive: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := service.Request(ctx, testTenant); err == nil {
+		t.Fatal("Request went through while an erasure held the tenant exclusively")
+	}
+	if len(challenges.rows) != 0 {
+		t.Fatalf("a Request blocked by an erasure issued %d rows", len(challenges.rows))
+	}
+
+	release()
+	if _, err := service.Request(context.Background(), testTenant); err != nil {
+		t.Fatalf("Request after the erasure released: %v", err)
+	}
+	if len(challenges.rows) != 1 {
+		t.Fatalf("rows = %d after the erasure released, want 1", len(challenges.rows))
+	}
+}
+
 // TestConfirmWithCancelledContextFailsClosed covers the guard-acquisition
 // branch: when the tenant exclusion cannot be entered, nothing is claimed and
 // nothing is deleted. The empty-code subtest pins the order the other way: a

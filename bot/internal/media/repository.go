@@ -578,8 +578,13 @@ func (r *Repository) DeleteTenantBatch(ctx context.Context, ownerUserID int64, l
 	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			DELETE FROM media_files
-			WHERE id IN (SELECT id FROM media_files ORDER BY id LIMIT $1)
-		`, limit)
+			WHERE owner_user_id = $1
+			  AND id IN (
+				SELECT id FROM media_files
+				WHERE owner_user_id = $1
+				ORDER BY id LIMIT $2
+			  )
+		`, ownerUserID, limit)
 		if err != nil {
 			return err
 		}
@@ -658,9 +663,11 @@ func (r *Repository) DeleteStalePending(ctx context.Context, ownerUserID int64, 
 	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			DELETE FROM media_files
-			WHERE id IN (
+			WHERE owner_user_id = $4
+			  AND id IN (
 				SELECT id FROM media_files
-				WHERE status = 'pending'
+				WHERE owner_user_id = $4
+				  AND status = 'pending'
 				  AND (
 				        -- Retention is absolute: no metadata outlives it,
 				        -- requeued or not.
@@ -672,7 +679,7 @@ func (r *Repository) DeleteStalePending(ctx context.Context, ownerUserID int64, 
 				ORDER BY id
 				LIMIT $3
 			)
-		`, maxAge.Seconds(), retentionDays, limit)
+		`, maxAge.Seconds(), retentionDays, limit, ownerUserID)
 		if err != nil {
 			return err
 		}
@@ -700,15 +707,17 @@ func (r *Repository) DeletePurged(ctx context.Context, ownerUserID int64, grace 
 	err := r.db.InTenant(ctx, ownerUserID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			DELETE FROM media_files
-			WHERE id IN (
+			WHERE owner_user_id = $4
+			  AND id IN (
 				SELECT id FROM media_files
-				WHERE status = 'purged'
+				WHERE owner_user_id = $4
+				  AND status = 'purged'
 				  AND created_at < now() - make_interval(days => $1)
 				  AND updated_at < now() - make_interval(secs => $2)
 				ORDER BY id
 				LIMIT $3
 			)
-		`, retentionDays, grace.Seconds(), limit)
+		`, retentionDays, grace.Seconds(), limit, ownerUserID)
 		if err != nil {
 			return err
 		}

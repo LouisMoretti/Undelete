@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -86,10 +87,15 @@ func (p *phaseRecorder) PurgeExpired(context.Context, []users.TenantRetention) (
 type fakeMediaRetention struct {
 	calls []string
 	err   error
+	// afterRun, when set, runs at the end of every Run (e.g. a shutdown).
+	afterRun func()
 }
 
 func (f *fakeMediaRetention) Run(context.Context, []users.TenantRetention) (purge.Stats, error) {
 	f.calls = append(f.calls, "run")
+	if f.afterRun != nil {
+		f.afterRun()
+	}
 	return purge.Stats{FilesDeleted: 2}, f.err
 }
 
@@ -254,6 +260,50 @@ func TestRunRetentionLoopTicksCyclesAndStops(t *testing.T) {
 	}
 }
 
+// TestRunRetentionLoopRunsACycleAtStart pins the boot pass: the first cycle
+// runs before the first tick, so a process restarted more often than the
+// interval still purges.
+func TestRunRetentionLoopRunsACycleAtStart(t *testing.T) {
+	tenants := &fakeTenantLister{tenants: testTenants(11)}
+	msgs := &phaseRecorder{}
+	ob := &phaseRecorder{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Shut down as soon as the first cycle ends: with an hour-long interval,
+	// only a boot pass can have run by then.
+	media := &fakeMediaRetention{afterRun: cancel}
+
+	runRetentionLoop(ctx, tenants, msgs, ob, media, discardLogger(), time.Hour)
+
+	if len(msgs.calls) != 1 || len(ob.calls) != 1 || len(media.calls) != 1 {
+		t.Fatalf("cycles at start: messages %v, outbox %v, media %v; want exactly one each", msgs.calls, ob.calls, media.calls)
+	}
+}
+
+// TestRunRetentionLoopSkipsTheBootPassOnShutdown pins the other half of the
+// boot pass: a shutdown that arrived before the loop started (a SIGTERM during
+// the migrations or the pool open) cancels it entirely. Spending it on a dying
+// context would log every phase's context error as a broken purge, on what is
+// a clean stop.
+//
+// Unlike the outbox, media and backlog loops -- where a pre-cancelled context
+// is the way their single iteration is made deterministic -- this loop owes
+// its first cycle to a live context only.
+func TestRunRetentionLoopSkipsTheBootPassOnShutdown(t *testing.T) {
+	tenants := &fakeTenantLister{tenants: testTenants(11)}
+	msgs := &phaseRecorder{}
+	ob := &phaseRecorder{}
+	media := &fakeMediaRetention{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	runRetentionLoop(ctx, tenants, msgs, ob, media, discardLogger(), time.Hour)
+
+	if tenants.calls != 0 || len(msgs.calls) != 0 || len(ob.calls) != 0 || len(media.calls) != 0 {
+		t.Fatalf("listings = %d, phases = %v/%v/%v; want no cycle at all", tenants.calls, msgs.calls, ob.calls, media.calls)
+	}
+}
+
 // TestRunFailsFastWithoutConfiguration pins the startup contract: without
 // any environment, run returns the configuration error instead of booting
 // half-wired (no migrations, no pool, no Telegram client).
@@ -290,12 +340,12 @@ func TestRunRetentionOnceRunsPhasesInOrder(t *testing.T) {
 	}
 }
 
-// TestRunRetentionOnceSkipsLaterPhasesOnFailure pins the short-circuit: a
-// failing text purge skips the outbox and media phases (its own error is
-// already logged), and a failing outbox purge skips the media phase. The
-// media phase failure itself still closes the cycle.
-func TestRunRetentionOnceSkipsLaterPhasesOnFailure(t *testing.T) {
-	t.Run("messages failure skips outbox and media", func(t *testing.T) {
+// TestRunRetentionOnceRunsEveryPhaseDespiteFailures pins the phase
+// independence: a failing text purge must not starve the outbox and media
+// phases of their daily pass, and a failing outbox purge must not starve the
+// media phase. The media phase failure itself still closes the cycle.
+func TestRunRetentionOnceRunsEveryPhaseDespiteFailures(t *testing.T) {
+	t.Run("messages failure still runs outbox and media", func(t *testing.T) {
 		tenants := &fakeTenantLister{tenants: testTenants(11)}
 		msgs := &phaseRecorder{errOn: "purgeExpired"}
 		ob := &phaseRecorder{}
@@ -303,20 +353,34 @@ func TestRunRetentionOnceSkipsLaterPhasesOnFailure(t *testing.T) {
 
 		runRetentionOnce(context.Background(), tenants, msgs, ob, media, discardLogger())
 
-		if len(ob.calls) != 0 || len(media.calls) != 0 {
-			t.Fatalf("outbox calls = %v, media calls = %v; want none after a messages failure", ob.calls, media.calls)
+		if len(ob.calls) != 1 || len(media.calls) != 1 {
+			t.Fatalf("outbox calls = %v, media calls = %v; want one each after a messages failure", ob.calls, media.calls)
 		}
 	})
 
-	t.Run("outbox failure skips media", func(t *testing.T) {
+	t.Run("outbox failure still runs media", func(t *testing.T) {
 		tenants := &fakeTenantLister{tenants: testTenants(11)}
 		ob := &failingOutbox{}
 		media := &fakeMediaRetention{}
 
 		runRetentionOnce(context.Background(), tenants, &phaseRecorder{}, ob, media, discardLogger())
 
-		if len(media.calls) != 0 {
-			t.Fatalf("media calls = %v; want none after an outbox failure", media.calls)
+		if len(media.calls) != 1 {
+			t.Fatalf("media calls = %v; want one after an outbox failure", media.calls)
+		}
+	})
+
+	t.Run("shutdown between phases stops the cycle", func(t *testing.T) {
+		tenants := &fakeTenantLister{tenants: testTenants(11)}
+		ctx, cancel := context.WithCancel(context.Background())
+		msgs := &cancellingPurge{cancel: cancel}
+		ob := &phaseRecorder{}
+		media := &fakeMediaRetention{}
+
+		runRetentionOnce(ctx, tenants, msgs, ob, media, discardLogger())
+
+		if len(ob.calls) != 0 || len(media.calls) != 0 {
+			t.Fatalf("outbox calls = %v, media calls = %v; want none once shutdown began", ob.calls, media.calls)
 		}
 	})
 
@@ -333,6 +397,31 @@ func TestRunRetentionOnceSkipsLaterPhasesOnFailure(t *testing.T) {
 			t.Fatal("every phase must have run despite the media failure")
 		}
 	})
+
+	t.Run("shutdown during media skips the summary", func(t *testing.T) {
+		tenants := &fakeTenantLister{tenants: testTenants(11)}
+		ctx, cancel := context.WithCancel(context.Background())
+		// The shutdown lands inside the last phase, where the two earlier
+		// early returns can no longer catch it.
+		media := &fakeMediaRetention{afterRun: cancel}
+		// watch is left empty: this handler only records, the cancel above
+		// drives the test.
+		handler := &logCancellingHandler{cancel: func() {}}
+
+		runRetentionOnce(ctx, tenants, &phaseRecorder{}, &phaseRecorder{}, media, slog.New(handler))
+
+		if handler.seen("retention purge complete") {
+			t.Fatalf("cycle cut short by a shutdown still logged the summary; messages = %v", handler.msgs)
+		}
+	})
+}
+
+// cancellingPurge simulates a shutdown arriving during the text purge.
+type cancellingPurge struct{ cancel context.CancelFunc }
+
+func (c *cancellingPurge) PurgeExpired(context.Context, []users.TenantRetention) (int64, error) {
+	c.cancel()
+	return 0, context.Canceled
 }
 
 type failingOutbox struct{ calls []string }
@@ -533,22 +622,31 @@ func TestRunBacklogLoopPublishesCountToGauge(t *testing.T) {
 	}
 }
 
-// TestRunStopsOnMigrationFailure pins the boot order at the unit level: with
-// a loadable configuration, run() attempts the migrations with the owner DSN
-// BEFORE anything else -- the failure it surfaces is the migration
-// connection's, not the application pool's and not a configuration one. The
-// migration DSN points at a unix socket directory that cannot exist, so the
-// connection fails instantly and without any network.
-func TestRunStopsOnMigrationFailure(t *testing.T) {
-	t.Setenv("DATABASE_URL", "postgres://app:app@/app?host=/tmp/opencode/no-such-app-socket&sslmode=disable")
-	t.Setenv("MIGRATION_DATABASE_URL", "postgres://mig:mig@/mig?host=/tmp/opencode/no-such-socket&sslmode=disable")
+// TestRunTakesTheInstanceLockFirst pins the boot order at the unit level:
+// with a loadable configuration, run() takes the instance lock BEFORE
+// anything else, migrations included, so that once every binary in rotation
+// takes the lock, a new version cannot migrate under an old one still serving
+// (the lock is advisory: upgrading FROM a pre-lock binary still requires
+// stopping it first) -- and an unreachable database fails the boot at once
+// instead of waiting.
+//
+// Both DSNs point at a unix socket directory the test never creates, inside
+// its own t.TempDir(): the connections fail instantly, without any network,
+// and without depending on a path outside the test that something else could
+// create. They stay distinct DSNs because config.Load() rejects equal ones.
+func TestRunTakesTheInstanceLockFirst(t *testing.T) {
+	missing := t.TempDir()
+	appSocket := filepath.Join(missing, "no-such-app-socket")
+	migrationSocket := filepath.Join(missing, "no-such-migration-socket")
+	t.Setenv("DATABASE_URL", "postgres://app:app@/app?host="+appSocket+"&sslmode=disable")
+	t.Setenv("MIGRATION_DATABASE_URL", "postgres://mig:mig@/mig?host="+migrationSocket+"&sslmode=disable")
 	t.Setenv("TELEGRAM_BOT_TOKEN", "0:test-token")
 
 	err := run(discardLogger())
 	if err == nil {
-		t.Fatal("run() with an unreachable migration DSN = nil, want the migration failure")
+		t.Fatal("run() with an unreachable database = nil, want the instance lock failure")
 	}
-	if !strings.Contains(err.Error(), "connecting for migrations") {
-		t.Fatalf("run() error = %q, want the migration failure: migrations must run before the pool opens", err)
+	if !strings.Contains(err.Error(), "connecting for the instance lock") {
+		t.Fatalf("run() error = %q, want the instance lock failure: it must precede the migrations", err)
 	}
 }

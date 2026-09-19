@@ -9,7 +9,7 @@
 //
 // Deliberate corollary: the exposed series have NO labels, the list of names
 // is fixed and hardcoded in RenderPrometheus. Cardinality is therefore
-// bounded by construction (one series per name, eight in total), without any
+// bounded by construction (one series per name, ten in total), without any
 // runtime guardrail being necessary.
 package metrics
 
@@ -39,6 +39,13 @@ type Counters struct {
 	// crossing and one per fresh block -- never per update under sustained
 	// saturation.
 	quotaWarnings atomic.Int64
+	// updateRetries counts in-place retries of an update whose handling
+	// failed transiently (database blip, Telegram 429/5xx).
+	updateRetries atomic.Int64
+	// updatesDroppedTransient counts updates still failing transiently once
+	// their retry budget was spent: the poller advances past them, so each
+	// one is a capture lost to an outage rather than to a bug.
+	updatesDroppedTransient atomic.Int64
 }
 
 // std is the instance used by the binary. The counters are atomic: the poller
@@ -71,6 +78,9 @@ func (c *Counters) AddQuotaWarnings(n int64) { c.quotaWarnings.Add(n) }
 // being delivered, and a spike of deferred alerts would read as plain backlog.
 func (c *Counters) AddOutboxFailed(n int64) { c.outboxFailed.Add(n) }
 
+func (c *Counters) AddUpdateRetries(n int64)           { c.updateRetries.Add(n) }
+func (c *Counters) AddUpdatesDroppedTransient(n int64) { c.updatesDroppedTransient.Add(n) }
+
 // SetOutboxBacklog publishes the number of outbox rows still to be delivered.
 // It is a gauge: it goes up and down, unlike counters.
 func (c *Counters) SetOutboxBacklog(n int64) { c.outboxBacklog.Store(n) }
@@ -84,6 +94,9 @@ func AddDeletions(n int64)     { std.AddDeletions(n) }
 func SetOutboxBacklog(n int64) { std.SetOutboxBacklog(n) }
 func AddQuotaDrops(n int64)    { std.AddQuotaDrops(n) }
 func AddQuotaWarnings(n int64) { std.AddQuotaWarnings(n) }
+func AddUpdateRetries(n int64) { std.AddUpdateRetries(n) }
+
+func AddUpdatesDroppedTransient(n int64) { std.AddUpdatesDroppedTransient(n) }
 
 // ContentType is the MIME type of the Prometheus text exposition.
 const ContentType = "text/plain; version=0.0.4; charset=utf-8"
@@ -146,6 +159,18 @@ var allSeries = []series{
 		help:  "Total number of per-tenant volume-quota pre-saturation alerts (threshold crossings and fresh volume refusals, never rate refusals).",
 		kind:  "counter",
 		value: func(c *Counters) int64 { return c.quotaWarnings.Load() },
+	},
+	{
+		name:  "undelete_update_retries_total",
+		help:  "Total number of in-place retries of an update whose handling failed transiently (database connection, Telegram 429/5xx).",
+		kind:  "counter",
+		value: func(c *Counters) int64 { return c.updateRetries.Load() },
+	},
+	{
+		name:  "undelete_updates_dropped_transient_total",
+		help:  "Total number of updates skipped while still failing transiently after their retry budget (captures lost to an outage).",
+		kind:  "counter",
+		value: func(c *Counters) int64 { return c.updatesDroppedTransient.Load() },
 	},
 }
 

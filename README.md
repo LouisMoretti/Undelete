@@ -125,7 +125,8 @@ again once captures flow.
 Ledger accounting is approximate by design. The message admission is taken
 before the tenant-exclusion recheck and before the write: an update skipped as
 disabled-after-admit, or a write that fails after admission (message or media
-row), leaves its ledger unit counted with no database row behind it. Moving
+row), leaves its ledger unit counted with no database row behind it -- and so
+does the first attempt of an update retried after a transient failure. Moving
 the admission after the guard would hold the Shared side across the resync
 database reads -- a saturated tenant's slow source would then delay its own
 (and only its own, the guard is per-tenant) erasure path -- so the drift is
@@ -208,11 +209,23 @@ Exposed metrics (counters, except `undelete_outbox_backlog` which is a gauge):
 `undelete_updates_total`, `undelete_update_errors_total`,
 `undelete_outbox_retries_total`, `undelete_outbox_failed_total`,
 `undelete_deletions_total`, `undelete_outbox_backlog`,
-`undelete_quota_drops_total`, `undelete_quota_warnings_total`.
+`undelete_quota_drops_total`, `undelete_quota_warnings_total`,
+`undelete_update_retries_total`, `undelete_updates_dropped_transient_total`.
+
+An update whose handling fails on a transient cause (database connection
+lost or refused, serialization failure, Telegram 429/5xx) is retried in place
+up to 3 times with a jittered backoff (`undelete_update_retries_total`)
+before the poller advances past it. One that still fails is counted in
+`undelete_updates_dropped_transient_total`: a capture lost to an outage. After
+such a loss the handler gives every update a single attempt for 30s, so a
+real outage stalls the poller for one retry budget, not one per update.
 
 `undelete_outbox_failed_total` counts alerts that exhausted the fast lane
 (10 attempts) and entered the slow lane: they are deferred with a fresh
-budget after 6h, never abandoned. `undelete_outbox_backlog` counts
+budget after 6h, never abandoned for failing -- only retention removes them,
+like any other outbox row (`retention_days`, counted from creation): an alert
+still undeliverable after that many days is purged with the content it
+carries. `undelete_outbox_backlog` counts
 `pending`/`processing`/`failed`: `failed` rows are undelivered work, even
 while parked until their resweep deadline — excluding them would drop the
 gauge to zero precisely when every alert is stuck.

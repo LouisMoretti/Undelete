@@ -60,9 +60,11 @@ const (
 	knownPathsSQL   = "SELECT RELATIVE_PATH FROM MEDIA_FILES"
 	albumAnchorsSQL = "SELECT MEDIA_GROUP_ID, MIN(MESSAGE_ID)"
 
-	deleteTenantSQL = "DELETE FROM MEDIA_FILES WHERE ID IN (SELECT ID FROM MEDIA_FILES ORDER BY ID"
-	deleteStaleSQL  = "DELETE FROM MEDIA_FILES WHERE ID IN (SELECT ID FROM MEDIA_FILES WHERE STATUS = 'PENDING'"
-	deletePurgedSQL = "DELETE FROM MEDIA_FILES WHERE ID IN (SELECT ID FROM MEDIA_FILES WHERE STATUS = 'PURGED'"
+	// The batched DELETEs carry the owner predicate at both levels, on top of
+	// RLS: a tenant context that failed to apply must not widen them.
+	deleteTenantSQL = "DELETE FROM MEDIA_FILES WHERE OWNER_USER_ID = '11' AND ID IN (SELECT ID FROM MEDIA_FILES WHERE OWNER_USER_ID = '11' ORDER BY ID"
+	deleteStaleSQL  = "DELETE FROM MEDIA_FILES WHERE OWNER_USER_ID = '11' AND ID IN (SELECT ID FROM MEDIA_FILES WHERE OWNER_USER_ID = '11' AND STATUS = 'PENDING'"
+	deletePurgedSQL = "DELETE FROM MEDIA_FILES WHERE OWNER_USER_ID = '11' AND ID IN (SELECT ID FROM MEDIA_FILES WHERE OWNER_USER_ID = '11' AND STATUS = 'PURGED'"
 
 	// catalogueSQL is the prefix every catalogue read (selectColumns) starts
 	// with -- short on purpose: the full twenty-column list is pinned by the
@@ -1060,7 +1062,7 @@ func TestDeleteStalePendingKeepsBothDeadlines(t *testing.T) {
 	assertEveryQueryRanInsideInTenant(t, queries, 11)
 	got := firstQueryWithPrefix(t, queries, deleteStaleSQL)
 	for _, want := range []string{
-		"WHERE STATUS = 'PENDING'",
+		"AND STATUS = 'PENDING'",
 		"CREATED_AT < NOW() - MAKE_INTERVAL(DAYS => '14')",
 		"CREATED_AT < NOW() - MAKE_INTERVAL(SECS => '86400')",
 		"AND UPDATED_AT < NOW() - MAKE_INTERVAL(SECS => '86400')",
@@ -1090,7 +1092,7 @@ func TestDeletePurgedGatesOnRetentionAndGrace(t *testing.T) {
 	assertEveryQueryRanInsideInTenant(t, queries, 11)
 	got := firstQueryWithPrefix(t, queries, deletePurgedSQL)
 	for _, want := range []string{
-		"WHERE STATUS = 'PURGED'",
+		"AND STATUS = 'PURGED'",
 		"CREATED_AT < NOW() - MAKE_INTERVAL(DAYS => '14')",
 		"UPDATED_AT < NOW() - MAKE_INTERVAL(SECS => '3600')",
 		"LIMIT '100'",

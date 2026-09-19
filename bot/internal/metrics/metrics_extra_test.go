@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// TestPackageWrappersTouchTheDefaultInstance pins that the eight package-level
+// TestPackageWrappersTouchTheDefaultInstance pins that the ten package-level
 // helpers write to std (the instance the binary serves): a wrapper silently
 // detached from Default() would make production dashboards freeze. Deltas are
 // asserted rather than absolute values so the test stays repeatable in-process
@@ -21,6 +21,8 @@ func TestPackageWrappersTouchTheDefaultInstance(t *testing.T) {
 	SetOutboxBacklog(7)
 	AddQuotaDrops(8)
 	AddQuotaWarnings(9)
+	AddUpdateRetries(10)
+	AddUpdatesDroppedTransient(11)
 	after := prometheusValues(t, Default().RenderPrometheus())
 	if equalMaps(before, after) {
 		t.Fatal("package wrappers left the default instance unchanged")
@@ -33,6 +35,9 @@ func TestPackageWrappersTouchTheDefaultInstance(t *testing.T) {
 		"undelete_deletions_total":      6,
 		"undelete_quota_drops_total":    8,
 		"undelete_quota_warnings_total": 9,
+		"undelete_update_retries_total": 10,
+
+		"undelete_updates_dropped_transient_total": 11,
 	} {
 		if after[series]-before[series] != delta {
 			t.Fatalf("wrapper delta for %q = %d, want +%d (before=%d after=%d)",

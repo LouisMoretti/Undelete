@@ -269,11 +269,22 @@ func New(cfg Config) (*Service, error) {
 // Request issues a fresh code for the tenant. The code is returned in clear to
 // the caller, which sends it to the owner and forgets it; only its hash is
 // stored.
+//
+// The issue runs under the tenant's shared exclusion, like every other tenant
+// write: an erasure in flight holds the exclusive side, so a Request typed
+// from another chat meanwhile waits for it to complete instead of landing a
+// pending row between DeleteOthers and Complete -- a row the owner would then
+// hold after being told everything was gone.
 func (s *Service) Request(ctx context.Context, t Tenant) (Challenge, error) {
 	code, err := newCode()
 	if err != nil {
 		return Challenge{}, err
 	}
+	release, err := s.guard.Shared(ctx, t.OwnerUserID)
+	if err != nil {
+		return Challenge{}, err
+	}
+	defer release()
 	expiresAt, err := s.challenges.Issue(ctx, t, HashCode(code), ChallengeTTL)
 	if err != nil {
 		return Challenge{}, err

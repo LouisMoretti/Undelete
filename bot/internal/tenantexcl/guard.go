@@ -31,8 +31,9 @@
 //
 // The scope is one process: the bot runs a single poller, a single fetcher
 // and a single outbox loop, so an in-memory lock covers every writer. A
-// second process with its own Guard would not be excluded; the deployment
-// (a single container, docker-compose.yml) has exactly one of each.
+// second process with its own Guard would not be excluded, which is why the
+// bot holds storage.InstanceLockKey for its whole life: a second bot on the
+// same database waits at boot instead of running alongside the first.
 package tenantexcl
 
 import (

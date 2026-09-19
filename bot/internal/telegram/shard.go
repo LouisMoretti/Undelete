@@ -114,8 +114,9 @@ var ErrUpdateNotSubmitted = errors.New("telegram: update never submitted")
 //     the next batch is fetched.
 //   - bounded wait: that stall is bounded by the handler's own ceilings --
 //     the command answers (10s), the welcome send (30s) and the erasure
-//     (60s). A slow tenant stalls freshness, it never deadlocks the loop
-//     and never loses an update.
+//     (60s, then its 10s answer: 70s for one /delete_my_data <code>). A slow
+//     tenant stalls freshness, it never deadlocks the loop and never loses
+//     an update.
 type Dispatcher struct {
 	handler Handler
 	logger  *slog.Logger

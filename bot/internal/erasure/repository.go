@@ -23,16 +23,18 @@ type Repository struct {
 
 func NewRepository(db *storage.DB) *Repository { return &Repository{db: db} }
 
-// Issue clears the tenant's pending codes and records a new one.
+// Issue replaces the tenant's pending code with a new one.
 //
-// Both in ONE transaction: between the two statements there must be no instant
-// where the owner has two live codes, nor one where they have none although the
-// bot is about to hand them one.
+// One statement, arbitrated by the partial unique index of migration 0008 (one
+// 'pending' row per owner): the tenant never has two live codes, not even when
+// two Requests race from two chats -- the second one waits on the first one's
+// row and overwrites it, so the last code handed out is the only one
+// spendable. A clear-then-insert pair could not promise that under READ
+// COMMITTED: each transaction clears a snapshot without the other's row.
 //
-// Only 'pending' rows are cleared. A 'consumed' row is an erasure that started
-// and may still need resuming, and a 'completed' one is the receipt a replayed
-// confirmation is answered from; deleting either to make room for a new code
-// would trade a real guarantee for tidiness.
+// Only the 'pending' row is replaced. A 'consumed' row is an erasure that
+// started and may still need resuming, and a 'completed' one is the receipt a
+// replayed confirmation is answered from; neither is matched by the index.
 //
 // expires_at is computed by PostgreSQL (now() + interval), not by the bot, so
 // the deadline and the comparison that later enforces it are read off the same
@@ -40,18 +42,19 @@ func NewRepository(db *storage.DB) *Repository { return &Repository{db: db} }
 func (r *Repository) Issue(ctx context.Context, t Tenant, codeHash string, ttl time.Duration) (time.Time, error) {
 	var expiresAt time.Time
 	err := r.db.InTenant(ctx, t.OwnerUserID, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `
-			DELETE FROM data_erasure_requests
-			WHERE owner_user_id = $1 AND status = 'pending'
-		`, t.OwnerUserID); err != nil {
-			return fmt.Errorf("clearing pending erasure requests: %w", err)
-		}
 		return tx.QueryRow(ctx, `
 			INSERT INTO data_erasure_requests (
 				owner_user_id, owner_telegram_user_id, business_connection_id,
 				code_sha256, expires_at
 			)
 			VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))
+			ON CONFLICT (owner_user_id) WHERE status = 'pending'
+			DO UPDATE SET
+				owner_telegram_user_id = EXCLUDED.owner_telegram_user_id,
+				business_connection_id = EXCLUDED.business_connection_id,
+				code_sha256            = EXCLUDED.code_sha256,
+				created_at             = EXCLUDED.created_at,
+				expires_at             = EXCLUDED.expires_at
 			RETURNING expires_at
 		`, t.OwnerUserID, t.OwnerTelegramUserID, t.BusinessConnectionID,
 			codeHash, ttl.Seconds()).Scan(&expiresAt)

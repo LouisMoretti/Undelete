@@ -299,10 +299,17 @@ if [ -z "$archive" ]; then
     echo "restore-test: no archive produced by backup.sh" >&2
     exit 1
 fi
-echo "restore-test: archive $(basename "$archive") ($(wc -c < "$archive") bytes)"
+archive_name=$(basename "$archive")
+# The archive is root:0600 by design (umask 077 in backup.sh, same as in
+# production): read it the way an operator would, as root inside a container
+# that mounts the work directory, never as this script's own host user.
+in_src() {
+    docker exec "$src_container" sh -c "$1" _ "/work/backups" "$archive_name"
+}
+echo "restore-test: archive ${archive_name} ($(in_src 'wc -c < "$1/$2"' | tr -d ' ') bytes)"
 
 echo "restore-test: archive checks"
-if gzip -t "$archive" 2>/dev/null; then
+if in_src 'gzip -t "$1/$2"' 2>/dev/null; then
     ok "gzip integrity of the archive"
 else
     ko "gzip integrity of the archive"
@@ -311,7 +318,7 @@ fi
 # The .sha256 sidecar scripts/backup.sh writes next to every archive must
 # exist and must verify: it is what a transfer or a silent disk corruption is
 # checked against before extracting.
-if [ -f "${archive}.sha256" ] && ( cd "$(dirname "$archive")" && sha256sum -c "$(basename "${archive}.sha256")" >/dev/null 2>&1 ); then
+if [ -f "${archive}.sha256" ] && in_src 'cd "$1" && sha256sum -c "$2.sha256"' >/dev/null 2>&1; then
     ok ".sha256 sidecar of the archive verifies"
 else
     ko ".sha256 sidecar of the archive verifies"
@@ -341,7 +348,7 @@ fi
 
 echo "restore-test: restoring (gunzip then psql)"
 restore_started=$(date -u +%s)
-gunzip -c "$archive" > "$workdir/restore.sql"
+in_src 'gunzip -c "$1/$2"' > "$workdir/restore.sql"
 psql_in "$dst_container" "$dst_db" -q < "$workdir/restore.sql"
 restore_ended=$(date -u +%s)
 # Measured RTO: duration of the restore only (decompression + SQL replay),

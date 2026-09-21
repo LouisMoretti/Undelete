@@ -134,7 +134,7 @@ jobs:
       # for $TARGETARCH.
       - uses: docker/setup-qemu-action@v3
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       # The production image is otherwise never built before deploy: a
       # broken Dockerfile (or a base image that no longer resolves) must
